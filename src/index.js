@@ -9,22 +9,9 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const adminKey = process.env.ADMIN_KEY || 'PASANTIAS90';
 
-const rawCorsOrigin = String(process.env.CORS_ORIGIN || '').trim();
-const corsOrigins = rawCorsOrigin
-  ? rawCorsOrigin
-      .split(',')
-      .map((item) => item.trim().replace(/^['"]|['"]$/g, ''))
-      .filter(Boolean)
-  : ['*'];
-const allowAnyOrigin = corsOrigins.includes('*') || corsOrigins.includes('https://*') || corsOrigins.includes('http://*');
-
 app.use(
   cors({
-    origin: (origin, callback) => {
-      if (allowAnyOrigin || !origin) return callback(null, true);
-      const isAllowed = corsOrigins.includes(origin);
-      return callback(isAllowed ? null : new Error('Not allowed by CORS'), isAllowed);
-    },
+    origin: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
@@ -33,7 +20,7 @@ app.options('*', cors());
 
 app.use((req, res, next) => {
   const requestOrigin = req.headers.origin;
-  if (allowAnyOrigin && requestOrigin) {
+  if (requestOrigin) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin);
     res.setHeader('Vary', 'Origin');
   }
