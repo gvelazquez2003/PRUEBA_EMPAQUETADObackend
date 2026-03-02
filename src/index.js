@@ -263,9 +263,26 @@ app.post('/api/mermas', async (req, res) => {
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'Empaquetado');
   const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 200);
+  const fecha = String(req.query.fecha || '').trim();
+  const mes = String(req.query.mes || '').trim();
+
+  const hasFecha = /^\d{4}-\d{2}-\d{2}$/.test(fecha);
+  const hasMes = /^\d{4}-\d{2}$/.test(mes);
 
   try {
     if (tipo.toLowerCase() === 'merma') {
+      const whereParts = [];
+      const params = [];
+      if (hasFecha) {
+        params.push(fecha);
+        whereParts.push(`DATE(mc.fecha_hora) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(mc.fecha_hora, 'YYYY-MM') = $${params.length}`);
+      }
+      params.push(limit);
+      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
       const result = await pool.query(
         `SELECT
           mc.fecha_hora AS "Marca temporal",
@@ -282,13 +299,27 @@ app.get('/api/registros', async (req, res) => {
         JOIN productos p ON p.id_producto = md.id_producto
         JOIN responsables r ON r.id_responsable = mc.id_responsable
         JOIN sedes s ON s.id_sede = mc.id_sede
+        ${whereClause}
         ORDER BY mc.fecha_hora DESC, md.id_merma_detalle DESC
-        LIMIT $1`,
-        [limit]
+        LIMIT $${params.length}`,
+        params
       );
       const headers = result.rows.length ? Object.keys(result.rows[0]) : [];
       return res.json({ ok: true, sheet: 'Merma', headers, rows: result.rows, total: result.rows.length });
     }
+
+    const whereParts = [];
+    const params = [];
+    if (hasFecha) {
+      params.push(fecha);
+      whereParts.push(`DATE(ec.fecha_hora) = $${params.length}`);
+    }
+    if (hasMes) {
+      params.push(mes);
+      whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
+    }
+    params.push(limit);
+    const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
 
     const result = await pool.query(
       `SELECT
@@ -307,9 +338,10 @@ app.get('/api/registros', async (req, res) => {
       JOIN destinos d ON d.id_destino = ec.id_destino
       JOIN responsables r ON r.id_responsable = ec.id_responsable
       JOIN sedes s ON s.id_sede = ec.id_sede
+      ${whereClause}
       ORDER BY ec.fecha_hora DESC, ed.id_detalle DESC
-      LIMIT $1`,
-      [limit]
+      LIMIT $${params.length}`,
+      params
     );
     const headers = result.rows.length ? Object.keys(result.rows[0]) : [];
     res.json({ ok: true, sheet: 'Empaquetado', headers, rows: result.rows, total: result.rows.length });
