@@ -102,7 +102,7 @@ app.get('/productos', async (_req, res) => {
         paquetes AS paquetes_por_cesta,
         sobre_piso
       FROM productos
-      ORDER BY descripcion ASC
+      ORDER BY codigo_producto ASC
     `);
     res.json(result.rows);
   } catch (error) {
