@@ -262,7 +262,7 @@ app.post('/api/mermas', async (req, res) => {
 
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'Empaquetado');
-  const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 200);
+  const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
   const fecha = String(req.query.fecha || '').trim();
   const mes = String(req.query.mes || '').trim();
 
@@ -285,6 +285,7 @@ app.get('/api/registros', async (req, res) => {
       const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
       const result = await pool.query(
         `SELECT
+          md.id_merma_detalle AS "__ROW_ID",
           mc.fecha_hora AS "Marca temporal",
           TO_CHAR(mc.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
           p.descripcion AS "PRODUCTO",
@@ -323,6 +324,7 @@ app.get('/api/registros', async (req, res) => {
 
     const result = await pool.query(
       `SELECT
+        ed.id_detalle AS "__ROW_ID",
         ec.fecha_hora AS "Marca temporal",
         TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
         p.descripcion AS "PRODUCTO",
@@ -347,6 +349,76 @@ app.get('/api/registros', async (req, res) => {
     res.json({ ok: true, sheet: 'Empaquetado', headers, rows: result.rows, total: result.rows.length });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/registros/delete', async (req, res) => {
+  const tipo = String(req.body?.tipo || 'Empaquetado');
+  const idsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const ids = idsRaw.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0);
+
+  if (!ids.length) {
+    return res.status(400).json({ ok: false, error: 'ids es obligatorio y debe contener valores válidos' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (tipo.toLowerCase() === 'merma') {
+      const deleted = await client.query(
+        `DELETE FROM mermas_detalle
+         WHERE id_merma_detalle = ANY($1::int[])
+         RETURNING id_merma_cabecera`,
+        [ids]
+      );
+
+      const cabeceras = [...new Set(deleted.rows.map((row) => Number(row.id_merma_cabecera)).filter(Boolean))];
+      if (cabeceras.length) {
+        await client.query(
+          `DELETE FROM mermas_cabecera mc
+           WHERE mc.id_merma_cabecera = ANY($1::int[])
+             AND NOT EXISTS (
+               SELECT 1
+               FROM mermas_detalle md
+               WHERE md.id_merma_cabecera = mc.id_merma_cabecera
+             )`,
+          [cabeceras]
+        );
+      }
+
+      await client.query('COMMIT');
+      return res.json({ ok: true, deleted: deleted.rowCount || 0 });
+    }
+
+    const deleted = await client.query(
+      `DELETE FROM empaquetados_detalle
+       WHERE id_detalle = ANY($1::int[])
+       RETURNING id_cabecera`,
+      [ids]
+    );
+
+    const cabeceras = [...new Set(deleted.rows.map((row) => Number(row.id_cabecera)).filter(Boolean))];
+    if (cabeceras.length) {
+      await client.query(
+        `DELETE FROM empaquetados_cabecera ec
+         WHERE ec.id_cabecera = ANY($1::int[])
+           AND NOT EXISTS (
+             SELECT 1
+             FROM empaquetados_detalle ed
+             WHERE ed.id_cabecera = ec.id_cabecera
+           )`,
+        [cabeceras]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.json({ ok: true, deleted: deleted.rowCount || 0 });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
