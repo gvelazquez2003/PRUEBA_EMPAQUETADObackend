@@ -262,22 +262,44 @@ app.get('/api/registros', async (req, res) => {
       params.push(limit);
 
       const result = await pool.query(
-        `SELECT
-          NULL::int AS "__ROW_ID",
-          'Almacen09' AS "ORIGEN",
-          alp.processed_at AS "Marca temporal",
-          TO_CHAR(alp.processed_at, 'YYYY-MM-DD') AS "FECHA",
-          alp.codigo_lote AS "NUMERO DE LOTE",
-          COALESCE(elem.value->>'codigo_producto', '') AS "CODIGO PRODUCTO",
-          COALESCE(p.descripcion, elem.value->>'codigo_producto', '') AS "PRODUCTO",
-          COALESCE((elem.value->>'cantidad_validada')::int, 0) AS "CANTIDAD",
-          alp.estado AS "ESTADO"
-        FROM almacen_lotes_procesados alp
-        LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
-        LEFT JOIN productos p ON p.id_producto = NULLIF(elem.value->>'id_producto', '')::int
-        WHERE ${whereParts.join(' AND ')}
-        ORDER BY alp.processed_at DESC
-        LIMIT $${params.length}`,
+        `WITH empa_lote AS (
+           SELECT
+             UPPER(TRIM(ed.numero_lote)) AS codigo_lote,
+             SUM(ed.cantidad)::int AS cantidad_empaquetado,
+             MAX(ec.fecha_hora) AS fecha_empaquetado,
+             STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
+           FROM empaquetados_detalle ed
+           JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
+           JOIN productos p ON p.id_producto = ed.id_producto
+           WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
+           GROUP BY UPPER(TRIM(ed.numero_lote))
+         ),
+         alm_lote AS (
+           SELECT
+             alp.codigo_lote,
+             COALESCE(SUM((elem.value->>'cantidad_validada')::int), 0)::int AS cantidad_almacen
+           FROM almacen_lotes_procesados alp
+           LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
+           GROUP BY alp.codigo_lote
+         )
+         SELECT
+           NULL::int AS "__ROW_ID",
+           'Almacen09' AS "ORIGEN",
+           alp.processed_at AS "Marca temporal",
+           TO_CHAR(alp.processed_at, 'YYYY-MM-DD') AS "FECHA",
+           alp.codigo_lote AS "NUMERO DE LOTE",
+           COALESCE(el.productos, '-') AS "PRODUCTO",
+           COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
+           TO_CHAR(el.fecha_empaquetado, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
+           COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
+           TO_CHAR(alp.processed_at, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
+           alp.estado AS "ESTADO"
+         FROM almacen_lotes_procesados alp
+         LEFT JOIN empa_lote el ON el.codigo_lote = alp.codigo_lote
+         LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
+         WHERE ${whereParts.join(' AND ')}
+         ORDER BY alp.processed_at DESC
+         LIMIT $${params.length}`,
         params
       );
 
@@ -309,14 +331,36 @@ app.get('/api/registros', async (req, res) => {
              ec.fecha_hora AS "Marca temporal",
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
              ed.numero_lote AS "NUMERO DE LOTE",
-             p.codigo_producto AS "CODIGO PRODUCTO",
              p.descripcion AS "PRODUCTO",
-             ed.cantidad AS "CANTIDAD",
+             ed.cantidad AS "CANTIDAD EMPAQUETADO",
+             TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
+             NULL::int AS "CANTIDAD ALMACEN",
+             NULL::text AS "FECHA ENTRADA",
              'registrado'::text AS "ESTADO"
            FROM empaquetados_detalle ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
            JOIN productos p ON p.id_producto = ed.id_producto
            ${whereEmpa.length ? `WHERE ${whereEmpa.join(' AND ')}` : ''}
+         ),
+         empa_lote AS (
+           SELECT
+             UPPER(TRIM(ed.numero_lote)) AS codigo_lote,
+             SUM(ed.cantidad)::int AS cantidad_empaquetado,
+             MAX(ec.fecha_hora) AS fecha_empaquetado,
+             STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
+           FROM empaquetados_detalle ed
+           JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
+           JOIN productos p ON p.id_producto = ed.id_producto
+           WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
+           GROUP BY UPPER(TRIM(ed.numero_lote))
+         ),
+         alm_lote AS (
+           SELECT
+             alp.codigo_lote,
+             COALESCE(SUM((elem.value->>'cantidad_validada')::int), 0)::int AS cantidad_almacen
+           FROM almacen_lotes_procesados alp
+           LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
+           GROUP BY alp.codigo_lote
          ),
          alm AS (
            SELECT
@@ -325,13 +369,15 @@ app.get('/api/registros', async (req, res) => {
              alp.processed_at AS "Marca temporal",
              TO_CHAR(alp.processed_at, 'YYYY-MM-DD') AS "FECHA",
              alp.codigo_lote AS "NUMERO DE LOTE",
-             COALESCE(elem.value->>'codigo_producto', '') AS "CODIGO PRODUCTO",
-             COALESCE(p.descripcion, elem.value->>'codigo_producto', '') AS "PRODUCTO",
-             COALESCE((elem.value->>'cantidad_validada')::int, 0) AS "CANTIDAD",
+             COALESCE(el.productos, '-') AS "PRODUCTO",
+             COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
+             TO_CHAR(el.fecha_empaquetado, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
+             COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
+             TO_CHAR(alp.processed_at, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
              alp.estado AS "ESTADO"
            FROM almacen_lotes_procesados alp
-           LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
-           LEFT JOIN productos p ON p.id_producto = NULLIF(elem.value->>'id_producto', '')::int
+           LEFT JOIN empa_lote el ON el.codigo_lote = alp.codigo_lote
+           LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
            WHERE ${whereAlm.join(' AND ')}
          )
          SELECT * FROM (
