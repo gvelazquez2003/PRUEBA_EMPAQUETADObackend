@@ -54,6 +54,44 @@ function combineFechaHora(fecha, hora) {
   return `${fecha} ${safeHora}:00`;
 }
 
+async function ensureAlmacen09Tables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conteo_errores (
+      id SERIAL PRIMARY KEY,
+      codigo_lote VARCHAR(50),
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS almacen_lotes_procesados (
+      codigo_lote VARCHAR(50) PRIMARY KEY,
+      estado VARCHAR(20) NOT NULL DEFAULT 'validado',
+      processed_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS almacen_validaciones_detalle (
+      id SERIAL PRIMARY KEY,
+      codigo_lote VARCHAR(50) NOT NULL REFERENCES almacen_lotes_procesados(codigo_lote) ON DELETE CASCADE,
+      id_producto INTEGER NOT NULL,
+      codigo_producto VARCHAR(50) NOT NULL,
+      cantidad_esperada INTEGER NOT NULL,
+      cantidad_contada INTEGER NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+async function registrarErrorConteo(codigoLote) {
+  try {
+    await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [codigoLote || null]);
+  } catch (error) {
+    console.error('Error registrando conteo_errores:', error);
+  }
+}
+
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -422,6 +460,271 @@ app.post('/api/registros/delete', async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`Servidor escuchando en puerto ${port}`);
+app.get('/api/almacen09/lotes', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `WITH detalle_agregado AS (
+         SELECT
+           UPPER(TRIM(ed.numero_lote)) AS codigo_lote,
+           ed.id_producto,
+           SUM(ed.cantidad)::int AS cantidad,
+           MAX(ec.fecha_hora) AS fecha_hora
+         FROM empaquetados_detalle ed
+         JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
+         WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
+         GROUP BY UPPER(TRIM(ed.numero_lote)), ed.id_producto
+       ),
+       pendientes AS (
+         SELECT da.*
+         FROM detalle_agregado da
+         LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = da.codigo_lote
+         WHERE alp.codigo_lote IS NULL
+       )
+       SELECT
+         p.codigo_lote,
+         MAX(p.fecha_hora) AS created_at,
+         JSON_AGG(
+           JSON_BUILD_OBJECT(
+             'id', p.id_producto,
+             'codigo', pr.codigo_producto,
+             'descripcion', pr.descripcion,
+             'lote_producto', p.codigo_lote,
+             'cantidad', p.cantidad,
+             'cestas_calculadas',
+               CASE
+                 WHEN COALESCE(pr.paquetes, 0) > 0
+                   THEN CEIL(p.cantidad::numeric / pr.paquetes) + COALESCE(pr.sobre_piso, 0)
+                 ELSE NULL
+               END
+           )
+           ORDER BY pr.codigo_producto
+         ) AS productos
+       FROM pendientes p
+       JOIN productos pr ON pr.id_producto = p.id_producto
+       GROUP BY p.codigo_lote
+       ORDER BY MAX(p.fecha_hora) ASC`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).send('Error al listar lotes pendientes');
+  }
 });
+
+app.post('/api/almacen09/validar-conteo', async (req, res) => {
+  const { codigo_lote, productos_y_cantidades } = req.body || {};
+
+  if (!codigo_lote || !Array.isArray(productos_y_cantidades) || !productos_y_cantidades.length) {
+    return res.status(400).send('Datos incompletos');
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const productosResult = await client.query(
+      `SELECT
+         ed.id_producto AS id,
+         p.codigo_producto AS codigo,
+         p.descripcion,
+         SUM(ed.cantidad)::int AS cantidad,
+         CASE
+           WHEN COALESCE(p.paquetes, 0) > 0
+             THEN CEIL(SUM(ed.cantidad)::numeric / p.paquetes) + COALESCE(p.sobre_piso, 0)
+           ELSE NULL
+         END AS cestas_calculadas,
+         UPPER(TRIM(ed.numero_lote)) AS lote_producto
+       FROM empaquetados_detalle ed
+       JOIN productos p ON p.id_producto = ed.id_producto
+       WHERE UPPER(TRIM(ed.numero_lote)) = UPPER(TRIM($1))
+       GROUP BY ed.id_producto, p.codigo_producto, p.descripcion, p.paquetes, p.sobre_piso, UPPER(TRIM(ed.numero_lote))
+       ORDER BY p.codigo_producto`,
+      [codigo_lote]
+    );
+
+    if (productosResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).send('Lote no encontrado');
+    }
+
+    const cantidadesPorProductoId = new Map();
+    const cantidadesPorCodigo = new Map();
+    for (const item of productos_y_cantidades) {
+      const cantidad = Number(item && item.cantidad);
+      if (Number.isNaN(cantidad)) continue;
+
+      const productoId = Number(item && item.id);
+      if (Number.isFinite(productoId) && productoId > 0) {
+        cantidadesPorProductoId.set(productoId, cantidad);
+        continue;
+      }
+
+      const codigo = item && item.codigo ? String(item.codigo).trim() : '';
+      if (codigo) cantidadesPorCodigo.set(codigo, cantidad);
+    }
+
+    let hayMismatch = false;
+    const productosValidados = [];
+    for (const producto of productosResult.rows) {
+      const recibido = cantidadesPorProductoId.has(producto.id)
+        ? cantidadesPorProductoId.get(producto.id)
+        : cantidadesPorCodigo.get(producto.codigo);
+
+      if (recibido === undefined || Number.isNaN(recibido) || Number(recibido) !== Number(producto.cantidad)) {
+        hayMismatch = true;
+        break;
+      }
+
+      productosValidados.push({
+        id: producto.id,
+        codigo: producto.codigo,
+        cantidad: producto.cantidad,
+        recibido,
+      });
+    }
+
+    if (hayMismatch) {
+      await client.query('ROLLBACK');
+      await registrarErrorConteo(codigo_lote);
+      return res.status(400).send('ERROR: Las cantidades no coinciden con el registro de Empaquetado. CUENTE DE NUEVO');
+    }
+
+    const loteCodigo = String(codigo_lote).trim().toUpperCase();
+    const insertProcesado = await client.query(
+      `INSERT INTO almacen_lotes_procesados (codigo_lote, estado)
+       VALUES ($1, 'validado')
+       ON CONFLICT (codigo_lote) DO NOTHING`,
+      [loteCodigo]
+    );
+
+    if (!insertProcesado.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(409).send('Este lote ya fue procesado previamente.');
+    }
+
+    for (const producto of productosValidados) {
+      await client.query(
+        `INSERT INTO almacen_validaciones_detalle
+          (codigo_lote, id_producto, codigo_producto, cantidad_esperada, cantidad_contada)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          loteCodigo,
+          Number(producto.id),
+          String(producto.codigo || '').trim().toUpperCase(),
+          Number(producto.cantidad),
+          Number(producto.recibido),
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.json({ ok: true, message: 'Lote validado y registrado en PostgreSQL.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).send(error.message || 'Error al validar lote');
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/almacen09/borrar-lotes', async (req, res) => {
+  const { key } = req.body || {};
+  if (!key || String(key).trim() !== String(adminKey).trim()) {
+    return res.status(401).send('Clave inválida');
+  }
+
+  try {
+    const result = await pool.query(
+      `WITH detalle_agregado AS (
+         SELECT UPPER(TRIM(ed.numero_lote)) AS codigo_lote
+         FROM empaquetados_detalle ed
+         WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
+         GROUP BY UPPER(TRIM(ed.numero_lote))
+       ),
+       pendientes AS (
+         SELECT da.codigo_lote
+         FROM detalle_agregado da
+         LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = da.codigo_lote
+         WHERE alp.codigo_lote IS NULL
+       )
+       INSERT INTO almacen_lotes_procesados (codigo_lote, estado)
+       SELECT codigo_lote, 'descartado' FROM pendientes
+       ON CONFLICT (codigo_lote) DO UPDATE SET estado = 'descartado', processed_at = NOW()
+       RETURNING codigo_lote`
+    );
+
+    return res.json({ ok: true, total: result.rowCount || 0 });
+  } catch (error) {
+    return res.status(500).send('Error al descartar lotes');
+  }
+});
+
+app.post('/api/almacen09/borrar-registros', async (req, res) => {
+  const { key, codigos_lote } = req.body || {};
+  if (!key || String(key).trim() !== String(adminKey).trim()) {
+    return res.status(401).send('Clave inválida');
+  }
+
+  const codigos = Array.isArray(codigos_lote)
+    ? codigos_lote.map((value) => String(value || '').trim().toUpperCase()).filter(Boolean)
+    : [];
+
+  if (!codigos.length) {
+    return res.status(400).send('Codigos de lote requeridos');
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO almacen_lotes_procesados (codigo_lote, estado)
+       SELECT code, 'descartado'
+       FROM UNNEST($1::text[]) AS t(code)
+       ON CONFLICT (codigo_lote) DO UPDATE SET estado = 'descartado', processed_at = NOW()`,
+      [codigos]
+    );
+
+    return res.json({ ok: true, total: result.rowCount || codigos.length });
+  } catch (error) {
+    return res.status(500).send('Error al descartar registros');
+  }
+});
+
+app.get('/api/almacen09/errores-conteo', async (req, res) => {
+  const { date, key } = req.query || {};
+  if (!key || String(key).trim() !== String(adminKey).trim()) {
+    return res.status(401).send('Clave inválida');
+  }
+
+  const targetDate = date ? String(date) : null;
+
+  try {
+    const params = [];
+    let where = 'created_at::date = CURRENT_DATE';
+    if (targetDate) {
+      where = 'created_at::date = $1';
+      params.push(targetDate);
+    }
+
+    const result = await pool.query(
+      `SELECT id, codigo_lote, created_at
+       FROM conteo_errores
+       WHERE ${where}
+       ORDER BY created_at DESC`,
+      params
+    );
+
+    return res.json({ ok: true, total: result.rows.length, items: result.rows });
+  } catch (error) {
+    return res.status(500).send('Error al consultar errores');
+  }
+});
+
+ensureAlmacen09Tables()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Servidor escuchando en puerto ${port}`);
+    });
+  })
+  .catch((error) => {
+    console.error('No se pudieron preparar las tablas de Almacén 09:', error);
+    process.exit(1);
+  });
