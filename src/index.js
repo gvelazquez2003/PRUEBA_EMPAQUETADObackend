@@ -239,6 +239,7 @@ app.post('/api/empaquetados', async (req, res) => {
 });
 
 app.get('/api/registros', async (req, res) => {
+  const tipo = String(req.query.tipo || 'General').trim().toLowerCase();
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
   const fecha = String(req.query.fecha || '').trim();
   const mes = String(req.query.mes || '').trim();
@@ -247,6 +248,106 @@ app.get('/api/registros', async (req, res) => {
   const hasMes = /^\d{4}-\d{2}$/.test(mes);
 
   try {
+    if (tipo === 'almacen09') {
+      const whereParts = [`alp.estado = 'validado'`];
+      const params = [];
+      if (hasFecha) {
+        params.push(fecha);
+        whereParts.push(`DATE(alp.processed_at) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(alp.processed_at, 'YYYY-MM') = $${params.length}`);
+      }
+      params.push(limit);
+
+      const result = await pool.query(
+        `SELECT
+          NULL::int AS "__ROW_ID",
+          'Almacen09' AS "ORIGEN",
+          alp.processed_at AS "Marca temporal",
+          TO_CHAR(alp.processed_at, 'YYYY-MM-DD') AS "FECHA",
+          alp.codigo_lote AS "NUMERO DE LOTE",
+          COALESCE(elem.value->>'codigo_producto', '') AS "CODIGO PRODUCTO",
+          COALESCE(p.descripcion, elem.value->>'codigo_producto', '') AS "PRODUCTO",
+          COALESCE((elem.value->>'cantidad_validada')::int, 0) AS "CANTIDAD",
+          alp.estado AS "ESTADO"
+        FROM almacen_lotes_procesados alp
+        LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
+        LEFT JOIN productos p ON p.id_producto = NULLIF(elem.value->>'id_producto', '')::int
+        WHERE ${whereParts.join(' AND ')}
+        ORDER BY alp.processed_at DESC
+        LIMIT $${params.length}`,
+        params
+      );
+
+      const headers = result.rows.length ? Object.keys(result.rows[0]) : [];
+      return res.json({ ok: true, sheet: 'Almacen09', headers, rows: result.rows, total: result.rows.length });
+    }
+
+    if (tipo === 'general') {
+      const whereEmpa = [];
+      const whereAlm = [`alp.estado = 'validado'`];
+      const params = [];
+      if (hasFecha) {
+        params.push(fecha);
+        whereEmpa.push(`DATE(ec.fecha_hora) = $${params.length}`);
+        whereAlm.push(`DATE(alp.processed_at) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
+        whereAlm.push(`TO_CHAR(alp.processed_at, 'YYYY-MM') = $${params.length}`);
+      }
+      params.push(limit);
+
+      const result = await pool.query(
+        `WITH empa AS (
+           SELECT
+             ed.id_detalle AS "__ROW_ID",
+             'Empaquetado' AS "ORIGEN",
+             ec.fecha_hora AS "Marca temporal",
+             TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
+             ed.numero_lote AS "NUMERO DE LOTE",
+             p.codigo_producto AS "CODIGO PRODUCTO",
+             p.descripcion AS "PRODUCTO",
+             ed.cantidad AS "CANTIDAD",
+             'registrado'::text AS "ESTADO"
+           FROM empaquetados_detalle ed
+           JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
+           JOIN productos p ON p.id_producto = ed.id_producto
+           ${whereEmpa.length ? `WHERE ${whereEmpa.join(' AND ')}` : ''}
+         ),
+         alm AS (
+           SELECT
+             NULL::int AS "__ROW_ID",
+             'Almacen09' AS "ORIGEN",
+             alp.processed_at AS "Marca temporal",
+             TO_CHAR(alp.processed_at, 'YYYY-MM-DD') AS "FECHA",
+             alp.codigo_lote AS "NUMERO DE LOTE",
+             COALESCE(elem.value->>'codigo_producto', '') AS "CODIGO PRODUCTO",
+             COALESCE(p.descripcion, elem.value->>'codigo_producto', '') AS "PRODUCTO",
+             COALESCE((elem.value->>'cantidad_validada')::int, 0) AS "CANTIDAD",
+             alp.estado AS "ESTADO"
+           FROM almacen_lotes_procesados alp
+           LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
+           LEFT JOIN productos p ON p.id_producto = NULLIF(elem.value->>'id_producto', '')::int
+           WHERE ${whereAlm.join(' AND ')}
+         )
+         SELECT * FROM (
+           SELECT * FROM empa
+           UNION ALL
+           SELECT * FROM alm
+         ) x
+         ORDER BY "Marca temporal" DESC
+         LIMIT $${params.length}`,
+        params
+      );
+
+      const headers = result.rows.length ? Object.keys(result.rows[0]) : [];
+      return res.json({ ok: true, sheet: 'General', headers, rows: result.rows, total: result.rows.length });
+    }
+
     const whereParts = [];
     const params = [];
     if (hasFecha) {
