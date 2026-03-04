@@ -67,19 +67,8 @@ async function ensureAlmacen09Tables() {
     CREATE TABLE IF NOT EXISTS almacen_lotes_procesados (
       codigo_lote VARCHAR(50) PRIMARY KEY,
       estado VARCHAR(20) NOT NULL DEFAULT 'validado',
-      processed_at TIMESTAMP NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS almacen_validaciones_detalle (
-      id SERIAL PRIMARY KEY,
-      codigo_lote VARCHAR(50) NOT NULL REFERENCES almacen_lotes_procesados(codigo_lote) ON DELETE CASCADE,
-      id_producto INTEGER NOT NULL,
-      codigo_producto VARCHAR(50) NOT NULL,
-      cantidad_esperada INTEGER NOT NULL,
-      cantidad_contada INTEGER NOT NULL,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      processed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      resumen_validacion JSONB
     )
   `);
 }
@@ -249,57 +238,7 @@ app.post('/api/empaquetados', async (req, res) => {
   }
 });
 
-app.post('/api/mermas', async (req, res) => {
-  const { cabecera, detalle } = req.body || {};
-  if (!cabecera || !Array.isArray(detalle) || !detalle.length) {
-    return res.status(400).json({ ok: false, error: 'cabecera y detalle son obligatorios' });
-  }
-
-  const timestamp = combineFechaHora(cabecera.fecha, cabecera.hora);
-  if (!timestamp || !cabecera.id_responsable || !cabecera.id_sede) {
-    return res.status(400).json({ ok: false, error: 'Faltan campos en cabecera' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const headerResult = await client.query(
-      `INSERT INTO mermas_cabecera (fecha_hora, id_responsable, id_sede)
-       VALUES ($1, $2, $3)
-       RETURNING id_merma_cabecera`,
-      [timestamp, Number(cabecera.id_responsable), Number(cabecera.id_sede)]
-    );
-
-    const idCabecera = headerResult.rows[0].id_merma_cabecera;
-    for (const item of detalle) {
-      if (!item.id_producto || !item.cantidad || !item.motivo || !item.numero_lote) {
-        throw new Error('Cada item requiere id_producto, cantidad, motivo y numero_lote');
-      }
-      await client.query(
-        `INSERT INTO mermas_detalle (id_merma_cabecera, id_producto, cantidad, motivo, numero_lote)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          idCabecera,
-          Number(item.id_producto),
-          Number(item.cantidad),
-          String(item.motivo).trim().toUpperCase(),
-          String(item.numero_lote).trim().toUpperCase(),
-        ]
-      );
-    }
-
-    await client.query('COMMIT');
-    res.status(201).json({ ok: true, id_merma_cabecera: idCabecera });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ ok: false, error: error.message });
-  } finally {
-    client.release();
-  }
-});
-
 app.get('/api/registros', async (req, res) => {
-  const tipo = String(req.query.tipo || 'Empaquetado');
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
   const fecha = String(req.query.fecha || '').trim();
   const mes = String(req.query.mes || '').trim();
@@ -308,45 +247,6 @@ app.get('/api/registros', async (req, res) => {
   const hasMes = /^\d{4}-\d{2}$/.test(mes);
 
   try {
-    if (tipo.toLowerCase() === 'merma') {
-      const whereParts = [];
-      const params = [];
-      if (hasFecha) {
-        params.push(fecha);
-        whereParts.push(`DATE(mc.fecha_hora) = $${params.length}`);
-      }
-      if (hasMes) {
-        params.push(mes);
-        whereParts.push(`TO_CHAR(mc.fecha_hora, 'YYYY-MM') = $${params.length}`);
-      }
-      params.push(limit);
-      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
-      const result = await pool.query(
-        `SELECT
-          md.id_merma_detalle AS "__ROW_ID",
-          mc.fecha_hora AS "Marca temporal",
-          TO_CHAR(mc.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
-          p.descripcion AS "PRODUCTO",
-          p.unidad_primaria AS "UNIDAD DE MEDIDA",
-          s.nombre AS "SEDE",
-          md.motivo AS "MOTIVO DE MERMA",
-          md.cantidad AS "CANTIDAD DEL MOTIVO DE MERMA",
-          md.numero_lote AS "NUMERO DE LOTE",
-          r.nombre_completo AS "RESPONSABLE"
-        FROM mermas_detalle md
-        JOIN mermas_cabecera mc ON mc.id_merma_cabecera = md.id_merma_cabecera
-        JOIN productos p ON p.id_producto = md.id_producto
-        JOIN responsables r ON r.id_responsable = mc.id_responsable
-        JOIN sedes s ON s.id_sede = mc.id_sede
-        ${whereClause}
-        ORDER BY mc.fecha_hora DESC, md.id_merma_detalle DESC
-        LIMIT $${params.length}`,
-        params
-      );
-      const headers = result.rows.length ? Object.keys(result.rows[0]) : [];
-      return res.json({ ok: true, sheet: 'Merma', headers, rows: result.rows, total: result.rows.length });
-    }
-
     const whereParts = [];
     const params = [];
     if (hasFecha) {
@@ -391,7 +291,6 @@ app.get('/api/registros', async (req, res) => {
 });
 
 app.post('/api/registros/delete', async (req, res) => {
-  const tipo = String(req.body?.tipo || 'Empaquetado');
   const idsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
   const ids = idsRaw.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0);
 
@@ -402,32 +301,6 @@ app.post('/api/registros/delete', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    if (tipo.toLowerCase() === 'merma') {
-      const deleted = await client.query(
-        `DELETE FROM mermas_detalle
-         WHERE id_merma_detalle = ANY($1::int[])
-         RETURNING id_merma_cabecera`,
-        [ids]
-      );
-
-      const cabeceras = [...new Set(deleted.rows.map((row) => Number(row.id_merma_cabecera)).filter(Boolean))];
-      if (cabeceras.length) {
-        await client.query(
-          `DELETE FROM mermas_cabecera mc
-           WHERE mc.id_merma_cabecera = ANY($1::int[])
-             AND NOT EXISTS (
-               SELECT 1
-               FROM mermas_detalle md
-               WHERE md.id_merma_cabecera = mc.id_merma_cabecera
-             )`,
-          [cabeceras]
-        );
-      }
-
-      await client.query('COMMIT');
-      return res.json({ ok: true, deleted: deleted.rowCount || 0 });
-    }
 
     const deleted = await client.query(
       `DELETE FROM empaquetados_detalle
@@ -602,20 +475,21 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
       return res.status(409).send('Este lote ya fue procesado previamente.');
     }
 
-    for (const producto of productosValidados) {
-      await client.query(
-        `INSERT INTO almacen_validaciones_detalle
-          (codigo_lote, id_producto, codigo_producto, cantidad_esperada, cantidad_contada)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          loteCodigo,
-          Number(producto.id),
-          String(producto.codigo || '').trim().toUpperCase(),
-          Number(producto.cantidad),
-          Number(producto.recibido),
-        ]
-      );
-    }
+    await client.query(
+      `UPDATE almacen_lotes_procesados
+       SET resumen_validacion = $2::jsonb
+       WHERE codigo_lote = $1`,
+      [
+        loteCodigo,
+        JSON.stringify(
+          productosValidados.map((producto) => ({
+            id_producto: Number(producto.id),
+            codigo_producto: String(producto.codigo || '').trim().toUpperCase(),
+            cantidad_validada: Number(producto.recibido),
+          }))
+        ),
+      ]
+    );
 
     await client.query('COMMIT');
     return res.json({ ok: true, message: 'Lote validado y registrado en PostgreSQL.' });
