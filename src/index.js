@@ -259,7 +259,7 @@ app.get('/api/registros', async (req, res) => {
 
   try {
     if (tipo === 'almacen09') {
-      const whereParts = [`alp.estado = 'validado'`];
+      const whereParts = [`alp.estado = 'validado'`, `alp.resumen_validacion IS NOT NULL`];
       const params = [];
       if (hasDesde) {
         params.push(desde);
@@ -324,7 +324,7 @@ app.get('/api/registros', async (req, res) => {
            COALESCE(el.lotes, alp.codigo_lote) AS "NUMERO DE LOTE",
            COALESCE(el.productos, CONCAT('REGISTRO ', COALESCE(el.numero_registro, '-'))) AS "PRODUCTO",
            COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
-           TO_CHAR(el.fecha_empaquetado, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
+           TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
            COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
            TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
            alp.estado AS "ESTADO"
@@ -343,7 +343,7 @@ app.get('/api/registros', async (req, res) => {
 
     if (tipo === 'general') {
       const whereEmpa = [];
-      const whereAlm = [`alp.estado = 'validado'`];
+      const whereAlm = [`alp.estado = 'validado'`, `alp.resumen_validacion IS NOT NULL`];
       const params = [];
       if (hasDesde) {
         params.push(desde);
@@ -435,7 +435,7 @@ app.get('/api/registros', async (req, res) => {
              COALESCE(el.lotes, alp.codigo_lote) AS "NUMERO DE LOTE",
              COALESCE(el.productos, CONCAT('REGISTRO ', COALESCE(el.numero_registro, '-'))) AS "PRODUCTO",
              COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
-             TO_CHAR(el.fecha_empaquetado, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
+             TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
              COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
              TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
              alp.estado AS "ESTADO"
