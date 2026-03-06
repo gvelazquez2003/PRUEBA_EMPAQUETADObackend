@@ -7,7 +7,7 @@ dotenv.config();
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
-const adminKey = process.env.ADMIN_KEY || 'PASANTIAS90';
+const adminKey = process.env.ADMIN_KEY || '#FANDETATA';
 
 const rawCorsOrigin = String(process.env.CORS_ORIGIN || '').trim();
 const corsOrigins = rawCorsOrigin
