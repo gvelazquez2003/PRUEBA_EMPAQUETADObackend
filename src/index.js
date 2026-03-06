@@ -241,17 +241,25 @@ app.post('/api/empaquetados', async (req, res) => {
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'General').trim().toLowerCase();
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
+  const semana = String(req.query.semana || '').trim();
   const fecha = String(req.query.fecha || '').trim();
   const mes = String(req.query.mes || '').trim();
+  const anio = String(req.query.anio || '').trim();
   const almacenTsVzExpr = `(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
 
+  const hasSemana = /^\d{4}-W(0[1-9]|[1-4][0-9]|5[0-3])$/.test(semana);
   const hasFecha = /^\d{4}-\d{2}-\d{2}$/.test(fecha);
   const hasMes = /^\d{4}-\d{2}$/.test(mes);
+  const hasAnio = /^\d{4}$/.test(anio);
 
   try {
     if (tipo === 'almacen09') {
       const whereParts = [`alp.estado = 'validado'`];
       const params = [];
+      if (hasSemana) {
+        params.push(semana);
+        whereParts.push(`TO_CHAR(${almacenTsVzExpr}, 'IYYY-"W"IW') = $${params.length}`);
+      }
       if (hasFecha) {
         params.push(fecha);
         whereParts.push(`DATE(${almacenTsVzExpr}) = $${params.length}`);
@@ -259,6 +267,10 @@ app.get('/api/registros', async (req, res) => {
       if (hasMes) {
         params.push(mes);
         whereParts.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasAnio) {
+        params.push(anio);
+        whereParts.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY') = $${params.length}`);
       }
       params.push(limit);
 
@@ -316,6 +328,11 @@ app.get('/api/registros', async (req, res) => {
       const whereEmpa = [];
       const whereAlm = [`alp.estado = 'validado'`];
       const params = [];
+      if (hasSemana) {
+        params.push(semana);
+        whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
+        whereAlm.push(`TO_CHAR(${almacenTsVzExpr}, 'IYYY-"W"IW') = $${params.length}`);
+      }
       if (hasFecha) {
         params.push(fecha);
         whereEmpa.push(`DATE(ec.fecha_hora) = $${params.length}`);
@@ -325,6 +342,11 @@ app.get('/api/registros', async (req, res) => {
         params.push(mes);
         whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
         whereAlm.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasAnio) {
+        params.push(anio);
+        whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'YYYY') = $${params.length}`);
+        whereAlm.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY') = $${params.length}`);
       }
       params.push(limit);
 
@@ -406,6 +428,10 @@ app.get('/api/registros', async (req, res) => {
 
     const whereParts = [];
     const params = [];
+    if (hasSemana) {
+      params.push(semana);
+      whereParts.push(`TO_CHAR(ec.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
+    }
     if (hasFecha) {
       params.push(fecha);
       whereParts.push(`DATE(ec.fecha_hora) = $${params.length}`);
@@ -413,6 +439,10 @@ app.get('/api/registros', async (req, res) => {
     if (hasMes) {
       params.push(mes);
       whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
+    }
+    if (hasAnio) {
+      params.push(anio);
+      whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY') = $${params.length}`);
     }
     params.push(limit);
     const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
