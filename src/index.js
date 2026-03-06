@@ -241,21 +241,34 @@ app.post('/api/empaquetados', async (req, res) => {
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'General').trim().toLowerCase();
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
+  const desde = String(req.query.desde || '').trim();
+  const hasta = String(req.query.hasta || '').trim();
   const semana = String(req.query.semana || '').trim();
   const fecha = String(req.query.fecha || '').trim();
   const mes = String(req.query.mes || '').trim();
   const anio = String(req.query.anio || '').trim();
   const almacenTsVzExpr = `(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
 
+  const hasDesde = /^\d{4}-\d{2}-\d{2}$/.test(desde);
+  const hasHasta = /^\d{4}-\d{2}-\d{2}$/.test(hasta);
   const hasSemana = /^\d{4}-W(0[1-9]|[1-4][0-9]|5[0-3])$/.test(semana);
   const hasFecha = /^\d{4}-\d{2}-\d{2}$/.test(fecha);
   const hasMes = /^\d{4}-\d{2}$/.test(mes);
+  const hasMesNumero = /^(0[1-9]|1[0-2])$/.test(mes);
   const hasAnio = /^\d{4}$/.test(anio);
 
   try {
     if (tipo === 'almacen09') {
       const whereParts = [`alp.estado = 'validado'`];
       const params = [];
+      if (hasDesde) {
+        params.push(desde);
+        whereParts.push(`DATE(${almacenTsVzExpr}) >= $${params.length}`);
+      }
+      if (hasHasta) {
+        params.push(hasta);
+        whereParts.push(`DATE(${almacenTsVzExpr}) <= $${params.length}`);
+      }
       if (hasSemana) {
         params.push(semana);
         whereParts.push(`TO_CHAR(${almacenTsVzExpr}, 'IYYY-"W"IW') = $${params.length}`);
@@ -267,6 +280,10 @@ app.get('/api/registros', async (req, res) => {
       if (hasMes) {
         params.push(mes);
         whereParts.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasMesNumero) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(${almacenTsVzExpr}, 'MM') = $${params.length}`);
       }
       if (hasAnio) {
         params.push(anio);
@@ -328,6 +345,16 @@ app.get('/api/registros', async (req, res) => {
       const whereEmpa = [];
       const whereAlm = [`alp.estado = 'validado'`];
       const params = [];
+      if (hasDesde) {
+        params.push(desde);
+        whereEmpa.push(`DATE(ec.fecha_hora) >= $${params.length}`);
+        whereAlm.push(`DATE(${almacenTsVzExpr}) >= $${params.length}`);
+      }
+      if (hasHasta) {
+        params.push(hasta);
+        whereEmpa.push(`DATE(ec.fecha_hora) <= $${params.length}`);
+        whereAlm.push(`DATE(${almacenTsVzExpr}) <= $${params.length}`);
+      }
       if (hasSemana) {
         params.push(semana);
         whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
@@ -342,6 +369,11 @@ app.get('/api/registros', async (req, res) => {
         params.push(mes);
         whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
         whereAlm.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasMesNumero) {
+        params.push(mes);
+        whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'MM') = $${params.length}`);
+        whereAlm.push(`TO_CHAR(${almacenTsVzExpr}, 'MM') = $${params.length}`);
       }
       if (hasAnio) {
         params.push(anio);
@@ -428,6 +460,14 @@ app.get('/api/registros', async (req, res) => {
 
     const whereParts = [];
     const params = [];
+    if (hasDesde) {
+      params.push(desde);
+      whereParts.push(`DATE(ec.fecha_hora) >= $${params.length}`);
+    }
+    if (hasHasta) {
+      params.push(hasta);
+      whereParts.push(`DATE(ec.fecha_hora) <= $${params.length}`);
+    }
     if (hasSemana) {
       params.push(semana);
       whereParts.push(`TO_CHAR(ec.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
@@ -439,6 +479,10 @@ app.get('/api/registros', async (req, res) => {
     if (hasMes) {
       params.push(mes);
       whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
+    }
+    if (hasMesNumero) {
+      params.push(mes);
+      whereParts.push(`TO_CHAR(ec.fecha_hora, 'MM') = $${params.length}`);
     }
     if (hasAnio) {
       params.push(anio);
