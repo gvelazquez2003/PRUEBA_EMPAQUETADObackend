@@ -243,6 +243,7 @@ app.get('/api/registros', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
   const fecha = String(req.query.fecha || '').trim();
   const mes = String(req.query.mes || '').trim();
+  const almacenTsVzExpr = `(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
 
   const hasFecha = /^\d{4}-\d{2}-\d{2}$/.test(fecha);
   const hasMes = /^\d{4}-\d{2}$/.test(mes);
@@ -253,11 +254,11 @@ app.get('/api/registros', async (req, res) => {
       const params = [];
       if (hasFecha) {
         params.push(fecha);
-        whereParts.push(`DATE(alp.processed_at) = $${params.length}`);
+        whereParts.push(`DATE(${almacenTsVzExpr}) = $${params.length}`);
       }
       if (hasMes) {
         params.push(mes);
-        whereParts.push(`TO_CHAR(alp.processed_at, 'YYYY-MM') = $${params.length}`);
+        whereParts.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM') = $${params.length}`);
       }
       params.push(limit);
 
@@ -289,14 +290,14 @@ app.get('/api/registros', async (req, res) => {
          SELECT
            NULL::int AS "__ROW_ID",
            'Almacen09' AS "ORIGEN",
-           alp.processed_at AS "Marca temporal",
-           TO_CHAR(alp.processed_at, 'YYYY-MM-DD') AS "FECHA",
+           TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
+           TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
            COALESCE(el.lotes, alp.codigo_lote) AS "NUMERO DE LOTE",
            COALESCE(el.productos, CONCAT('REGISTRO ', COALESCE(el.numero_registro, '-'))) AS "PRODUCTO",
            COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
            TO_CHAR(el.fecha_empaquetado, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
            COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
-           TO_CHAR(alp.processed_at, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
+           TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
            alp.estado AS "ESTADO"
          FROM almacen_lotes_procesados alp
          LEFT JOIN empa_reg el ON el.codigo_lote = alp.codigo_lote
@@ -318,12 +319,12 @@ app.get('/api/registros', async (req, res) => {
       if (hasFecha) {
         params.push(fecha);
         whereEmpa.push(`DATE(ec.fecha_hora) = $${params.length}`);
-        whereAlm.push(`DATE(alp.processed_at) = $${params.length}`);
+        whereAlm.push(`DATE(${almacenTsVzExpr}) = $${params.length}`);
       }
       if (hasMes) {
         params.push(mes);
         whereEmpa.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
-        whereAlm.push(`TO_CHAR(alp.processed_at, 'YYYY-MM') = $${params.length}`);
+        whereAlm.push(`TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM') = $${params.length}`);
       }
       params.push(limit);
 
@@ -332,7 +333,7 @@ app.get('/api/registros', async (req, res) => {
            SELECT
              ed.id_detalle AS "__ROW_ID",
              'Empaquetado' AS "ORIGEN",
-             ec.fecha_hora AS "Marca temporal",
+             TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
              ed.numero_lote AS "NUMERO DE LOTE",
              p.descripcion AS "PRODUCTO",
@@ -375,14 +376,14 @@ app.get('/api/registros', async (req, res) => {
            SELECT
              NULL::int AS "__ROW_ID",
              'Almacen09' AS "ORIGEN",
-             alp.processed_at AS "Marca temporal",
-             TO_CHAR(alp.processed_at, 'YYYY-MM-DD') AS "FECHA",
+             TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
+             TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
              COALESCE(el.lotes, alp.codigo_lote) AS "NUMERO DE LOTE",
              COALESCE(el.productos, CONCAT('REGISTRO ', COALESCE(el.numero_registro, '-'))) AS "PRODUCTO",
              COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
              TO_CHAR(el.fecha_empaquetado, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
              COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
-             TO_CHAR(alp.processed_at, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
+             TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
              alp.estado AS "ESTADO"
            FROM almacen_lotes_procesados alp
            LEFT JOIN empa_reg el ON el.codigo_lote = alp.codigo_lote
@@ -419,7 +420,7 @@ app.get('/api/registros', async (req, res) => {
     const result = await pool.query(
       `SELECT
         ed.id_detalle AS "__ROW_ID",
-        ec.fecha_hora AS "Marca temporal",
+        TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
         TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
         p.descripcion AS "PRODUCTO",
         ed.cantidad AS "CANTIDAD",
