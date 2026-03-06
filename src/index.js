@@ -310,19 +310,19 @@ app.get('/api/registros', async (req, res) => {
         `SELECT
           ed.id_detalle AS "__ROW_ID",
           TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
+          TO_CHAR(ec.fecha_hora, 'DD/MM/YYYY HH24:MI') AS "Fecha Empaquetado",
+          CASE
+            WHEN alp.estado = 'validado' AND alp.resumen_validacion IS NOT NULL
+              THEN TO_CHAR(${almacenTsVzExpr}, 'DD/MM/YYYY HH24:MI')
+            ELSE NULL
+          END AS "Fecha Almacen09",
           p.descripcion AS "PRODUCTO",
           ed.cantidad AS "CANTIDAD",
           d.nombre AS "ENTREGADO A",
           ec.numero_registro AS "NUMERO REGISTRO",
           r.nombre_completo AS "RESPONSABLE",
           s.nombre AS "SEDE",
-          ed.numero_lote AS "NUMERO DE LOTE",
-          TO_CHAR(ec.fecha_hora, 'HH24:MI') AS "HORA EMPAQUETADO",
-          CASE
-            WHEN alp.estado = 'validado' AND alp.resumen_validacion IS NOT NULL
-              THEN TO_CHAR(${almacenTsVzExpr}, 'HH24:MI')
-            ELSE NULL
-          END AS "HORA ALMACEN09"
+          ed.numero_lote AS "NUMERO DE LOTE"
         FROM empaquetados_detalle ed
         JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
         JOIN productos p ON p.id_producto = ed.id_producto
@@ -673,7 +673,7 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
        SELECT
          p.codigo_lote,
          MAX(p.numero_registro) AS numero_registro,
-         MAX(p.fecha_hora) AS created_at,
+         TO_CHAR(MAX(p.fecha_hora), 'DD/MM/YYYY HH24:MI') AS created_at,
          JSON_AGG(
            JSON_BUILD_OBJECT(
              'id', p.id_producto,
