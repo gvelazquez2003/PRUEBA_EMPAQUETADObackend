@@ -239,7 +239,7 @@ app.post('/api/empaquetados', async (req, res) => {
 });
 
 app.get('/api/registros', async (req, res) => {
-  const tipo = String(req.query.tipo || 'General').trim().toLowerCase();
+  const tipo = String(req.query.tipo || 'Consolidado').trim().toLowerCase();
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
   const desde = String(req.query.desde || '').trim();
   const hasta = String(req.query.hasta || '').trim();
@@ -258,6 +258,74 @@ app.get('/api/registros', async (req, res) => {
   const hasAnio = /^\d{4}$/.test(anio);
 
   try {
+    if (tipo === 'consolidado') {
+      const whereParts = [];
+      const params = [];
+      if (hasDesde) {
+        params.push(desde);
+        whereParts.push(`DATE(ec.fecha_hora) >= $${params.length}`);
+      }
+      if (hasHasta) {
+        params.push(hasta);
+        whereParts.push(`DATE(ec.fecha_hora) <= $${params.length}`);
+      }
+      if (hasSemana) {
+        params.push(semana);
+        whereParts.push(`TO_CHAR(ec.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
+      }
+      if (hasFecha) {
+        params.push(fecha);
+        whereParts.push(`DATE(ec.fecha_hora) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasMesNumero) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(ec.fecha_hora, 'MM') = $${params.length}`);
+      }
+      if (hasAnio) {
+        params.push(anio);
+        whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY') = $${params.length}`);
+      }
+      params.push(limit);
+      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      const result = await pool.query(
+        `SELECT
+          ed.id_detalle AS "__ROW_ID",
+          TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
+          p.descripcion AS "PRODUCTO",
+          ed.cantidad AS "CANTIDAD",
+          d.nombre AS "ENTREGADO A",
+          ec.numero_registro AS "NUMERO REGISTRO",
+          r.nombre_completo AS "RESPONSABLE",
+          s.nombre AS "SEDE",
+          ed.numero_lote AS "NUMERO DE LOTE",
+          TO_CHAR(ec.fecha_hora, 'HH24:MI') AS "HORA EMPAQUETADO",
+          CASE
+            WHEN alp.estado = 'validado' AND alp.resumen_validacion IS NOT NULL
+              THEN TO_CHAR(${almacenTsVzExpr}, 'HH24:MI')
+            ELSE NULL
+          END AS "HORA ALMACEN09"
+        FROM empaquetados_detalle ed
+        JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
+        JOIN productos p ON p.id_producto = ed.id_producto
+        JOIN destinos d ON d.id_destino = ec.id_destino
+        JOIN responsables r ON r.id_responsable = ec.id_responsable
+        JOIN sedes s ON s.id_sede = ec.id_sede
+        LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = CONCAT('CAB-', ec.id_cabecera)
+        ${whereClause}
+        ORDER BY ec.fecha_hora DESC, ed.id_detalle DESC
+        LIMIT $${params.length}`,
+        params
+      );
+
+      const headers = result.rows.length ? Object.keys(result.rows[0]) : [];
+      return res.json({ ok: true, sheet: 'Consolidado', headers, rows: result.rows, total: result.rows.length });
+    }
+
     if (tipo === 'almacen09') {
       const whereParts = [`alp.estado = 'validado'`, `alp.resumen_validacion IS NOT NULL`];
       const params = [];
