@@ -71,6 +71,20 @@ async function ensureAlmacen09Tables() {
       resumen_validacion JSONB
     )
   `);
+
+  // Backward-compatible migration: older deployments may already have the table without newer columns.
+  await pool.query(`
+    ALTER TABLE almacen_lotes_procesados
+    ADD COLUMN IF NOT EXISTS estado VARCHAR(20) NOT NULL DEFAULT 'validado'
+  `);
+  await pool.query(`
+    ALTER TABLE almacen_lotes_procesados
+    ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP NOT NULL DEFAULT NOW()
+  `);
+  await pool.query(`
+    ALTER TABLE almacen_lotes_procesados
+    ADD COLUMN IF NOT EXISTS resumen_validacion JSONB
+  `);
 }
 
 async function registrarErrorConteo(codigoLote) {
