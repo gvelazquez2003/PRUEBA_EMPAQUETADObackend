@@ -316,6 +316,7 @@ app.get('/api/registros', async (req, res) => {
               THEN TO_CHAR(${almacenTsVzExpr}, 'DD/MM/YYYY HH24:MI')
             ELSE NULL
           END AS "Fecha Almacen09",
+          p.codigo_producto AS "CODIGO PRODUCTO",
           p.descripcion AS "PRODUCTO",
           ed.cantidad AS "CANTIDAD",
           d.nombre AS "ENTREGADO A",
