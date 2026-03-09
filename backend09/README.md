@@ -13,3 +13,9 @@ Componentes de Almacén 09 integrados al backend principal.
 - `POST /api/almacen09/borrar-lotes`
 - `POST /api/almacen09/borrar-registros`
 - `GET /api/almacen09/errores-conteo?key=...`
+
+## Reinicio total en Neon
+1. Ejecuta `reset_total_backend09.sql`.
+2. Verifica que ambos conteos queden en 0.
+3. Ejecuta `seed_masivo_neon.sql` para poblar prueba de carga.
+4. Si quieres limpiar luego de probar, ejecuta `cleanup_masivo_neon.sql`.
