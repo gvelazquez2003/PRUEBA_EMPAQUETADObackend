@@ -385,7 +385,7 @@ app.get('/api/registros', async (req, res) => {
         JOIN destinos d ON d.id_destino = ec.id_destino
         JOIN responsables r ON r.id_responsable = ec.id_responsable
         JOIN sedes s ON s.id_sede = ec.id_sede
-        LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = CONCAT('CAB-', ec.id_cabecera)
+        LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote)))
         ${whereClause}
         ORDER BY ec.fecha_hora DESC, ed.id_detalle DESC
         LIMIT $${params.length}`,
@@ -432,11 +432,11 @@ app.get('/api/registros', async (req, res) => {
       const result = await pool.query(
         `WITH empa_reg AS (
            SELECT
-             CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
+             CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote,
              ec.numero_registro,
+             UPPER(TRIM(ed.numero_lote)) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
-             STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lotes,
              STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
            FROM empaquetados_detalle ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
@@ -444,7 +444,7 @@ app.get('/api/registros', async (req, res) => {
            JOIN productos p ON p.id_producto = ed.id_producto
            WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
              AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-           GROUP BY ec.id_cabecera, ec.numero_registro
+           GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote))
          ),
          alm_lote AS (
            SELECT
@@ -459,7 +459,7 @@ app.get('/api/registros', async (req, res) => {
            'Almacen09' AS "ORIGEN",
            TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
            TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
-           COALESCE(el.lotes, alp.codigo_lote) AS "NUMERO DE LOTE",
+           COALESCE(el.lote_referencia, alp.codigo_lote) AS "NUMERO DE LOTE",
            COALESCE(el.productos, CONCAT('REGISTRO ', COALESCE(el.numero_registro, '-'))) AS "PRODUCTO",
            COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
            TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
@@ -542,11 +542,11 @@ app.get('/api/registros', async (req, res) => {
          ),
            empa_reg AS (
            SELECT
-               CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
+               CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote,
                ec.numero_registro,
+             UPPER(TRIM(ed.numero_lote)) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
-               STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lotes,
              STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
            FROM empaquetados_detalle ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
@@ -554,7 +554,7 @@ app.get('/api/registros', async (req, res) => {
            JOIN productos p ON p.id_producto = ed.id_producto
            WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
                AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-             GROUP BY ec.id_cabecera, ec.numero_registro
+             GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote))
          ),
          alm_lote AS (
            SELECT
@@ -570,7 +570,7 @@ app.get('/api/registros', async (req, res) => {
              'Almacen09' AS "ORIGEN",
              TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
              TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
-             COALESCE(el.lotes, alp.codigo_lote) AS "NUMERO DE LOTE",
+             COALESCE(el.lote_referencia, alp.codigo_lote) AS "NUMERO DE LOTE",
              COALESCE(el.productos, CONCAT('REGISTRO ', COALESCE(el.numero_registro, '-'))) AS "PRODUCTO",
              COALESCE(el.cantidad_empaquetado, 0) AS "CANTIDAD EMPAQUETADO",
              TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
@@ -707,18 +707,19 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
     const result = await pool.query(
       `WITH detalle_agregado AS (
          SELECT
-           CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
+           CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote,
+           CONCAT('CAB-', ec.id_cabecera) AS codigo_cabecera,
            ec.numero_registro,
+           UPPER(TRIM(ed.numero_lote)) AS lote_referencia,
            ed.id_producto,
            SUM(ed.cantidad)::int AS cantidad,
-           MAX(ec.fecha_hora) AS fecha_hora,
-           STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lotes
+           MAX(ec.fecha_hora) AS fecha_hora
          FROM empaquetados_detalle ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-         GROUP BY ec.id_cabecera, ec.numero_registro, ed.id_producto
+         GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote)), ed.id_producto
        ),
        pendientes AS (
          SELECT da.*
@@ -728,15 +729,16 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
        )
        SELECT
          p.codigo_lote,
+         MAX(p.codigo_cabecera) AS codigo_cabecera,
          MAX(p.numero_registro) AS numero_registro,
-         MAX(p.lotes) AS lote_referencia,
+         MAX(p.lote_referencia) AS lote_referencia,
          TO_CHAR(MAX(p.fecha_hora), 'DD/MM/YYYY HH24:MI') AS created_at,
          JSON_AGG(
            JSON_BUILD_OBJECT(
              'id', p.id_producto,
              'codigo', pr.codigo_producto,
              'descripcion', pr.descripcion,
-             'lote_producto', p.lotes,
+             'lote_producto', p.lote_referencia,
              'cantidad', p.cantidad,
              'cestas_calculadas',
                CASE
@@ -771,12 +773,18 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
     await client.query('BEGIN');
 
     const codigoRegistro = String(codigo_lote || '').trim().toUpperCase();
-    const cabeceraMatch = /^CAB-(\d+)$/.exec(codigoRegistro);
+    const loteMatch = /^CAB-(\d+)::(.+)$/.exec(codigoRegistro);
+    const cabeceraMatch = loteMatch || /^CAB-(\d+)$/.exec(codigoRegistro);
     if (!cabeceraMatch) {
       await client.query('ROLLBACK');
       return res.status(400).send('Código de registro inválido');
     }
     const idCabecera = Number(cabeceraMatch[1]);
+    const loteFiltro = loteMatch ? String(loteMatch[2] || '').trim().toUpperCase() : '';
+
+    const productosParams = [idCabecera];
+    const loteWhere = loteFiltro ? ` AND UPPER(TRIM(ed.numero_lote)) = $2` : '';
+    if (loteFiltro) productosParams.push(loteFiltro);
 
     const productosResult = await client.query(
       `SELECT
@@ -795,10 +803,12 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
        JOIN destinos d ON d.id_destino = ec.id_destino
        JOIN productos p ON p.id_producto = ed.id_producto
        WHERE ec.id_cabecera = $1
+         AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
          AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
+         ${loteWhere}
        GROUP BY ed.id_producto, p.codigo_producto, p.descripcion, p.paquetes, p.sobre_piso
        ORDER BY p.codigo_producto`,
-      [idCabecera]
+      productosParams
     );
 
     if (productosResult.rows.length === 0) {
@@ -896,13 +906,13 @@ app.post('/api/almacen09/borrar-lotes', async (req, res) => {
   try {
     const result = await pool.query(
       `WITH detalle_agregado AS (
-         SELECT CONCAT('CAB-', ec.id_cabecera) AS codigo_lote
+         SELECT CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote
          FROM empaquetados_detalle ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-         GROUP BY ec.id_cabecera
+         GROUP BY ec.id_cabecera, UPPER(TRIM(ed.numero_lote))
        ),
        pendientes AS (
          SELECT da.codigo_lote
