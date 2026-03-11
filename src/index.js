@@ -94,6 +94,13 @@ async function ensureAlmacen09Tables() {
   `);
 }
 
+async function ensureProductosSoftDelete() {
+  await pool.query(`
+    ALTER TABLE productos
+    ADD COLUMN IF NOT EXISTS activo BOOLEAN NOT NULL DEFAULT TRUE
+  `);
+}
+
 async function registrarErrorConteo(codigoLote) {
   try {
     await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [codigoLote || null]);
@@ -150,6 +157,7 @@ app.get('/productos', async (_req, res) => {
         paquetes AS paquetes_por_cesta,
         sobre_piso
       FROM productos
+      WHERE COALESCE(activo, TRUE) = TRUE
       ORDER BY codigo_producto ASC
     `);
     res.json(result.rows);
@@ -170,8 +178,14 @@ app.post('/productos', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso)
+      `INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso, activo)
        VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (codigo_producto) DO UPDATE
+       SET descripcion = EXCLUDED.descripcion,
+           unidad_primaria = EXCLUDED.unidad_primaria,
+           paquetes = EXCLUDED.paquetes,
+           sobre_piso = EXCLUDED.sobre_piso,
+           activo = TRUE
        RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso`,
       [
         String(codigo).trim().toUpperCase(),
@@ -202,7 +216,7 @@ app.delete('/productos/:codigo', async (req, res) => {
     await client.query('BEGIN');
 
     const productResult = await client.query(
-      'SELECT id_producto, codigo_producto FROM productos WHERE LOWER(codigo_producto) = LOWER($1) LIMIT 1',
+      'SELECT id_producto, codigo_producto, COALESCE(activo, TRUE) AS activo FROM productos WHERE LOWER(codigo_producto) = LOWER($1) LIMIT 1',
       [codigo]
     );
     if (!productResult.rowCount) {
@@ -211,17 +225,9 @@ app.delete('/productos/:codigo', async (req, res) => {
     }
 
     const idProducto = productResult.rows[0].id_producto;
-
-    const empaResult = await client.query(
-      'DELETE FROM empaquetados_detalle WHERE id_producto = $1',
-      [idProducto]
-    );
-    const mermaResult = await client.query(
-      'DELETE FROM mermas_detalle WHERE id_producto = $1',
-      [idProducto]
-    );
-    const deleteProductoResult = await client.query(
-      'DELETE FROM productos WHERE id_producto = $1 RETURNING id_producto, codigo_producto',
+    const wasActive = Boolean(productResult.rows[0].activo);
+    const updateResult = await client.query(
+      'UPDATE productos SET activo = FALSE WHERE id_producto = $1 RETURNING id_producto, codigo_producto',
       [idProducto]
     );
 
@@ -229,10 +235,9 @@ app.delete('/productos/:codigo', async (req, res) => {
 
     res.json({
       ok: true,
-      removed: {
-        producto: deleteProductoResult.rowCount,
-        empaquetados_detalle: empaResult.rowCount,
-        mermas_detalle: mermaResult.rowCount,
+      archived: {
+        producto: updateResult.rowCount,
+        wasActive,
       },
     });
   } catch (error) {
@@ -965,13 +970,13 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
   }
 });
 
-ensureAlmacen09Tables()
+Promise.all([ensureAlmacen09Tables(), ensureProductosSoftDelete()])
   .then(() => {
     app.listen(port, () => {
       console.log(`Servidor escuchando en puerto ${port}`);
     });
   })
   .catch((error) => {
-    console.error('No se pudieron preparar las tablas de Almacén 09:', error);
+    console.error('No se pudieron preparar las tablas base:', error);
     process.exit(1);
   });
