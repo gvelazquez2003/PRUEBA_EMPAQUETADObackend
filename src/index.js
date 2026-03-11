@@ -189,7 +189,7 @@ app.post('/productos', async (req, res) => {
   try {
     const result = await pool.query(
       `INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso, activo)
-       VALUES ($1, $2, $3, $4, $5)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
        ON CONFLICT (codigo_producto) DO UPDATE
        SET descripcion = EXCLUDED.descripcion,
            unidad_primaria = EXCLUDED.unidad_primaria,
