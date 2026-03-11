@@ -8,6 +8,7 @@ dotenv.config();
 const app = express();
 const port = Number(process.env.PORT || 3001);
 const adminKey = process.env.ADMIN_KEY || '#FANDETATA';
+const legacyAdminKey = '#FANDETATA';
 
 const rawCorsOrigin = String(process.env.CORS_ORIGIN || '').trim();
 const corsOrigins = rawCorsOrigin
@@ -52,6 +53,12 @@ function combineFechaHora(fecha, hora) {
   if (!fecha) return null;
   const safeHora = hora && String(hora).trim() ? String(hora).trim() : '00:00';
   return `${fecha} ${safeHora}:00`;
+}
+
+function isValidAdminKey(sentKey) {
+  const normalized = String(sentKey || '').trim();
+  if (!normalized) return false;
+  return normalized === String(adminKey || '').trim() || normalized === legacyAdminKey;
 }
 
 async function ensureAlmacen09Tables() {
@@ -152,8 +159,9 @@ app.get('/productos', async (_req, res) => {
 });
 
 app.post('/productos', async (req, res) => {
-  const { codigo, descripcion, unidad, paquetes, sobre_piso, adminKey: sentKey } = req.body;
-  if (sentKey !== adminKey) {
+  const { codigo, descripcion, unidad, paquetes, sobre_piso, adminKey: bodyKey } = req.body;
+  const sentKey = bodyKey || req.query?.adminKey || req.headers['x-admin-key'];
+  if (!isValidAdminKey(sentKey)) {
     return res.status(403).json({ ok: false, error: 'adminKey inválido' });
   }
   if (!codigo || !descripcion) {
@@ -184,8 +192,8 @@ app.post('/productos', async (req, res) => {
 
 app.delete('/productos/:codigo', async (req, res) => {
   const { codigo } = req.params;
-  const sentKey = req.body?.adminKey || req.query?.adminKey;
-  if (sentKey !== adminKey) {
+  const sentKey = req.body?.adminKey || req.query?.adminKey || req.headers['x-admin-key'];
+  if (!isValidAdminKey(sentKey)) {
     return res.status(403).json({ ok: false, error: 'adminKey inválido' });
   }
 
