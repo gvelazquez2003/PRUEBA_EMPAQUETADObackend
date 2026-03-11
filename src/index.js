@@ -197,17 +197,49 @@ app.delete('/productos/:codigo', async (req, res) => {
     return res.status(403).json({ ok: false, error: 'adminKey inválido' });
   }
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      'DELETE FROM productos WHERE LOWER(codigo_producto) = LOWER($1) RETURNING id_producto',
+    await client.query('BEGIN');
+
+    const productResult = await client.query(
+      'SELECT id_producto, codigo_producto FROM productos WHERE LOWER(codigo_producto) = LOWER($1) LIMIT 1',
       [codigo]
     );
-    if (!result.rowCount) {
+    if (!productResult.rowCount) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ ok: false, error: 'Producto no encontrado' });
     }
-    res.json({ ok: true });
+
+    const idProducto = productResult.rows[0].id_producto;
+
+    const empaResult = await client.query(
+      'DELETE FROM empaquetados_detalle WHERE id_producto = $1',
+      [idProducto]
+    );
+    const mermaResult = await client.query(
+      'DELETE FROM mermas_detalle WHERE id_producto = $1',
+      [idProducto]
+    );
+    const deleteProductoResult = await client.query(
+      'DELETE FROM productos WHERE id_producto = $1 RETURNING id_producto, codigo_producto',
+      [idProducto]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      ok: true,
+      removed: {
+        producto: deleteProductoResult.rowCount,
+        empaquetados_detalle: empaResult.rowCount,
+        mermas_detalle: mermaResult.rowCount,
+      },
+    });
   } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
     res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
