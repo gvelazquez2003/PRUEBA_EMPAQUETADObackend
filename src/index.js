@@ -707,8 +707,7 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
     const result = await pool.query(
       `WITH detalle_agregado AS (
          SELECT
-           CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote,
-           CONCAT('CAB-', ec.id_cabecera) AS codigo_cabecera,
+           CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
            ec.numero_registro,
            UPPER(TRIM(ed.numero_lote)) AS lote_referencia,
            ed.id_producto,
@@ -729,12 +728,12 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
        )
        SELECT
          p.codigo_lote,
-         MAX(p.codigo_cabecera) AS codigo_cabecera,
          MAX(p.numero_registro) AS numero_registro,
-         MAX(p.lote_referencia) AS lote_referencia,
+         STRING_AGG(DISTINCT p.lote_referencia, ' | ' ORDER BY p.lote_referencia) AS lote_referencia,
          TO_CHAR(MAX(p.fecha_hora), 'DD/MM/YYYY HH24:MI') AS created_at,
          JSON_AGG(
            JSON_BUILD_OBJECT(
+             'line_key', CONCAT(p.id_producto, '::', p.lote_referencia),
              'id', p.id_producto,
              'codigo', pr.codigo_producto,
              'descripcion', pr.descripcion,
@@ -747,7 +746,7 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
                  ELSE NULL
                END
            )
-           ORDER BY pr.codigo_producto
+           ORDER BY p.lote_referencia, pr.codigo_producto
          ) AS productos
        FROM pendientes p
        JOIN productos pr ON pr.id_producto = p.id_producto
@@ -773,21 +772,16 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
     await client.query('BEGIN');
 
     const codigoRegistro = String(codigo_lote || '').trim().toUpperCase();
-    const loteMatch = /^CAB-(\d+)::(.+)$/.exec(codigoRegistro);
-    const cabeceraMatch = loteMatch || /^CAB-(\d+)$/.exec(codigoRegistro);
+    const cabeceraMatch = /^CAB-(\d+)$/.exec(codigoRegistro);
     if (!cabeceraMatch) {
       await client.query('ROLLBACK');
       return res.status(400).send('Código de registro inválido');
     }
     const idCabecera = Number(cabeceraMatch[1]);
-    const loteFiltro = loteMatch ? String(loteMatch[2] || '').trim().toUpperCase() : '';
-
-    const productosParams = [idCabecera];
-    const loteWhere = loteFiltro ? ` AND UPPER(TRIM(ed.numero_lote)) = $2` : '';
-    if (loteFiltro) productosParams.push(loteFiltro);
 
     const productosResult = await client.query(
       `SELECT
+         CONCAT(ed.id_producto, '::', UPPER(TRIM(ed.numero_lote))) AS line_key,
          ed.id_producto AS id,
          p.codigo_producto AS codigo,
          p.descripcion,
@@ -805,10 +799,9 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
        WHERE ec.id_cabecera = $1
          AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
          AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-         ${loteWhere}
-       GROUP BY ed.id_producto, p.codigo_producto, p.descripcion, p.paquetes, p.sobre_piso
-       ORDER BY p.codigo_producto`,
-      productosParams
+       GROUP BY ed.id_producto, UPPER(TRIM(ed.numero_lote)), p.codigo_producto, p.descripcion, p.paquetes, p.sobre_piso
+       ORDER BY UPPER(TRIM(ed.numero_lote)), p.codigo_producto`,
+      [idCabecera]
     );
 
     if (productosResult.rows.length === 0) {
@@ -818,9 +811,16 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
 
     const cantidadesPorProductoId = new Map();
     const cantidadesPorCodigo = new Map();
+    const cantidadesPorLinea = new Map();
     for (const item of productos_y_cantidades) {
       const cantidad = Number(item && item.cantidad);
       if (Number.isNaN(cantidad)) continue;
+
+      const lineKey = item && item.line_key ? String(item.line_key).trim().toUpperCase() : '';
+      if (lineKey) {
+        cantidadesPorLinea.set(lineKey, cantidad);
+        continue;
+      }
 
       const productoId = Number(item && item.id);
       if (Number.isFinite(productoId) && productoId > 0) {
@@ -835,9 +835,11 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
     let hayMismatch = false;
     const productosValidados = [];
     for (const producto of productosResult.rows) {
-      const recibido = cantidadesPorProductoId.has(producto.id)
-        ? cantidadesPorProductoId.get(producto.id)
-        : cantidadesPorCodigo.get(producto.codigo);
+      const recibido = cantidadesPorLinea.has(producto.line_key)
+        ? cantidadesPorLinea.get(producto.line_key)
+        : cantidadesPorProductoId.has(producto.id)
+          ? cantidadesPorProductoId.get(producto.id)
+          : cantidadesPorCodigo.get(producto.codigo);
 
       if (recibido === undefined || Number.isNaN(recibido) || Number(recibido) !== Number(producto.cantidad)) {
         hayMismatch = true;
@@ -899,20 +901,20 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
 
 app.post('/api/almacen09/borrar-lotes', async (req, res) => {
   const { key } = req.body || {};
-  if (!key || String(key).trim() !== String(adminKey).trim()) {
+  if (!isValidAdminKey(key)) {
     return res.status(401).send('Clave inválida');
   }
 
   try {
     const result = await pool.query(
       `WITH detalle_agregado AS (
-         SELECT CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote
+         SELECT CONCAT('CAB-', ec.id_cabecera) AS codigo_lote
          FROM empaquetados_detalle ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-         GROUP BY ec.id_cabecera, UPPER(TRIM(ed.numero_lote))
+         GROUP BY ec.id_cabecera
        ),
        pendientes AS (
          SELECT da.codigo_lote
@@ -934,7 +936,7 @@ app.post('/api/almacen09/borrar-lotes', async (req, res) => {
 
 app.post('/api/almacen09/borrar-registros', async (req, res) => {
   const { key, codigos_lote } = req.body || {};
-  if (!key || String(key).trim() !== String(adminKey).trim()) {
+  if (!isValidAdminKey(key)) {
     return res.status(401).send('Clave inválida');
   }
 
@@ -963,7 +965,7 @@ app.post('/api/almacen09/borrar-registros', async (req, res) => {
 
 app.get('/api/almacen09/errores-conteo', async (req, res) => {
   const { date, key } = req.query || {};
-  if (!key || String(key).trim() !== String(adminKey).trim()) {
+  if (!isValidAdminKey(key)) {
     return res.status(401).send('Clave inválida');
   }
 
