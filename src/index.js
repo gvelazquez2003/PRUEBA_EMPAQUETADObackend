@@ -129,7 +129,12 @@ app.get('/destinos', async (_req, res) => {
 
 app.get('/sedes', async (_req, res) => {
   try {
-    const result = await pool.query('SELECT id_sede, nombre FROM sedes ORDER BY nombre');
+    const result = await pool.query(
+      `SELECT id_sede, nombre
+       FROM sedes
+       WHERE UPPER(TRIM(COALESCE(nombre, ''))) <> 'SEDE PRINCIPAL'
+       ORDER BY nombre`
+    );
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -138,7 +143,12 @@ app.get('/sedes', async (_req, res) => {
 
 app.get('/responsables', async (_req, res) => {
   try {
-    const result = await pool.query('SELECT id_responsable, nombre_completo FROM responsables ORDER BY nombre_completo');
+    const result = await pool.query(
+      `SELECT id_responsable, nombre_completo
+       FROM responsables
+       WHERE UPPER(TRIM(COALESCE(nombre_completo, ''))) <> 'USUARIO PRUEBA MASIVA'
+       ORDER BY nombre_completo`
+    );
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -719,6 +729,7 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
        SELECT
          p.codigo_lote,
          MAX(p.numero_registro) AS numero_registro,
+         MAX(p.lotes) AS lote_referencia,
          TO_CHAR(MAX(p.fecha_hora), 'DD/MM/YYYY HH24:MI') AS created_at,
          JSON_AGG(
            JSON_BUILD_OBJECT(
@@ -957,10 +968,30 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, codigo_lote, created_at
-       FROM conteo_errores
-       WHERE ${where}
-       ORDER BY created_at DESC`,
+      `WITH errores AS (
+         SELECT id, codigo_lote, created_at
+         FROM conteo_errores
+         WHERE ${where}
+       ),
+       lotes_referencia AS (
+         SELECT
+           CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
+           STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia
+         FROM empaquetados_cabecera ec
+         JOIN empaquetados_detalle ed ON ed.id_cabecera = ec.id_cabecera
+         JOIN destinos d ON d.id_destino = ec.id_destino
+         WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
+           AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
+         GROUP BY ec.id_cabecera
+       )
+       SELECT
+         e.id,
+         e.codigo_lote,
+         COALESCE(lr.lote_referencia, e.codigo_lote) AS codigo_mostrado,
+         e.created_at
+       FROM errores e
+       LEFT JOIN lotes_referencia lr ON lr.codigo_lote = e.codigo_lote
+       ORDER BY e.created_at DESC`,
       params
     );
 
