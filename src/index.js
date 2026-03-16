@@ -10,11 +10,22 @@ const port = Number(process.env.PORT || 3001);
 const adminKey = process.env.ADMIN_KEY || '#FANDETATA';
 const legacyAdminKey = '#FANDETATA';
 
+function normalizeOrigin(value) {
+  const raw = String(value || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!raw) return '';
+  if (raw === '*' || raw === 'https://*' || raw === 'http://*') return raw;
+  try {
+    return new URL(raw).origin;
+  } catch (_) {
+    return raw.replace(/[\/?#].*$/, '').replace(/\/+$/, '');
+  }
+}
+
 const rawCorsOrigin = String(process.env.CORS_ORIGIN || '').trim();
 const corsOrigins = rawCorsOrigin
   ? rawCorsOrigin
       .split(',')
-      .map((item) => item.trim().replace(/^['"]|['"]$/g, ''))
+      .map((item) => normalizeOrigin(item))
       .filter(Boolean)
   : ['*'];
 const allowAnyOrigin = corsOrigins.includes('*') || corsOrigins.includes('https://*') || corsOrigins.includes('http://*');
@@ -23,7 +34,8 @@ app.use(
   cors({
     origin: (origin, callback) => {
       if (allowAnyOrigin || !origin) return callback(null, true);
-      const isAllowed = corsOrigins.includes(origin);
+      const normalizedOrigin = normalizeOrigin(origin);
+      const isAllowed = corsOrigins.includes(normalizedOrigin);
       return callback(isAllowed ? null : new Error('Not allowed by CORS'), isAllowed);
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
