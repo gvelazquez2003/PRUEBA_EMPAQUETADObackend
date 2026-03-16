@@ -397,7 +397,7 @@ app.get('/api/registros', async (req, res) => {
         JOIN destinos d ON d.id_destino = ec.id_destino
         JOIN responsables r ON r.id_responsable = ec.id_responsable
         JOIN sedes s ON s.id_sede = ec.id_sede
-        LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote)))
+        LEFT JOIN almacen_lotes_procesados alp ON split_part(alp.codigo_lote, '::', 1) = CONCAT('CAB-', ec.id_cabecera)
         ${whereClause}
         ORDER BY ec.fecha_hora DESC, ed.id_detalle DESC
         LIMIT $${params.length}`,
@@ -442,11 +442,11 @@ app.get('/api/registros', async (req, res) => {
       params.push(limit);
 
       const result = await pool.query(
-        `WITH empa_reg AS (
+         WITH empa_reg AS (
            SELECT
-             CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote,
+             CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
              ec.numero_registro,
-             UPPER(TRIM(ed.numero_lote)) AS lote_referencia,
+             STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
              STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
@@ -456,7 +456,7 @@ app.get('/api/registros', async (req, res) => {
            JOIN productos p ON p.id_producto = ed.id_producto
            WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
              AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-           GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote))
+           GROUP BY ec.id_cabecera, ec.numero_registro
          ),
          alm_lote AS (
            SELECT
@@ -479,7 +479,7 @@ app.get('/api/registros', async (req, res) => {
            TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
            alp.estado AS "ESTADO"
          FROM almacen_lotes_procesados alp
-         LEFT JOIN empa_reg el ON el.codigo_lote = alp.codigo_lote
+         LEFT JOIN empa_reg el ON el.codigo_lote = split_part(alp.codigo_lote, '::', 1)
          LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
          WHERE ${whereParts.join(' AND ')}
          ORDER BY alp.processed_at DESC
@@ -554,9 +554,9 @@ app.get('/api/registros', async (req, res) => {
          ),
            empa_reg AS (
            SELECT
-               CONCAT('CAB-', ec.id_cabecera, '::', UPPER(TRIM(ed.numero_lote))) AS codigo_lote,
+               CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
                ec.numero_registro,
-             UPPER(TRIM(ed.numero_lote)) AS lote_referencia,
+             STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
              STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
@@ -566,7 +566,7 @@ app.get('/api/registros', async (req, res) => {
            JOIN productos p ON p.id_producto = ed.id_producto
            WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
                AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-             GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote))
+             GROUP BY ec.id_cabecera, ec.numero_registro
          ),
          alm_lote AS (
            SELECT
@@ -590,7 +590,7 @@ app.get('/api/registros', async (req, res) => {
              TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
              alp.estado AS "ESTADO"
            FROM almacen_lotes_procesados alp
-           LEFT JOIN empa_reg el ON el.codigo_lote = alp.codigo_lote
+           LEFT JOIN empa_reg el ON el.codigo_lote = split_part(alp.codigo_lote, '::', 1)
            LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
            WHERE ${whereAlm.join(' AND ')}
          )
