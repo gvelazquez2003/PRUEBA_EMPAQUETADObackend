@@ -329,6 +329,7 @@ app.get('/api/registros', async (req, res) => {
   const mes = String(req.query.mes || '').trim();
   const anio = String(req.query.anio || '').trim();
   const almacenTsVzExpr = `(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
+  const almacenCabCodigoExpr = `UPPER(TRIM(split_part(alp.codigo_lote, '::', 1)))`;
 
   const hasDesde = /^\d{4}-\d{2}-\d{2}$/.test(desde);
   const hasHasta = /^\d{4}-\d{2}-\d{2}$/.test(hasta);
@@ -379,7 +380,7 @@ app.get('/api/registros', async (req, res) => {
           TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
           TO_CHAR(ec.fecha_hora, 'DD/MM/YYYY HH24:MI') AS "Fecha Empaquetado",
           CASE
-            WHEN alp.estado = 'validado' AND alp.resumen_validacion IS NOT NULL
+            WHEN alp.estado = 'validado' AND alp.processed_at IS NOT NULL
               THEN TO_CHAR(${almacenTsVzExpr}, 'DD/MM/YYYY HH24:MI')
             ELSE NULL
           END AS "Fecha Almacen09",
@@ -397,7 +398,7 @@ app.get('/api/registros', async (req, res) => {
         JOIN destinos d ON d.id_destino = ec.id_destino
         JOIN responsables r ON r.id_responsable = ec.id_responsable
         JOIN sedes s ON s.id_sede = ec.id_sede
-        LEFT JOIN almacen_lotes_procesados alp ON split_part(alp.codigo_lote, '::', 1) = CONCAT('CAB-', ec.id_cabecera)
+        LEFT JOIN almacen_lotes_procesados alp ON ${almacenCabCodigoExpr} = UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera)))
         ${whereClause}
         ORDER BY ec.fecha_hora DESC, ed.id_detalle DESC
         LIMIT $${params.length}`,
@@ -409,7 +410,7 @@ app.get('/api/registros', async (req, res) => {
     }
 
     if (tipo === 'almacen09') {
-      const whereParts = [`alp.estado = 'validado'`, `alp.resumen_validacion IS NOT NULL`];
+      const whereParts = [`alp.estado = 'validado'`];
       const params = [];
       if (hasDesde) {
         params.push(desde);
@@ -442,7 +443,7 @@ app.get('/api/registros', async (req, res) => {
       params.push(limit);
 
       const result = await pool.query(
-         WITH empa_reg AS (
+        `WITH empa_reg AS (
            SELECT
              CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
              ec.numero_registro,
@@ -479,7 +480,7 @@ app.get('/api/registros', async (req, res) => {
            TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
            alp.estado AS "ESTADO"
          FROM almacen_lotes_procesados alp
-         LEFT JOIN empa_reg el ON el.codigo_lote = split_part(alp.codigo_lote, '::', 1)
+         LEFT JOIN empa_reg el ON UPPER(TRIM(el.codigo_lote)) = ${almacenCabCodigoExpr}
          LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
          WHERE ${whereParts.join(' AND ')}
          ORDER BY alp.processed_at DESC
@@ -493,7 +494,7 @@ app.get('/api/registros', async (req, res) => {
 
     if (tipo === 'general') {
       const whereEmpa = [];
-      const whereAlm = [`alp.estado = 'validado'`, `alp.resumen_validacion IS NOT NULL`];
+      const whereAlm = [`alp.estado = 'validado'`];
       const params = [];
       if (hasDesde) {
         params.push(desde);
@@ -590,7 +591,7 @@ app.get('/api/registros', async (req, res) => {
              TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
              alp.estado AS "ESTADO"
            FROM almacen_lotes_procesados alp
-           LEFT JOIN empa_reg el ON el.codigo_lote = split_part(alp.codigo_lote, '::', 1)
+           LEFT JOIN empa_reg el ON UPPER(TRIM(el.codigo_lote)) = ${almacenCabCodigoExpr}
            LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
            WHERE ${whereAlm.join(' AND ')}
          )
@@ -887,7 +888,9 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
 
     await client.query(
       `UPDATE almacen_lotes_procesados
-       SET resumen_validacion = $2::jsonb
+       SET resumen_validacion = $2::jsonb,
+           estado = 'validado',
+           processed_at = NOW()
        WHERE codigo_lote = $1`,
       [
         loteCodigo,
