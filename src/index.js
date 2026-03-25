@@ -113,6 +113,38 @@ async function ensureProductosSoftDelete() {
   `);
 }
 
+async function ensureHistoricoResultadosTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS historico_resultados_consolidado (
+      id_historico BIGSERIAL PRIMARY KEY,
+      fecha DATE,
+      fecha_empaquetado TIMESTAMP,
+      fecha_almacen09 TIMESTAMP,
+      codigo_producto VARCHAR(30),
+      producto TEXT NOT NULL,
+      cantidad INTEGER,
+      entregado_a VARCHAR(120),
+      numero_registro VARCHAR(50),
+      responsable VARCHAR(120),
+      sede VARCHAR(160),
+      numero_lote VARCHAR(80),
+      source_hash VARCHAR(64) UNIQUE NOT NULL,
+      origen_historico VARCHAR(20) NOT NULL DEFAULT 'csv',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_historico_resultados_fecha_empaquetado
+    ON historico_resultados_consolidado (fecha_empaquetado DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_historico_resultados_fecha_almacen09
+    ON historico_resultados_consolidado (fecha_almacen09 DESC)
+  `);
+}
+
 async function registrarErrorConteo(codigoLote) {
   try {
     await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [codigoLote || null]);
@@ -341,66 +373,122 @@ app.get('/api/registros', async (req, res) => {
 
   try {
     if (tipo === 'consolidado') {
-      const whereParts = [];
+      const wherePartsActual = [];
+      const wherePartsHistorico = [];
       const params = [];
       if (hasDesde) {
         params.push(desde);
-        whereParts.push(`DATE(ec.fecha_hora) >= $${params.length}`);
+        wherePartsActual.push(`DATE(ec.fecha_hora) >= $${params.length}`);
+        wherePartsHistorico.push(`DATE(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp)) >= $${params.length}`);
       }
       if (hasHasta) {
         params.push(hasta);
-        whereParts.push(`DATE(ec.fecha_hora) <= $${params.length}`);
+        wherePartsActual.push(`DATE(ec.fecha_hora) <= $${params.length}`);
+        wherePartsHistorico.push(`DATE(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp)) <= $${params.length}`);
       }
       if (hasSemana) {
         params.push(semana);
-        whereParts.push(`TO_CHAR(ec.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
+        wherePartsActual.push(`TO_CHAR(ec.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
+        wherePartsHistorico.push(`TO_CHAR(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp), 'IYYY-"W"IW') = $${params.length}`);
       }
       if (hasFecha) {
         params.push(fecha);
-        whereParts.push(`DATE(ec.fecha_hora) = $${params.length}`);
+        wherePartsActual.push(`DATE(ec.fecha_hora) = $${params.length}`);
+        wherePartsHistorico.push(`DATE(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp)) = $${params.length}`);
       }
       if (hasMes) {
         params.push(mes);
-        whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
+        wherePartsActual.push(`TO_CHAR(ec.fecha_hora, 'YYYY-MM') = $${params.length}`);
+        wherePartsHistorico.push(`TO_CHAR(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp), 'YYYY-MM') = $${params.length}`);
       }
       if (hasMesNumero) {
         params.push(mes);
-        whereParts.push(`TO_CHAR(ec.fecha_hora, 'MM') = $${params.length}`);
+        wherePartsActual.push(`TO_CHAR(ec.fecha_hora, 'MM') = $${params.length}`);
+        wherePartsHistorico.push(`TO_CHAR(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp), 'MM') = $${params.length}`);
       }
       if (hasAnio) {
         params.push(anio);
-        whereParts.push(`TO_CHAR(ec.fecha_hora, 'YYYY') = $${params.length}`);
+        wherePartsActual.push(`TO_CHAR(ec.fecha_hora, 'YYYY') = $${params.length}`);
+        wherePartsHistorico.push(`TO_CHAR(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp), 'YYYY') = $${params.length}`);
       }
       params.push(limit);
-      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+      const whereClauseActual = wherePartsActual.length ? `WHERE ${wherePartsActual.join(' AND ')}` : '';
+      const whereClauseHistorico = wherePartsHistorico.length ? `WHERE ${wherePartsHistorico.join(' AND ')}` : '';
 
       const result = await pool.query(
-        `SELECT
-          ed.id_detalle AS "__ROW_ID",
-          TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
-          TO_CHAR(ec.fecha_hora, 'DD/MM/YYYY HH24:MI') AS "Fecha Empaquetado",
-          CASE
-            WHEN alp.estado = 'validado' AND alp.processed_at IS NOT NULL
-              THEN TO_CHAR(${almacenTsVzExpr}, 'DD/MM/YYYY HH24:MI')
-            ELSE NULL
-          END AS "Fecha Almacen09",
-          p.codigo_producto AS "CODIGO PRODUCTO",
-          p.descripcion AS "PRODUCTO",
-          ed.cantidad AS "CANTIDAD",
-          d.nombre AS "ENTREGADO A",
-          ec.numero_registro AS "NUMERO REGISTRO",
-          r.nombre_completo AS "RESPONSABLE",
-          s.nombre AS "SEDE",
-          ed.numero_lote AS "NUMERO DE LOTE"
-        FROM empaquetados_detalle ed
-        JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-        JOIN productos p ON p.id_producto = ed.id_producto
-        JOIN destinos d ON d.id_destino = ec.id_destino
-        JOIN responsables r ON r.id_responsable = ec.id_responsable
-        JOIN sedes s ON s.id_sede = ec.id_sede
-        LEFT JOIN almacen_lotes_procesados alp ON ${almacenCabCodigoExpr} = UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera)))
-        ${whereClause}
-        ORDER BY ec.fecha_hora DESC, ed.id_detalle DESC
+        `WITH actual AS (
+          SELECT
+            ed.id_detalle AS "__ROW_ID",
+            TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
+            TO_CHAR(ec.fecha_hora, 'DD/MM/YYYY HH24:MI') AS "Fecha Empaquetado",
+            CASE
+              WHEN alp.estado = 'validado' AND alp.processed_at IS NOT NULL
+                THEN TO_CHAR(${almacenTsVzExpr}, 'DD/MM/YYYY HH24:MI')
+              ELSE NULL
+            END AS "Fecha Almacen09",
+            p.codigo_producto AS "CODIGO PRODUCTO",
+            p.descripcion AS "PRODUCTO",
+            ed.cantidad AS "CANTIDAD",
+            d.nombre AS "ENTREGADO A",
+            ec.numero_registro AS "NUMERO REGISTRO",
+            r.nombre_completo AS "RESPONSABLE",
+            s.nombre AS "SEDE",
+            ed.numero_lote AS "NUMERO DE LOTE",
+            ec.fecha_hora AS "__ORDER_TS"
+          FROM empaquetados_detalle ed
+          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
+          JOIN productos p ON p.id_producto = ed.id_producto
+          JOIN destinos d ON d.id_destino = ec.id_destino
+          JOIN responsables r ON r.id_responsable = ec.id_responsable
+          JOIN sedes s ON s.id_sede = ec.id_sede
+          LEFT JOIN almacen_lotes_procesados alp ON ${almacenCabCodigoExpr} = UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera)))
+          ${whereClauseActual}
+        ),
+        historico AS (
+          SELECT
+            NULL::int AS "__ROW_ID",
+            TO_CHAR(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp), 'YYYY-MM-DD') AS "FECHA",
+            CASE
+              WHEN hr.fecha_empaquetado IS NOT NULL THEN TO_CHAR(hr.fecha_empaquetado, 'DD/MM/YYYY HH24:MI')
+              WHEN hr.fecha IS NOT NULL THEN TO_CHAR(hr.fecha::timestamp, 'DD/MM/YYYY HH24:MI')
+              ELSE NULL
+            END AS "Fecha Empaquetado",
+            CASE
+              WHEN hr.fecha_almacen09 IS NOT NULL THEN TO_CHAR(hr.fecha_almacen09, 'DD/MM/YYYY HH24:MI')
+              ELSE NULL
+            END AS "Fecha Almacen09",
+            hr.codigo_producto AS "CODIGO PRODUCTO",
+            hr.producto AS "PRODUCTO",
+            hr.cantidad AS "CANTIDAD",
+            hr.entregado_a AS "ENTREGADO A",
+            hr.numero_registro AS "NUMERO REGISTRO",
+            hr.responsable AS "RESPONSABLE",
+            hr.sede AS "SEDE",
+            hr.numero_lote AS "NUMERO DE LOTE",
+            COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp) AS "__ORDER_TS"
+          FROM historico_resultados_consolidado hr
+          ${whereClauseHistorico}
+        ),
+        unificado AS (
+          SELECT * FROM actual
+          UNION ALL
+          SELECT * FROM historico
+        )
+        SELECT
+          "__ROW_ID",
+          "FECHA",
+          "Fecha Empaquetado",
+          "Fecha Almacen09",
+          "CODIGO PRODUCTO",
+          "PRODUCTO",
+          "CANTIDAD",
+          "ENTREGADO A",
+          "NUMERO REGISTRO",
+          "RESPONSABLE",
+          "SEDE",
+          "NUMERO DE LOTE"
+        FROM unificado
+        ORDER BY "__ORDER_TS" DESC NULLS LAST
         LIMIT $${params.length}`,
         params
       );
@@ -1028,7 +1116,7 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
   }
 });
 
-Promise.all([ensureAlmacen09Tables(), ensureProductosSoftDelete()])
+Promise.all([ensureAlmacen09Tables(), ensureProductosSoftDelete(), ensureHistoricoResultadosTable()])
   .then(() => {
     app.listen(port, () => {
       console.log(`Servidor escuchando en puerto ${port}`);
