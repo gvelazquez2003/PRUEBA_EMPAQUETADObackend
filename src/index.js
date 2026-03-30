@@ -9,6 +9,7 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const adminKey = process.env.ADMIN_KEY || '#FANDETATA';
 const legacyAdminKey = '#FANDETATA';
+const STOCK_RESET_DATE = String(process.env.STOCK_RESET_DATE || '2026-03-30').trim();
 
 function normalizeOrigin(value) {
   const raw = String(value || '').trim().replace(/^['"]|['"]$/g, '');
@@ -1113,6 +1114,39 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
     return res.json({ ok: true, total: result.rows.length, items: result.rows });
   } catch (error) {
     return res.status(500).send('Error al consultar errores');
+  }
+});
+
+app.get('/api/almacen09/stock-actual', async (req, res) => {
+  const desdeRaw = String(req.query?.desde || STOCK_RESET_DATE).trim();
+  const desde = /^\d{4}-\d{2}-\d{2}$/.test(desdeRaw) ? desdeRaw : STOCK_RESET_DATE;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         p.codigo_producto,
+         p.descripcion AS producto,
+         UPPER(TRIM(ed.numero_lote)) AS numero_lote,
+         TO_CHAR(DATE(ec.fecha_hora), 'YYYY-MM-DD') AS fecha_empaquetado,
+         SUM(ed.cantidad)::int AS cantidad
+       FROM almacen_lotes_procesados alp
+       JOIN empaquetados_cabecera ec
+         ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
+       JOIN destinos d ON d.id_destino = ec.id_destino
+       JOIN empaquetados_detalle ed ON ed.id_cabecera = ec.id_cabecera
+       JOIN productos p ON p.id_producto = ed.id_producto
+       WHERE alp.estado = 'validado'
+         AND DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+         AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
+         AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
+       GROUP BY p.codigo_producto, p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
+       ORDER BY p.codigo_producto, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)`,
+      [desde]
+    );
+
+    return res.json({ ok: true, desde, rows: result.rows, total: result.rows.length });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: 'Error al calcular stock actual desde Almacén09' });
   }
 });
 
