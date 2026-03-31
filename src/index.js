@@ -416,76 +416,104 @@ app.post('/api/empaquetados', async (req, res) => {
 });
 
 app.post('/api/control-inventario', async (req, res) => {
-  const {
-    almacenista,
-    turno_actual,
-    momento_conteo,
-    id_producto,
-    cantidad_fisica_contada,
-    fecha_elaboracion,
-    almacen,
-  } = req.body || {};
+  const body = req.body || {};
+  const hasDetalle = Array.isArray(body.detalle);
+  const cabecera = hasDetalle ? body.cabecera || {} : body;
 
-  const cleanAlmacenista = String(almacenista || '').trim();
-  const cleanTurno = String(turno_actual || '').trim();
-  const cleanMomento = String(momento_conteo || '').trim();
-  const productoId = Number(id_producto);
-  const cantidadContada = Number(cantidad_fisica_contada);
-  const cleanFechaElaboracion = String(fecha_elaboracion || '').trim();
-  const cleanAlmacen = String(almacen || '').trim();
+  const cleanAlmacenista = String(cabecera.almacenista || '').trim();
+  const cleanTurno = String(cabecera.turno_actual || '').trim();
+  const cleanMomento = String(cabecera.momento_conteo || '').trim();
+  const cleanAlmacen = String(cabecera.almacen || '').trim();
 
-  if (
-    !cleanAlmacenista ||
-    !cleanTurno ||
-    !cleanMomento ||
-    !Number.isInteger(productoId) || productoId <= 0 ||
-    !Number.isFinite(cantidadContada) || cantidadContada <= 0 ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(cleanFechaElaboracion) ||
-    !cleanAlmacen
-  ) {
-    return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios o formato inválido' });
+  if (!cleanAlmacenista || !cleanTurno || !cleanMomento || !cleanAlmacen) {
+    return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios en cabecera' });
   }
 
+  const detalle = hasDetalle
+    ? body.detalle
+    : [
+        {
+          id_producto: body.id_producto,
+          cantidad_fisica_contada: body.cantidad_fisica_contada,
+          fecha_elaboracion: body.fecha_elaboracion,
+        },
+      ];
+
+  const detalleNormalizado = (detalle || []).map((item) => ({
+    id_producto: Number(item?.id_producto),
+    cantidad_fisica_contada: Number(item?.cantidad_fisica_contada),
+    fecha_elaboracion: String(item?.fecha_elaboracion || '').trim(),
+  }));
+
+  if (!detalleNormalizado.length) {
+    return res.status(400).json({ ok: false, error: 'detalle es obligatorio' });
+  }
+
+  const invalidItem = detalleNormalizado.find(
+    (item) =>
+      !Number.isInteger(item.id_producto) ||
+      item.id_producto <= 0 ||
+      !Number.isFinite(item.cantidad_fisica_contada) ||
+      item.cantidad_fisica_contada <= 0 ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(item.fecha_elaboracion)
+  );
+  if (invalidItem) {
+    return res.status(400).json({ ok: false, error: 'Hay líneas inválidas en detalle' });
+  }
+
+  const productIds = [...new Set(detalleNormalizado.map((item) => item.id_producto))];
+  const client = await pool.connect();
   try {
-    const product = await pool.query(
+    await client.query('BEGIN');
+
+    const productResult = await client.query(
       `SELECT id_producto
        FROM productos
-       WHERE id_producto = $1
-         AND COALESCE(activo, TRUE) = TRUE
-       LIMIT 1`,
-      [productoId]
+       WHERE COALESCE(activo, TRUE) = TRUE
+         AND id_producto = ANY($1::int[])`,
+      [productIds]
     );
-
-    if (!product.rowCount) {
-      return res.status(400).json({ ok: false, error: 'Producto inválido o inactivo' });
+    const validIds = new Set(productResult.rows.map((row) => Number(row.id_producto)));
+    const missing = productIds.filter((id) => !validIds.has(id));
+    if (missing.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: `Productos inválidos o inactivos: ${missing.join(', ')}` });
     }
 
-    const inserted = await pool.query(
-      `INSERT INTO control_inventario_guardia (
-         almacenista,
-         turno_actual,
-         momento_conteo,
-         id_producto,
-         cantidad_fisica_contada,
-         fecha_elaboracion,
-         almacen
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id_control, created_at`,
-      [
-        cleanAlmacenista,
-        cleanTurno,
-        cleanMomento,
-        productoId,
-        Math.floor(cantidadContada),
-        cleanFechaElaboracion,
-        cleanAlmacen,
-      ]
-    );
+    const insertedRows = [];
+    for (const item of detalleNormalizado) {
+      const inserted = await client.query(
+        `INSERT INTO control_inventario_guardia (
+           almacenista,
+           turno_actual,
+           momento_conteo,
+           id_producto,
+           cantidad_fisica_contada,
+           fecha_elaboracion,
+           almacen
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id_control, created_at, id_producto, cantidad_fisica_contada, fecha_elaboracion`,
+        [
+          cleanAlmacenista,
+          cleanTurno,
+          cleanMomento,
+          item.id_producto,
+          Math.floor(item.cantidad_fisica_contada),
+          item.fecha_elaboracion,
+          cleanAlmacen,
+        ]
+      );
+      insertedRows.push(inserted.rows[0]);
+    }
 
-    return res.status(201).json({ ok: true, record: inserted.rows[0] });
+    await client.query('COMMIT');
+    return res.status(201).json({ ok: true, total: insertedRows.length, rows: insertedRows });
   } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
     return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
