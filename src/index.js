@@ -167,6 +167,12 @@ async function ensureControlInventarioTable() {
   `);
 }
 
+async function dropLegacyLotesTables() {
+  // Tablas legacy no usadas por el flujo actual (Almacen09/Empaquetado).
+  await pool.query('DROP TABLE IF EXISTS lote_productos CASCADE');
+  await pool.query('DROP TABLE IF EXISTS lotes CASCADE');
+}
+
 async function registrarErrorConteo(codigoLote) {
   try {
     await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [codigoLote || null]);
@@ -1250,6 +1256,7 @@ Promise.all([
   ensureProductosSoftDelete(),
   ensureHistoricoResultadosTable(),
   ensureControlInventarioTable(),
+  dropLegacyLotesTables(),
 ])
   .then(() => {
     app.listen(port, () => {
