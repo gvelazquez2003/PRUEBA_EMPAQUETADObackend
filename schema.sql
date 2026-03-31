@@ -65,6 +65,51 @@ CREATE TABLE mermas_detalle (
     numero_lote VARCHAR(50) NOT NULL
 );
 
+CREATE TABLE conteo_errores (
+    id SERIAL PRIMARY KEY,
+    codigo_lote VARCHAR(50),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE almacen_lotes_procesados (
+    codigo_lote VARCHAR(50) PRIMARY KEY,
+    estado VARCHAR(20) NOT NULL DEFAULT 'validado',
+    processed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    resumen_validacion JSONB
+);
+
+CREATE TABLE control_inventario_guardia (
+    id_control BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    almacenista VARCHAR(120) NOT NULL,
+    turno_actual VARCHAR(120) NOT NULL,
+    momento_conteo VARCHAR(180) NOT NULL,
+    id_producto INT NOT NULL REFERENCES productos(id_producto),
+    cantidad_fisica_contada INT NOT NULL,
+    fecha_elaboracion DATE NOT NULL,
+    almacen VARCHAR(20) NOT NULL
+);
+
+CREATE TABLE almacen09_salidas_facturas (
+    id_factura BIGSERIAL PRIMARY KEY,
+    numero_factura VARCHAR(80) NOT NULL UNIQUE,
+    fecha_emision TIMESTAMP NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    estado VARCHAR(20) NOT NULL DEFAULT 'emitida'
+);
+
+CREATE TABLE almacen09_salidas_detalle (
+    id_detalle BIGSERIAL PRIMARY KEY,
+    id_factura BIGINT NOT NULL REFERENCES almacen09_salidas_facturas(id_factura) ON DELETE CASCADE,
+    id_producto INT NOT NULL REFERENCES productos(id_producto),
+    codigo_producto VARCHAR(30) NOT NULL,
+    producto TEXT NOT NULL,
+    numero_lote VARCHAR(80) NOT NULL,
+    maquina VARCHAR(10),
+    cantidad INT NOT NULL CHECK (cantidad > 0),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 -- Insert data
 INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, cestas, sobre_piso) VALUES
 ('PTEM0001', 'PAN DE HAMBURGUESA 85 GR 6 UND', 'PAQ', 10, 1, 1),

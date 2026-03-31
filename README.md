@@ -33,8 +33,35 @@ Ejecuta el archivo `schema.sql` en tu proyecto de Neon.
 - `POST /api/empaquetados`
 - `POST /api/mermas`
 - `GET /api/registros?tipo=Empaquetado|Merma&limit=20`
+- `POST /api/control-inventario`
+- `GET /api/almacen09/stock-actual`
+- `POST /api/almacen09/salidas-facturas`
+- `GET /api/almacen09/salidas-facturas?limit=100`
 
-## 5) Despliegue en Render
+## 5) Mapa front -> tablas SQL (Neon)
+
+- Empaquetado (form principal):
+	- `empaquetados_cabecera`
+	- `empaquetados_detalle`
+	- catálogo auxiliar: `productos`, `destinos`, `responsables`, `sedes`
+- Almacén09 Entradas (validación de conteo):
+	- `almacen_lotes_procesados`
+	- `conteo_errores`
+	- referencia de origen: `empaquetados_cabecera`, `empaquetados_detalle`
+- Almacén09 Salidas (facturación):
+	- `almacen09_salidas_facturas`
+	- `almacen09_salidas_detalle`
+- Control de Inventario (cambio de guardia):
+	- `control_inventario_guardia`
+	- referencia de producto: `productos`
+- Histórico consolidado:
+	- `historico_resultados_consolidado`
+
+Notas:
+- `lotes` y `lote_productos` son tablas legacy y se eliminan automáticamente al iniciar el backend para evitar confusión.
+- El endpoint de stock (`/api/almacen09/stock-actual`) ya descuenta lo facturado en Salidas09.
+
+## 6) Despliegue en Render
 
 - Root Directory: dejar vacío (este repo ya es solo backend).
 - Build Command: `npm install`

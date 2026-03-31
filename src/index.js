@@ -167,6 +167,42 @@ async function ensureControlInventarioTable() {
   `);
 }
 
+async function ensureSalidas09Tables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS almacen09_salidas_facturas (
+      id_factura BIGSERIAL PRIMARY KEY,
+      numero_factura VARCHAR(80) NOT NULL UNIQUE,
+      fecha_emision TIMESTAMP NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      estado VARCHAR(20) NOT NULL DEFAULT 'emitida'
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS almacen09_salidas_detalle (
+      id_detalle BIGSERIAL PRIMARY KEY,
+      id_factura BIGINT NOT NULL REFERENCES almacen09_salidas_facturas(id_factura) ON DELETE CASCADE,
+      id_producto INT NOT NULL REFERENCES productos(id_producto),
+      codigo_producto VARCHAR(30) NOT NULL,
+      producto TEXT NOT NULL,
+      numero_lote VARCHAR(80) NOT NULL,
+      maquina VARCHAR(10),
+      cantidad INT NOT NULL CHECK (cantidad > 0),
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_fecha
+    ON almacen09_salidas_facturas (fecha_emision DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_codigo_lote
+    ON almacen09_salidas_detalle (codigo_producto, numero_lote)
+  `);
+}
+
 async function dropLegacyLotesTables() {
   // Tablas legacy no usadas por el flujo actual (Almacen09/Empaquetado).
   await pool.query('DROP TABLE IF EXISTS lote_productos CASCADE');
@@ -1218,30 +1254,194 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
   }
 });
 
+app.post('/api/almacen09/salidas-facturas', async (req, res) => {
+  const numeroFacturaRaw = String(req.body?.numero_factura || '').trim();
+  const fechaEmisionRaw = String(req.body?.fecha_emision || '').trim();
+  const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
+
+  const numeroFactura = numeroFacturaRaw.toUpperCase();
+  const fechaEmision = fechaEmisionRaw || new Date().toISOString();
+
+  if (!numeroFactura) {
+    return res.status(400).json({ ok: false, error: 'numero_factura es obligatorio' });
+  }
+  if (!detalleRaw.length) {
+    return res.status(400).json({ ok: false, error: 'detalle es obligatorio' });
+  }
+
+  const detalle = detalleRaw
+    .map((linea) => ({
+      codigo: String(linea?.codigo || '').trim().toUpperCase(),
+      producto: String(linea?.producto || '').trim(),
+      lote: String(linea?.lote || '').trim().toUpperCase(),
+      maquina: String(linea?.maquina || '').trim(),
+      cantidad: Number(linea?.cantidad),
+    }))
+    .filter((linea) => linea.codigo && linea.lote && Number.isFinite(linea.cantidad) && linea.cantidad > 0);
+
+  if (!detalle.length) {
+    return res.status(400).json({ ok: false, error: 'No hay líneas válidas en detalle' });
+  }
+
+  const distinctCodigos = [...new Set(detalle.map((linea) => linea.codigo))];
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const duplicated = await client.query(
+      'SELECT 1 FROM almacen09_salidas_facturas WHERE UPPER(TRIM(numero_factura)) = $1 LIMIT 1',
+      [numeroFactura]
+    );
+    if (duplicated.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ ok: false, error: 'El serial de factura ya existe' });
+    }
+
+    const productsResult = await client.query(
+      `SELECT id_producto, UPPER(TRIM(codigo_producto)) AS codigo_producto, descripcion
+       FROM productos
+       WHERE UPPER(TRIM(codigo_producto)) = ANY($1::text[])`,
+      [distinctCodigos]
+    );
+
+    const productMap = new Map();
+    productsResult.rows.forEach((row) => {
+      productMap.set(String(row.codigo_producto || '').trim().toUpperCase(), {
+        id_producto: Number(row.id_producto),
+        descripcion: String(row.descripcion || '').trim(),
+      });
+    });
+
+    const missingCodigos = distinctCodigos.filter((codigo) => !productMap.has(codigo));
+    if (missingCodigos.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: `Códigos no encontrados: ${missingCodigos.join(', ')}` });
+    }
+
+    const facturaInsert = await client.query(
+      `INSERT INTO almacen09_salidas_facturas (numero_factura, fecha_emision, estado)
+       VALUES ($1, $2, 'emitida')
+       RETURNING id_factura, numero_factura, fecha_emision`,
+      [numeroFactura, fechaEmision]
+    );
+
+    const idFactura = Number(facturaInsert.rows[0].id_factura);
+    for (const linea of detalle) {
+      const product = productMap.get(linea.codigo);
+      await client.query(
+        `INSERT INTO almacen09_salidas_detalle (
+           id_factura,
+           id_producto,
+           codigo_producto,
+           producto,
+           numero_lote,
+           maquina,
+           cantidad
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          idFactura,
+          Number(product.id_producto),
+          linea.codigo,
+          linea.producto || product.descripcion,
+          linea.lote,
+          linea.maquina || null,
+          Math.floor(linea.cantidad),
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      ok: true,
+      factura: {
+        id_factura: idFactura,
+        numero_factura: facturaInsert.rows[0].numero_factura,
+        fecha_emision: facturaInsert.rows[0].fecha_emision,
+        lineas: detalle.length,
+      },
+    });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/almacen09/salidas-facturas', async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query?.limit || 100), 1), 500);
+  try {
+    const result = await pool.query(
+      `SELECT
+         sf.id_factura,
+         sf.numero_factura,
+         TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD HH24:MI:SS') AS fecha_emision,
+         sd.codigo_producto,
+         sd.producto,
+         sd.numero_lote,
+         sd.maquina,
+         sd.cantidad
+       FROM almacen09_salidas_facturas sf
+       JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
+       ORDER BY sf.fecha_emision DESC, sf.id_factura DESC, sd.id_detalle ASC
+       LIMIT $1`,
+      [limit]
+    );
+    return res.json({ ok: true, rows: result.rows, total: result.rowCount || 0 });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/api/almacen09/stock-actual', async (req, res) => {
   const desdeRaw = String(req.query?.desde || STOCK_RESET_DATE).trim();
   const desde = /^\d{4}-\d{2}-\d{2}$/.test(desdeRaw) ? desdeRaw : STOCK_RESET_DATE;
 
   try {
     const result = await pool.query(
-      `SELECT
-         p.codigo_producto,
-         p.descripcion AS producto,
-         UPPER(TRIM(ed.numero_lote)) AS numero_lote,
-         TO_CHAR(DATE(ec.fecha_hora), 'YYYY-MM-DD') AS fecha_empaquetado,
-         SUM(ed.cantidad)::int AS cantidad
-       FROM almacen_lotes_procesados alp
-       JOIN empaquetados_cabecera ec
-         ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
-       JOIN destinos d ON d.id_destino = ec.id_destino
-       JOIN empaquetados_detalle ed ON ed.id_cabecera = ec.id_cabecera
-       JOIN productos p ON p.id_producto = ed.id_producto
-       WHERE alp.estado = 'validado'
-         AND DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
-         AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
-         AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-       GROUP BY p.codigo_producto, p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
-       ORDER BY p.codigo_producto, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)`,
+      `WITH stock_validado AS (
+         SELECT
+           UPPER(TRIM(p.codigo_producto)) AS codigo_producto,
+           p.descripcion AS producto,
+           UPPER(TRIM(ed.numero_lote)) AS numero_lote,
+           DATE(ec.fecha_hora) AS fecha_empaquetado,
+           SUM(ed.cantidad)::int AS cantidad
+         FROM almacen_lotes_procesados alp
+         JOIN empaquetados_cabecera ec
+           ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
+         JOIN destinos d ON d.id_destino = ec.id_destino
+         JOIN empaquetados_detalle ed ON ed.id_cabecera = ec.id_cabecera
+         JOIN productos p ON p.id_producto = ed.id_producto
+         WHERE alp.estado = 'validado'
+           AND DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+           AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
+           AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
+         GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
+       ),
+       salidas AS (
+         SELECT
+           UPPER(TRIM(sd.codigo_producto)) AS codigo_producto,
+           UPPER(TRIM(sd.numero_lote)) AS numero_lote,
+           SUM(sd.cantidad)::int AS cantidad_salida
+         FROM almacen09_salidas_detalle sd
+         JOIN almacen09_salidas_facturas sf ON sf.id_factura = sd.id_factura
+         WHERE DATE(sf.fecha_emision) >= $1
+         GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
+       )
+       SELECT
+         sv.codigo_producto,
+         sv.producto,
+         sv.numero_lote,
+         TO_CHAR(sv.fecha_empaquetado, 'YYYY-MM-DD') AS fecha_empaquetado,
+         GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0))::int AS cantidad
+       FROM stock_validado sv
+       LEFT JOIN salidas sa
+         ON sa.codigo_producto = sv.codigo_producto
+        AND sa.numero_lote = sv.numero_lote
+       WHERE GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0)) > 0
+       ORDER BY sv.codigo_producto, sv.numero_lote, sv.fecha_empaquetado`,
       [desde]
     );
 
@@ -1256,6 +1456,7 @@ Promise.all([
   ensureProductosSoftDelete(),
   ensureHistoricoResultadosTable(),
   ensureControlInventarioTable(),
+  ensureSalidas09Tables(),
   dropLegacyLotesTables(),
 ])
   .then(() => {
