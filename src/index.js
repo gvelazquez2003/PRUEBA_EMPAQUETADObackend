@@ -146,6 +146,27 @@ async function ensureHistoricoResultadosTable() {
   `);
 }
 
+async function ensureControlInventarioTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS control_inventario_guardia (
+      id_control BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      almacenista VARCHAR(120) NOT NULL,
+      turno_actual VARCHAR(120) NOT NULL,
+      momento_conteo VARCHAR(180) NOT NULL,
+      id_producto INT NOT NULL REFERENCES productos(id_producto),
+      cantidad_fisica_contada INT NOT NULL,
+      fecha_elaboracion DATE NOT NULL,
+      almacen VARCHAR(20) NOT NULL
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_created_at
+    ON control_inventario_guardia (created_at DESC)
+  `);
+}
+
 async function registrarErrorConteo(codigoLote) {
   try {
     await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [codigoLote || null]);
@@ -349,6 +370,80 @@ app.post('/api/empaquetados', async (req, res) => {
     res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
+  }
+});
+
+app.post('/api/control-inventario', async (req, res) => {
+  const {
+    almacenista,
+    turno_actual,
+    momento_conteo,
+    id_producto,
+    cantidad_fisica_contada,
+    fecha_elaboracion,
+    almacen,
+  } = req.body || {};
+
+  const cleanAlmacenista = String(almacenista || '').trim();
+  const cleanTurno = String(turno_actual || '').trim();
+  const cleanMomento = String(momento_conteo || '').trim();
+  const productoId = Number(id_producto);
+  const cantidadContada = Number(cantidad_fisica_contada);
+  const cleanFechaElaboracion = String(fecha_elaboracion || '').trim();
+  const cleanAlmacen = String(almacen || '').trim();
+
+  if (
+    !cleanAlmacenista ||
+    !cleanTurno ||
+    !cleanMomento ||
+    !Number.isInteger(productoId) || productoId <= 0 ||
+    !Number.isFinite(cantidadContada) || cantidadContada <= 0 ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(cleanFechaElaboracion) ||
+    !cleanAlmacen
+  ) {
+    return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios o formato inválido' });
+  }
+
+  try {
+    const product = await pool.query(
+      `SELECT id_producto
+       FROM productos
+       WHERE id_producto = $1
+         AND COALESCE(activo, TRUE) = TRUE
+       LIMIT 1`,
+      [productoId]
+    );
+
+    if (!product.rowCount) {
+      return res.status(400).json({ ok: false, error: 'Producto inválido o inactivo' });
+    }
+
+    const inserted = await pool.query(
+      `INSERT INTO control_inventario_guardia (
+         almacenista,
+         turno_actual,
+         momento_conteo,
+         id_producto,
+         cantidad_fisica_contada,
+         fecha_elaboracion,
+         almacen
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id_control, created_at`,
+      [
+        cleanAlmacenista,
+        cleanTurno,
+        cleanMomento,
+        productoId,
+        Math.floor(cantidadContada),
+        cleanFechaElaboracion,
+        cleanAlmacen,
+      ]
+    );
+
+    return res.status(201).json({ ok: true, record: inserted.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -1150,7 +1245,12 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
   }
 });
 
-Promise.all([ensureAlmacen09Tables(), ensureProductosSoftDelete(), ensureHistoricoResultadosTable()])
+Promise.all([
+  ensureAlmacen09Tables(),
+  ensureProductosSoftDelete(),
+  ensureHistoricoResultadosTable(),
+  ensureControlInventarioTable(),
+])
   .then(() => {
     app.listen(port, () => {
       console.log(`Servidor escuchando en puerto ${port}`);
