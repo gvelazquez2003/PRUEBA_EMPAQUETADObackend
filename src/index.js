@@ -584,7 +584,8 @@ app.get('/api/registros', async (req, res) => {
       const result = await pool.query(
         `WITH actual AS (
           SELECT
-            ed.id_detalle AS "__ROW_ID",
+            ed.id_detalle::bigint AS "__ROW_ID",
+            'empaquetados_detalle'::text AS "__ROW_SOURCE",
             TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
             TO_CHAR(ec.fecha_hora, 'DD/MM/YYYY HH24:MI') AS "Fecha Empaquetado",
             CASE
@@ -612,7 +613,8 @@ app.get('/api/registros', async (req, res) => {
         ),
         historico AS (
           SELECT
-            NULL::int AS "__ROW_ID",
+            hr.id_historico AS "__ROW_ID",
+            'historico_resultados_consolidado'::text AS "__ROW_SOURCE",
             TO_CHAR(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp), 'YYYY-MM-DD') AS "FECHA",
             CASE
               WHEN hr.fecha_empaquetado IS NOT NULL THEN TO_CHAR(hr.fecha_empaquetado, 'DD/MM/YYYY HH24:MI')
@@ -642,6 +644,7 @@ app.get('/api/registros', async (req, res) => {
         )
         SELECT
           "__ROW_ID",
+          "__ROW_SOURCE",
           "FECHA",
           "Fecha Empaquetado",
           "Fecha Almacen09",
@@ -927,40 +930,93 @@ app.get('/api/registros', async (req, res) => {
 });
 
 app.post('/api/registros/delete', async (req, res) => {
-  const idsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  const ids = idsRaw.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0);
+  const rowsRaw = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const rows = rowsRaw
+    .map((row) => ({
+      source: String(row?.source || '').trim().toLowerCase(),
+      id: String(row?.id ?? '').trim(),
+    }))
+    .filter((row) => {
+      if (!/^\d+$/.test(row.id) || row.id === '0') return false;
+      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado';
+    });
 
-  if (!ids.length) {
-    return res.status(400).json({ ok: false, error: 'ids es obligatorio y debe contener valores válidos' });
+  const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const legacyIds = legacyIdsRaw
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0);
+
+  const detalleIdsSet = new Set(legacyIds);
+  const historicoIdsSet = new Set();
+
+  rows.forEach((row) => {
+    if (row.source === 'empaquetados_detalle') {
+      detalleIdsSet.add(Number(row.id));
+      return;
+    }
+    historicoIdsSet.add(row.id);
+  });
+
+  const detalleIds = Array.from(detalleIdsSet).filter((id) => Number.isInteger(id) && id > 0);
+  const historicoIds = Array.from(historicoIdsSet);
+
+  if (!detalleIds.length && !historicoIds.length) {
+    return res.status(400).json({ ok: false, error: 'rows o ids es obligatorio y debe contener valores válidos' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const deleted = await client.query(
-      `DELETE FROM empaquetados_detalle
-       WHERE id_detalle = ANY($1::int[])
-       RETURNING id_cabecera`,
-      [ids]
-    );
+    let deletedTotal = 0;
+    let deletedDetalleCount = 0;
+    let deletedHistoricoCount = 0;
+    let deletedCabecerasCount = 0;
 
-    const cabeceras = [...new Set(deleted.rows.map((row) => Number(row.id_cabecera)).filter(Boolean))];
-    if (cabeceras.length) {
-      await client.query(
-        `DELETE FROM empaquetados_cabecera ec
-         WHERE ec.id_cabecera = ANY($1::int[])
-           AND NOT EXISTS (
-             SELECT 1
-             FROM empaquetados_detalle ed
-             WHERE ed.id_cabecera = ec.id_cabecera
-           )`,
-        [cabeceras]
+    if (detalleIds.length) {
+      const deleted = await client.query(
+        `DELETE FROM empaquetados_detalle
+         WHERE id_detalle = ANY($1::int[])
+         RETURNING id_cabecera`,
+        [detalleIds]
       );
+      deletedDetalleCount = deleted.rowCount || 0;
+      deletedTotal += deletedDetalleCount;
+
+      const cabeceras = [...new Set(deleted.rows.map((row) => Number(row.id_cabecera)).filter(Boolean))];
+      if (cabeceras.length) {
+        const deletedCabeceras = await client.query(
+          `DELETE FROM empaquetados_cabecera ec
+           WHERE ec.id_cabecera = ANY($1::int[])
+             AND NOT EXISTS (
+               SELECT 1
+               FROM empaquetados_detalle ed
+               WHERE ed.id_cabecera = ec.id_cabecera
+             )`,
+          [cabeceras]
+        );
+        deletedCabecerasCount = deletedCabeceras.rowCount || 0;
+      }
+    }
+
+    if (historicoIds.length) {
+      const deletedHistorico = await client.query(
+        `DELETE FROM historico_resultados_consolidado
+         WHERE id_historico = ANY($1::bigint[])`,
+        [historicoIds]
+      );
+      deletedHistoricoCount = deletedHistorico.rowCount || 0;
+      deletedTotal += deletedHistoricoCount;
     }
 
     await client.query('COMMIT');
-    return res.json({ ok: true, deleted: deleted.rowCount || 0 });
+    return res.json({
+      ok: true,
+      deleted: deletedTotal,
+      deleted_detalle: deletedDetalleCount,
+      deleted_historico: deletedHistoricoCount,
+      deleted_cabeceras: deletedCabecerasCount,
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     return res.status(500).json({ ok: false, error: error.message });
