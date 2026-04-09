@@ -395,10 +395,7 @@ app.post('/auth/logout', async (req, res) => {
   }
 });
 
-app.get('/auth/users', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
-  if (!auth) return;
-
+async function listRegisteredUsers(_auth, res) {
   try {
     const result = await pool.query(
       `SELECT username, role, created_at
@@ -417,6 +414,18 @@ app.get('/auth/users', async (req, res) => {
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
+}
+
+app.get('/auth/users', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  return listRegisteredUsers(auth, res);
+});
+
+app.get('/auth/users/registered', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  return listRegisteredUsers(auth, res);
 });
 
 async function deleteAuthUserWithAdmin(auth, targetUser) {
