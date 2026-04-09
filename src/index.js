@@ -419,15 +419,7 @@ app.get('/auth/users', async (req, res) => {
   }
 });
 
-app.delete('/auth/users/:username', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
-  if (!auth) return;
-
-  const targetUser = normalizeAuthUsername(req.params?.username);
-  if (!targetUser) {
-    return res.status(400).json({ ok: false, error: 'username inválido' });
-  }
-
+async function deleteAuthUserWithAdmin(auth, targetUser) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -443,7 +435,7 @@ app.delete('/auth/users/:username', async (req, res) => {
 
     if (!targetResult.rowCount) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ ok: false, error: 'Usuario no encontrado' });
+      return { ok: false, status: 404, error: 'Usuario no encontrado' };
     }
 
     const target = targetResult.rows[0];
@@ -457,24 +449,59 @@ app.delete('/auth/users/:username', async (req, res) => {
       const adminsTotal = Number(adminsResult.rows[0]?.total || 0);
       if (adminsTotal <= 1) {
         await client.query('ROLLBACK');
-        return res.status(400).json({ ok: false, error: 'Debe existir al menos un Administrador activo' });
+        return { ok: false, status: 400, error: 'Debe existir al menos un Administrador activo' };
       }
     }
 
     await client.query('DELETE FROM auth_users WHERE id_user = $1', [Number(target.id_user)]);
 
     await client.query('COMMIT');
-    return res.json({
+    return {
       ok: true,
-      deleted: { username: String(target.username || '').trim() },
-      currentUserDeleted: String(auth.username || '').trim() === String(target.username || '').trim(),
-    });
+      payload: {
+        ok: true,
+        deleted: { username: String(target.username || '').trim() },
+        currentUserDeleted: String(auth.username || '').trim() === String(target.username || '').trim(),
+      },
+    };
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch (_) {}
-    return res.status(500).json({ ok: false, error: error.message });
+    return { ok: false, status: 500, error: error.message };
   } finally {
     client.release();
   }
+}
+
+app.delete('/auth/users/:username', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const targetUser = normalizeAuthUsername(req.params?.username);
+  if (!targetUser) {
+    return res.status(400).json({ ok: false, error: 'username inválido' });
+  }
+
+  const result = await deleteAuthUserWithAdmin(auth, targetUser);
+  if (!result.ok) {
+    return res.status(result.status).json({ ok: false, error: result.error });
+  }
+  return res.json(result.payload);
+});
+
+app.post('/auth/users/delete', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const targetUser = normalizeAuthUsername(req.body?.username);
+  if (!targetUser) {
+    return res.status(400).json({ ok: false, error: 'username inválido' });
+  }
+
+  const result = await deleteAuthUserWithAdmin(auth, targetUser);
+  if (!result.ok) {
+    return res.status(result.status).json({ ok: false, error: result.error });
+  }
+  return res.json(result.payload);
 });
 
 async function ensureAlmacen09Tables() {
