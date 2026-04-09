@@ -38,13 +38,43 @@ const corsOrigins = rawCorsOrigin
   : ['*'];
 const allowAnyOrigin = corsOrigins.includes('*') || corsOrigins.includes('https://*') || corsOrigins.includes('http://*');
 
+function originMatchesRule(rule, origin) {
+  if (!rule || !origin) return false;
+  if (rule === origin) return true;
+  if (rule.includes('*')) {
+    const escaped = rule.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    return new RegExp(`^${escaped}$`, 'i').test(origin);
+  }
+  return false;
+}
+
+function isAllowedOrigin(origin) {
+  if (allowAnyOrigin || !origin) return true;
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (!normalizedOrigin) return true;
+
+  // "null" origin is common when opening static files directly.
+  if (normalizedOrigin === 'null') return true;
+
+  if (corsOrigins.some((rule) => originMatchesRule(rule, normalizedOrigin))) {
+    return true;
+  }
+
+  try {
+    const parsed = new URL(normalizedOrigin);
+    const host = String(parsed.hostname || '').toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1') return true;
+    if (host.endsWith('.vercel.app')) return true;
+  } catch (_) {}
+
+  return false;
+}
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (allowAnyOrigin || !origin) return callback(null, true);
-      const normalizedOrigin = normalizeOrigin(origin);
-      const isAllowed = corsOrigins.includes(normalizedOrigin);
-      return callback(isAllowed ? null : new Error('Not allowed by CORS'), isAllowed);
+      const isAllowed = isAllowedOrigin(origin);
+      return callback(null, isAllowed);
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -54,7 +84,7 @@ app.options('*', cors());
 
 app.use((req, res, next) => {
   const requestOrigin = req.headers.origin;
-  if (allowAnyOrigin && requestOrigin) {
+  if (requestOrigin && isAllowedOrigin(requestOrigin)) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin);
     res.setHeader('Vary', 'Origin');
   }
