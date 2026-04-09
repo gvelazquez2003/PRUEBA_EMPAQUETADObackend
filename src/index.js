@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -10,6 +11,12 @@ const port = Number(process.env.PORT || 3001);
 const adminKey = process.env.ADMIN_KEY || '#FANDETATA';
 const legacyAdminKey = '#FANDETATA';
 const STOCK_RESET_DATE = String(process.env.STOCK_RESET_DATE || '2026-03-30').trim();
+const AUTH_SESSION_TTL_HOURS = Number(process.env.AUTH_SESSION_TTL_HOURS || 168);
+const APP_ROLES = {
+  ADMIN: 'administrador',
+  EMPAQUETADO: 'empaquetado',
+  ALMACEN: 'almacen',
+};
 
 function normalizeOrigin(value) {
   const raw = String(value || '').trim().replace(/^['"]|['"]$/g, '');
@@ -73,6 +80,402 @@ function isValidAdminKey(sentKey) {
   if (!normalized) return false;
   return normalized === String(adminKey || '').trim() || normalized === legacyAdminKey;
 }
+
+function normalizeAuthRole(value) {
+  const role = String(value || '').trim().toLowerCase();
+  if (role === APP_ROLES.ADMIN) return APP_ROLES.ADMIN;
+  if (role === APP_ROLES.EMPAQUETADO) return APP_ROLES.EMPAQUETADO;
+  if (role === APP_ROLES.ALMACEN) return APP_ROLES.ALMACEN;
+  return '';
+}
+
+function normalizeAuthUsername(value) {
+  return String(value || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 10);
+}
+
+function hashPassword(password) {
+  const clean = String(password || '');
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(clean, salt, 64).toString('hex');
+  return `scrypt:${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash) {
+  const cleanStored = String(storedHash || '').trim();
+  if (!cleanStored) return false;
+
+  if (cleanStored.startsWith('plain:')) {
+    return cleanStored === `plain:${String(password || '')}`;
+  }
+
+  if (!cleanStored.startsWith('scrypt:')) return false;
+  const parts = cleanStored.split(':');
+  if (parts.length !== 3) return false;
+
+  const salt = parts[1];
+  const hash = parts[2];
+  const computed = crypto.scryptSync(String(password || ''), salt, 64).toString('hex');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(computed, 'hex'));
+  } catch (_) {
+    return false;
+  }
+}
+
+function getRequestToken(req) {
+  const authHeader = String(req.headers.authorization || '').trim();
+  const match = /^Bearer\s+(.+)$/i.exec(authHeader);
+  if (match && match[1]) return String(match[1]).trim();
+
+  const queryToken = String(req.query?.token || '').trim();
+  if (queryToken) return queryToken;
+
+  const bodyToken = String(req.body?.token || '').trim();
+  if (bodyToken) return bodyToken;
+
+  return '';
+}
+
+function buildAuthSessionResponse(row) {
+  return {
+    token: String(row.token || '').trim(),
+    username: String(row.username || '').trim(),
+    role: normalizeAuthRole(row.role),
+    loggedAt: row.loggedAt || row.logged_at || row.created_at || new Date().toISOString(),
+    expiresAt: row.expiresAt || row.expires_at || null,
+  };
+}
+
+async function createSessionForUser(userId, req) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const hasTtl = Number.isFinite(AUTH_SESSION_TTL_HOURS) && AUTH_SESSION_TTL_HOURS > 0;
+  const expiresAt = hasTtl ? new Date(Date.now() + AUTH_SESSION_TTL_HOURS * 60 * 60 * 1000) : null;
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const ip = forwarded || req.ip || null;
+  const userAgent = String(req.headers['user-agent'] || '').slice(0, 1000) || null;
+
+  await pool.query(
+    `INSERT INTO auth_sessions (token, id_user, expires_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [token, Number(userId), expiresAt, userAgent, ip]
+  );
+
+  return { token, expiresAt };
+}
+
+async function getSessionContext(token, touch) {
+  const cleanToken = String(token || '').trim();
+  if (!cleanToken) return null;
+
+  const result = await pool.query(
+    `SELECT
+       s.token,
+       s.id_user,
+       s.created_at AS logged_at,
+       s.expires_at,
+       u.username,
+       u.role
+     FROM auth_sessions s
+     JOIN auth_users u ON u.id_user = s.id_user
+     WHERE s.token = $1
+       AND s.revoked_at IS NULL
+       AND (s.expires_at IS NULL OR s.expires_at > NOW())
+       AND u.activo = TRUE
+     LIMIT 1`,
+    [cleanToken]
+  );
+
+  if (!result.rowCount) return null;
+  if (touch) {
+    await pool.query('UPDATE auth_sessions SET last_seen_at = NOW() WHERE token = $1', [cleanToken]);
+  }
+
+  const row = result.rows[0];
+  return {
+    token: String(row.token || '').trim(),
+    userId: Number(row.id_user),
+    username: String(row.username || '').trim(),
+    role: normalizeAuthRole(row.role),
+    loggedAt: row.logged_at,
+    expiresAt: row.expires_at || null,
+  };
+}
+
+async function requireRolesForRequest(req, res, allowedRoles) {
+  const token = getRequestToken(req);
+  const session = await getSessionContext(token, true);
+  if (!session) {
+    res.status(401).json({ ok: false, error: 'Sesión inválida o expirada' });
+    return null;
+  }
+
+  if (Array.isArray(allowedRoles) && allowedRoles.length && !allowedRoles.includes(session.role)) {
+    res.status(403).json({ ok: false, error: 'No autorizado para esta operación' });
+    return null;
+  }
+
+  req.auth = session;
+  return session;
+}
+
+async function hasAdminAccess(req) {
+  const sentKey = req.body?.adminKey || req.query?.adminKey || req.headers['x-admin-key'];
+  if (isValidAdminKey(sentKey)) return true;
+
+  const token = getRequestToken(req);
+  if (!token) return false;
+
+  const session = await getSessionContext(token, true);
+  if (!session || session.role !== APP_ROLES.ADMIN) return false;
+  req.auth = session;
+  return true;
+}
+
+async function ensureAuthTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS auth_users (
+      id_user SERIAL PRIMARY KEY,
+      username VARCHAR(10) NOT NULL UNIQUE,
+      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'empaquetado', 'almacen')),
+      password_hash TEXT NOT NULL,
+      activo BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      token VARCHAR(128) PRIMARY KEY,
+      id_user INT NOT NULL REFERENCES auth_users(id_user) ON DELETE CASCADE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMP NULL,
+      revoked_at TIMESTAMP NULL,
+      user_agent TEXT,
+      ip_address VARCHAR(80)
+    )
+  `);
+
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_users_role ON auth_users(role)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(id_user)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_sessions_revoked ON auth_sessions(revoked_at)');
+}
+
+app.post('/auth/register', async (req, res) => {
+  const username = normalizeAuthUsername(req.body?.username);
+  const role = normalizeAuthRole(req.body?.role);
+  const password = String(req.body?.password || '');
+  const sentAdminKey = String(req.body?.adminKey || '').trim();
+
+  if (!username || username.length < 2) {
+    return res.status(400).json({ ok: false, error: 'username inválido' });
+  }
+  if (!role) {
+    return res.status(400).json({ ok: false, error: 'role inválido' });
+  }
+  if (password.length < 4) {
+    return res.status(400).json({ ok: false, error: 'password inválido' });
+  }
+  if (role === APP_ROLES.ADMIN && !isValidAdminKey(sentAdminKey)) {
+    return res.status(403).json({ ok: false, error: 'adminKey inválido' });
+  }
+
+  try {
+    const passwordHash = hashPassword(password);
+    const inserted = await pool.query(
+      `INSERT INTO auth_users (username, role, password_hash, activo)
+       VALUES ($1, $2, $3, TRUE)
+       RETURNING id_user, username, role, created_at`,
+      [username, role, passwordHash]
+    );
+
+    const user = inserted.rows[0];
+    const sessionData = await createSessionForUser(Number(user.id_user), req);
+    const session = {
+      token: sessionData.token,
+      username: String(user.username || '').trim(),
+      role: normalizeAuthRole(user.role),
+      loggedAt: user.created_at,
+      expiresAt: sessionData.expiresAt,
+    };
+    return res.status(201).json({ ok: true, session });
+  } catch (error) {
+    if (error && error.code === '23505') {
+      return res.status(409).json({ ok: false, error: 'Ese usuario ya existe' });
+    }
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  const username = normalizeAuthUsername(req.body?.username);
+  const role = normalizeAuthRole(req.body?.role);
+  const password = String(req.body?.password || '');
+
+  if (!username || !role || password.length < 4) {
+    return res.status(400).json({ ok: false, error: 'Credenciales inválidas' });
+  }
+
+  try {
+    const userResult = await pool.query(
+      `SELECT id_user, username, role, password_hash, created_at
+       FROM auth_users
+       WHERE username = $1
+         AND activo = TRUE
+       LIMIT 1`,
+      [username]
+    );
+
+    if (!userResult.rowCount) {
+      return res.status(401).json({ ok: false, error: 'Credenciales inválidas' });
+    }
+
+    const user = userResult.rows[0];
+    if (normalizeAuthRole(user.role) !== role) {
+      return res.status(401).json({ ok: false, error: 'Credenciales inválidas' });
+    }
+
+    if (!verifyPassword(password, user.password_hash)) {
+      return res.status(401).json({ ok: false, error: 'Credenciales inválidas' });
+    }
+
+    const sessionData = await createSessionForUser(Number(user.id_user), req);
+    const session = {
+      token: sessionData.token,
+      username: String(user.username || '').trim(),
+      role: normalizeAuthRole(user.role),
+      loggedAt: new Date().toISOString(),
+      expiresAt: sessionData.expiresAt,
+    };
+    return res.json({ ok: true, session });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/auth/session', async (req, res) => {
+  const token = getRequestToken(req);
+  if (!token) {
+    return res.status(401).json({ ok: false, error: 'Token requerido' });
+  }
+
+  try {
+    const session = await getSessionContext(token, true);
+    if (!session) {
+      return res.status(401).json({ ok: false, error: 'Sesión inválida o expirada' });
+    }
+    return res.json({ ok: true, session: buildAuthSessionResponse(session) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/auth/logout', async (req, res) => {
+  const token = getRequestToken(req);
+  if (!token) {
+    return res.status(400).json({ ok: false, error: 'Token requerido' });
+  }
+
+  try {
+    await pool.query(
+      `UPDATE auth_sessions
+       SET revoked_at = NOW()
+       WHERE token = $1
+         AND revoked_at IS NULL`,
+      [token]
+    );
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/auth/users', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  try {
+    const result = await pool.query(
+      `SELECT username, role, created_at
+       FROM auth_users
+       WHERE activo = TRUE
+       ORDER BY
+         CASE role
+           WHEN 'administrador' THEN 0
+           WHEN 'almacen' THEN 1
+           WHEN 'empaquetado' THEN 2
+           ELSE 9
+         END,
+         username ASC`
+    );
+    return res.json({ ok: true, users: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.delete('/auth/users/:username', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const targetUser = normalizeAuthUsername(req.params?.username);
+  if (!targetUser) {
+    return res.status(400).json({ ok: false, error: 'username inválido' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const targetResult = await client.query(
+      `SELECT id_user, username, role
+       FROM auth_users
+       WHERE username = $1
+         AND activo = TRUE
+       LIMIT 1`,
+      [targetUser]
+    );
+
+    if (!targetResult.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Usuario no encontrado' });
+    }
+
+    const target = targetResult.rows[0];
+    if (normalizeAuthRole(target.role) === APP_ROLES.ADMIN) {
+      const adminsResult = await client.query(
+        `SELECT COUNT(*)::int AS total
+         FROM auth_users
+         WHERE activo = TRUE
+           AND role = 'administrador'`
+      );
+      const adminsTotal = Number(adminsResult.rows[0]?.total || 0);
+      if (adminsTotal <= 1) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ ok: false, error: 'Debe existir al menos un Administrador activo' });
+      }
+    }
+
+    await client.query('DELETE FROM auth_users WHERE id_user = $1', [Number(target.id_user)]);
+
+    await client.query('COMMIT');
+    return res.json({
+      ok: true,
+      deleted: { username: String(target.username || '').trim() },
+      currentUserDeleted: String(auth.username || '').trim() === String(target.username || '').trim(),
+    });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
 
 async function ensureAlmacen09Tables() {
   await pool.query(`
@@ -285,9 +688,8 @@ app.get('/productos', async (_req, res) => {
 });
 
 app.post('/productos', async (req, res) => {
-  const { codigo, descripcion, unidad, paquetes, sobre_piso, adminKey: bodyKey } = req.body;
-  const sentKey = bodyKey || req.query?.adminKey || req.headers['x-admin-key'];
-  if (!isValidAdminKey(sentKey)) {
+  const { codigo, descripcion, unidad, paquetes, sobre_piso } = req.body;
+  if (!(await hasAdminAccess(req))) {
     return res.status(403).json({ ok: false, error: 'adminKey inválido' });
   }
   if (!codigo || !descripcion) {
@@ -324,8 +726,7 @@ app.post('/productos', async (req, res) => {
 
 app.delete('/productos/:codigo', async (req, res) => {
   const { codigo } = req.params;
-  const sentKey = req.body?.adminKey || req.query?.adminKey || req.headers['x-admin-key'];
-  if (!isValidAdminKey(sentKey)) {
+  if (!(await hasAdminAccess(req))) {
     return res.status(403).json({ ok: false, error: 'adminKey inválido' });
   }
 
@@ -367,6 +768,9 @@ app.delete('/productos/:codigo', async (req, res) => {
 });
 
 app.post('/api/empaquetados', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.EMPAQUETADO]);
+  if (!auth) return;
+
   const { cabecera, detalle } = req.body || {};
   if (!cabecera || !Array.isArray(detalle) || !detalle.length) {
     return res.status(400).json({ ok: false, error: 'cabecera y detalle son obligatorios' });
@@ -416,6 +820,9 @@ app.post('/api/empaquetados', async (req, res) => {
 });
 
 app.post('/api/control-inventario', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
   const body = req.body || {};
   const hasDetalle = Array.isArray(body.detalle);
   const cabecera = hasDetalle ? body.cabecera || {} : body;
@@ -930,6 +1337,9 @@ app.get('/api/registros', async (req, res) => {
 });
 
 app.post('/api/registros/delete', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
   const rowsRaw = Array.isArray(req.body?.rows) ? req.body.rows : [];
   const rows = rowsRaw
     .map((row) => ({
@@ -1084,6 +1494,9 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
 });
 
 app.post('/api/almacen09/validar-conteo', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  if (!auth) return;
+
   const { codigo_lote, productos_y_cantidades } = req.body || {};
 
   if (!codigo_lote || !Array.isArray(productos_y_cantidades) || !productos_y_cantidades.length) {
@@ -1339,6 +1752,9 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
 });
 
 app.post('/api/almacen09/salidas-facturas', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  if (!auth) return;
+
   const numeroFacturaRaw = String(req.body?.numero_factura || '').trim();
   const fechaEmisionRaw = String(req.body?.fecha_emision || '').trim();
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
@@ -1536,6 +1952,7 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
 });
 
 Promise.all([
+  ensureAuthTables(),
   ensureAlmacen09Tables(),
   ensureProductosSoftDelete(),
   ensureHistoricoResultadosTable(),
