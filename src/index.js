@@ -17,6 +17,8 @@ const APP_ROLES = {
   EMPAQUETADO: 'empaquetado',
   ALMACEN: 'almacen',
 };
+const INITIAL_ADMIN_USERNAMES = ['ATovar', 'EValerio', 'LGil'];
+const INITIAL_ADMIN_PASSWORD = String(process.env.INITIAL_ADMIN_PASSWORD || 'Admin12345');
 
 function normalizeOrigin(value) {
   const raw = String(value || '').trim().replace(/^['"]|['"]$/g, '');
@@ -296,11 +298,32 @@ async function ensureAuthTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_sessions_revoked ON auth_sessions(revoked_at)');
 }
 
+async function ensureInitialAdminUsers() {
+  for (const rawUsername of INITIAL_ADMIN_USERNAMES) {
+    const username = normalizeAuthUsername(rawUsername);
+    if (!username) continue;
+
+    const passwordHash = hashPassword(INITIAL_ADMIN_PASSWORD);
+    await pool.query(
+      `INSERT INTO auth_users (username, role, password_hash, activo)
+       VALUES ($1, $2, $3, TRUE)
+       ON CONFLICT (username) DO UPDATE
+         SET role = EXCLUDED.role,
+             password_hash = EXCLUDED.password_hash,
+             activo = TRUE,
+             updated_at = NOW()`,
+      [username, APP_ROLES.ADMIN, passwordHash]
+    );
+  }
+}
+
 app.post('/auth/register', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
   const username = normalizeAuthUsername(req.body?.username);
   const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
-  const sentAdminKey = String(req.body?.adminKey || '').trim();
 
   if (!username || username.length < 2) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
@@ -310,9 +333,6 @@ app.post('/auth/register', async (req, res) => {
   }
   if (password.length < 4) {
     return res.status(400).json({ ok: false, error: 'password inválido' });
-  }
-  if (role === APP_ROLES.ADMIN && !isValidAdminKey(sentAdminKey)) {
-    return res.status(403).json({ ok: false, error: 'adminKey inválido' });
   }
 
   try {
@@ -325,15 +345,14 @@ app.post('/auth/register', async (req, res) => {
     );
 
     const user = inserted.rows[0];
-    const sessionData = await createSessionForUser(Number(user.id_user), req);
-    const session = {
-      token: sessionData.token,
-      username: String(user.username || '').trim(),
-      role: normalizeAuthRole(user.role),
-      loggedAt: user.created_at,
-      expiresAt: sessionData.expiresAt,
-    };
-    return res.status(201).json({ ok: true, session });
+    return res.status(201).json({
+      ok: true,
+      user: {
+        username: String(user.username || '').trim(),
+        role: normalizeAuthRole(user.role),
+        createdAt: user.created_at,
+      },
+    });
   } catch (error) {
     if (error && error.code === '23505') {
       return res.status(409).json({ ok: false, error: 'Ese usuario ya existe' });
@@ -2026,7 +2045,8 @@ Promise.all([
   ensureSalidas09Tables(),
   dropLegacyLotesTables(),
 ])
-  .then(() => {
+  .then(async () => {
+    await ensureInitialAdminUsers();
     app.listen(port, () => {
       console.log(`Servidor escuchando en puerto ${port}`);
     });
