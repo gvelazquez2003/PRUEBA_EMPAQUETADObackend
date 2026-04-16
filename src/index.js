@@ -751,9 +751,28 @@ app.get('/responsables', async (_req, res) => {
   }
 });
 
-app.get('/productos', async (_req, res) => {
+app.get('/productos', async (req, res) => {
   try {
-    const result = await pool.query(`
+    const rawQuery = String(req.query?.q || '').trim();
+    const hasCustomLimit = req.query && req.query.limit !== undefined;
+    const hasCustomOffset = req.query && req.query.offset !== undefined;
+    const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
+    const offset = Math.max(Number(req.query?.offset || 0), 0);
+    const isPagedRequest = hasCustomLimit || hasCustomOffset || rawQuery.length > 0;
+
+    const whereParts = ['COALESCE(activo, TRUE) = TRUE'];
+    const params = [];
+
+    if (rawQuery) {
+      params.push(`%${rawQuery}%`);
+      whereParts.push(`(
+        codigo_producto ILIKE $${params.length}
+        OR descripcion ILIKE $${params.length}
+      )`);
+    }
+
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const baseSelect = `
       SELECT
         id_producto,
         codigo_producto,
@@ -763,9 +782,34 @@ app.get('/productos', async (_req, res) => {
         paquetes AS paquetes_por_cesta,
         sobre_piso
       FROM productos
-      WHERE COALESCE(activo, TRUE) = TRUE
+      ${whereSql}
       ORDER BY codigo_producto ASC
-    `);
+    `;
+
+    let result;
+    if (isPagedRequest) {
+      const pagedParams = params.slice();
+      pagedParams.push(limit);
+      pagedParams.push(offset);
+
+      result = await pool.query(
+        `${baseSelect} LIMIT $${pagedParams.length - 1} OFFSET $${pagedParams.length}`,
+        pagedParams
+      );
+
+      const countResult = await pool.query(
+        `SELECT COUNT(*)::INT AS total FROM productos ${whereSql}`,
+        params
+      );
+      const total = Number(countResult.rows?.[0]?.total || 0);
+      res.setHeader('X-Total-Count', String(total));
+      res.setHeader('X-Limit', String(limit));
+      res.setHeader('X-Offset', String(offset));
+      res.setHeader('X-Has-More', String(offset + result.rows.length < total));
+    } else {
+      result = await pool.query(baseSelect);
+    }
+
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
