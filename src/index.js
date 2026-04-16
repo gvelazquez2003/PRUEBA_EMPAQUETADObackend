@@ -2027,8 +2027,37 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
 app.get('/api/almacen09/stock-actual', async (req, res) => {
   const desdeRaw = String(req.query?.desde || STOCK_RESET_DATE).trim();
   const desde = /^\d{4}-\d{2}-\d{2}$/.test(desdeRaw) ? desdeRaw : STOCK_RESET_DATE;
+  const q = String(req.query?.q || '').trim();
+  const codigo = String(req.query?.codigo || '').trim().toUpperCase();
+  const loteFiltro = String(req.query?.loteFiltro || '').trim().toLowerCase();
+  const rawLimit = Number(req.query?.limit);
+  const hasLimit = Number.isFinite(rawLimit) && rawLimit > 0;
+  const limit = hasLimit ? Math.min(Math.max(Math.floor(rawLimit), 1), 4000) : 0;
 
   try {
+    const params = [desde];
+    let dynamicWhere = '';
+
+    if (codigo) {
+      params.push(codigo);
+      dynamicWhere += ` AND sa.codigo_producto = $${params.length}`;
+    } else if (q) {
+      params.push(`%${q}%`);
+      dynamicWhere += ` AND (sa.codigo_producto ILIKE $${params.length} OR sa.producto ILIKE $${params.length})`;
+    }
+
+    if (loteFiltro === 'dia2a5') {
+      dynamicWhere += ' AND sa.age_days BETWEEN 2 AND 5';
+    } else if (loteFiltro === 'primeros2') {
+      dynamicWhere += ' AND sa.age_days BETWEEN 0 AND 1';
+    }
+
+    let limitSql = '';
+    if (hasLimit) {
+      params.push(limit);
+      limitSql = ` LIMIT $${params.length}`;
+    }
+
     const result = await pool.query(
       `WITH stock_validado AS (
          SELECT
@@ -2058,20 +2087,40 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
          JOIN almacen09_salidas_facturas sf ON sf.id_factura = sd.id_factura
          WHERE DATE(sf.fecha_emision) >= $1
          GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
+       ),
+       base AS (
+         SELECT
+           sv.codigo_producto,
+           sv.producto,
+           sv.numero_lote,
+           sv.fecha_empaquetado,
+           GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0))::int AS cantidad
+         FROM stock_validado sv
+         LEFT JOIN salidas sa
+           ON sa.codigo_producto = sv.codigo_producto
+          AND sa.numero_lote = sv.numero_lote
+         WHERE GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0)) > 0
+       ),
+       stock_actual AS (
+         SELECT
+           base.codigo_producto,
+           base.producto,
+           base.numero_lote,
+           base.fecha_empaquetado,
+           base.cantidad,
+           (DATE(NOW() AT TIME ZONE 'America/Caracas') - base.fecha_empaquetado)::int AS age_days
+         FROM base
        )
        SELECT
-         sv.codigo_producto,
-         sv.producto,
-         sv.numero_lote,
-         TO_CHAR(sv.fecha_empaquetado, 'YYYY-MM-DD') AS fecha_empaquetado,
-         GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0))::int AS cantidad
-       FROM stock_validado sv
-       LEFT JOIN salidas sa
-         ON sa.codigo_producto = sv.codigo_producto
-        AND sa.numero_lote = sv.numero_lote
-       WHERE GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0)) > 0
-       ORDER BY sv.codigo_producto, sv.numero_lote, sv.fecha_empaquetado`,
-      [desde]
+         sa.codigo_producto,
+         sa.producto,
+         sa.numero_lote,
+         TO_CHAR(sa.fecha_empaquetado, 'YYYY-MM-DD') AS fecha_empaquetado,
+         sa.cantidad
+       FROM stock_actual sa
+       WHERE 1=1 ${dynamicWhere}
+       ORDER BY sa.codigo_producto, sa.numero_lote, sa.fecha_empaquetado${limitSql}`,
+      params
     );
 
     return res.json({ ok: true, desde, rows: result.rows, total: result.rows.length });
