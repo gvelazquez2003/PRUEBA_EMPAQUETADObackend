@@ -896,6 +896,114 @@ app.delete('/productos/:codigo', async (req, res) => {
   }
 });
 
+app.post('/productos/purge-catalog', async (req, res) => {
+  if (!(await hasAdminAccess(req))) {
+    return res.status(403).json({ ok: false, error: 'adminKey inválido' });
+  }
+
+  const rawCodes = Array.isArray(req.body?.codigos) ? req.body.codigos : [];
+  const keepCodes = Array.from(
+    new Set(
+      rawCodes
+        .map((value) => String(value || '').trim().toUpperCase())
+        .filter(Boolean)
+    )
+  );
+
+  if (!keepCodes.length) {
+    return res.status(400).json({ ok: false, error: 'Debes enviar codigos con al menos 1 elemento.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE productos
+       SET activo = TRUE
+       WHERE UPPER(TRIM(codigo_producto)) = ANY($1::text[])`,
+      [keepCodes]
+    );
+
+    const candidates = await client.query(
+      `SELECT
+         p.id_producto,
+         p.codigo_producto,
+         EXISTS(SELECT 1 FROM empaquetados_detalle ed WHERE ed.id_producto = p.id_producto) AS used_empaquetados,
+         EXISTS(SELECT 1 FROM mermas_detalle md WHERE md.id_producto = p.id_producto) AS used_mermas,
+         EXISTS(SELECT 1 FROM control_inventario_guardia cg WHERE cg.id_producto = p.id_producto) AS used_control,
+         EXISTS(SELECT 1 FROM almacen09_salidas_detalle sd WHERE sd.id_producto = p.id_producto) AS used_salidas
+       FROM productos p
+       WHERE UPPER(TRIM(p.codigo_producto)) <> ALL($1::text[])
+       ORDER BY p.codigo_producto ASC`,
+      [keepCodes]
+    );
+
+    const deletableIds = [];
+    const blockedRows = [];
+
+    for (const row of candidates.rows) {
+      const hasRefs = Boolean(row.used_empaquetados) || Boolean(row.used_mermas) || Boolean(row.used_control) || Boolean(row.used_salidas);
+      if (hasRefs) {
+        blockedRows.push(row);
+      } else {
+        deletableIds.push(Number(row.id_producto));
+      }
+    }
+
+    let deletedCount = 0;
+    if (deletableIds.length) {
+      const deleted = await client.query(
+        `DELETE FROM productos
+         WHERE id_producto = ANY($1::int[])`,
+        [deletableIds]
+      );
+      deletedCount = Number(deleted.rowCount || 0);
+    }
+
+    let archivedCount = 0;
+    if (blockedRows.length) {
+      const blockedIds = blockedRows.map((row) => Number(row.id_producto));
+      const archived = await client.query(
+        `UPDATE productos
+         SET activo = FALSE
+         WHERE id_producto = ANY($1::int[])`,
+        [blockedIds]
+      );
+      archivedCount = Number(archived.rowCount || 0);
+    }
+
+    const finalCountResult = await client.query(
+      `SELECT COUNT(*)::int AS total
+       FROM productos
+       WHERE COALESCE(activo, TRUE) = TRUE`
+    );
+    const finalActiveCount = Number(finalCountResult.rows?.[0]?.total || 0);
+
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      keepCodes: keepCodes.length,
+      deleted: deletedCount,
+      archived: archivedCount,
+      activeAfterPurge: finalActiveCount,
+      blockedRefs: blockedRows.slice(0, 50).map((row) => ({
+        codigo: row.codigo_producto,
+        empaquetados: Boolean(row.used_empaquetados),
+        mermas: Boolean(row.used_mermas),
+        control: Boolean(row.used_control),
+        salidas: Boolean(row.used_salidas),
+      })),
+    });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post('/api/empaquetados', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.EMPAQUETADO]);
   if (!auth) return;
