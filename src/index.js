@@ -567,8 +567,35 @@ async function ensureAlmacen09Tables() {
     CREATE TABLE IF NOT EXISTS conteo_errores (
       id SERIAL PRIMARY KEY,
       codigo_lote VARCHAR(50),
+      lote_producto VARCHAR(120),
+      codigo_producto VARCHAR(30),
+      nombre_producto TEXT,
+      cantidad_esperada INT,
+      cantidad_recibida INT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
+  `);
+
+  // Backward-compatible migration for old deployments that only had codigo_lote + created_at.
+  await pool.query(`
+    ALTER TABLE conteo_errores
+    ADD COLUMN IF NOT EXISTS lote_producto VARCHAR(120)
+  `);
+  await pool.query(`
+    ALTER TABLE conteo_errores
+    ADD COLUMN IF NOT EXISTS codigo_producto VARCHAR(30)
+  `);
+  await pool.query(`
+    ALTER TABLE conteo_errores
+    ADD COLUMN IF NOT EXISTS nombre_producto TEXT
+  `);
+  await pool.query(`
+    ALTER TABLE conteo_errores
+    ADD COLUMN IF NOT EXISTS cantidad_esperada INT
+  `);
+  await pool.query(`
+    ALTER TABLE conteo_errores
+    ADD COLUMN IF NOT EXISTS cantidad_recibida INT
   `);
 
   await pool.query(`
@@ -697,9 +724,39 @@ async function dropLegacyLotesTables() {
   await pool.query('DROP TABLE IF EXISTS lotes CASCADE');
 }
 
-async function registrarErrorConteo(codigoLote) {
+async function registrarErrorConteo(codigoLote, erroresDetalle) {
   try {
-    await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [codigoLote || null]);
+    const cleanCodigoLote = String(codigoLote || '').trim().toUpperCase() || null;
+    const detalles = Array.isArray(erroresDetalle) ? erroresDetalle : [];
+
+    if (!detalles.length) {
+      await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [cleanCodigoLote]);
+      return;
+    }
+
+    for (const detalle of detalles) {
+      const loteProducto = String(detalle?.lote_producto || '').trim().toUpperCase() || null;
+      const codigoProducto = String(detalle?.codigo || '').trim().toUpperCase() || null;
+      const nombreProducto = String(detalle?.descripcion || '').trim() || null;
+
+      const esperadoRaw = Number(detalle?.esperado);
+      const recibidoRaw = Number(detalle?.recibido);
+      const esperado = Number.isFinite(esperadoRaw) ? esperadoRaw : null;
+      const recibido = Number.isFinite(recibidoRaw) ? recibidoRaw : null;
+
+      await pool.query(
+        `INSERT INTO conteo_errores (
+           codigo_lote,
+           lote_producto,
+           codigo_producto,
+           nombre_producto,
+           cantidad_esperada,
+           cantidad_recibida
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [cleanCodigoLote, loteProducto, codigoProducto, nombreProducto, esperado, recibido]
+      );
+    }
   } catch (error) {
     console.error('Error registrando conteo_errores:', error);
   }
@@ -1805,7 +1862,7 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
       if (codigo) cantidadesPorCodigo.set(codigo, cantidad);
     }
 
-    let hayMismatch = false;
+    const erroresConteoDetalle = [];
     const productosValidados = [];
     for (const producto of productosResult.rows) {
       const recibido = cantidadesPorLinea.has(producto.line_key)
@@ -1814,22 +1871,30 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
           ? cantidadesPorProductoId.get(producto.id)
           : cantidadesPorCodigo.get(producto.codigo);
 
-      if (recibido === undefined || Number.isNaN(recibido) || Number(recibido) !== Number(producto.cantidad)) {
-        hayMismatch = true;
-        break;
+      const esperado = Number(producto.cantidad);
+      const recibidoNumero = Number(recibido);
+      if (recibido === undefined || Number.isNaN(recibidoNumero) || recibidoNumero !== esperado) {
+        erroresConteoDetalle.push({
+          codigo: producto.codigo,
+          descripcion: producto.descripcion,
+          lote_producto: producto.lote_producto,
+          esperado,
+          recibido: recibido === undefined || Number.isNaN(recibidoNumero) ? null : recibidoNumero,
+        });
+        continue;
       }
 
       productosValidados.push({
         id: producto.id,
         codigo: producto.codigo,
         cantidad: producto.cantidad,
-        recibido,
+        recibido: recibidoNumero,
       });
     }
 
-    if (hayMismatch) {
+    if (erroresConteoDetalle.length) {
       await client.query('ROLLBACK');
-      await registrarErrorConteo(codigoRegistro);
+      await registrarErrorConteo(codigoRegistro, erroresConteoDetalle);
       return res.status(400).send('ERROR: Las cantidades no coinciden con el registro de Empaquetado. CUENTE DE NUEVO');
     }
 
@@ -1956,7 +2021,15 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
 
     const result = await pool.query(
       `WITH errores AS (
-         SELECT id, codigo_lote, created_at
+         SELECT
+           id,
+           codigo_lote,
+           lote_producto,
+           codigo_producto,
+           nombre_producto,
+           cantidad_esperada,
+           cantidad_recibida,
+           created_at
          FROM conteo_errores
          WHERE ${where}
        ),
@@ -1974,7 +2047,11 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
        SELECT
          e.id,
          e.codigo_lote,
-         COALESCE(lr.lote_referencia, e.codigo_lote) AS codigo_mostrado,
+         COALESCE(NULLIF(TRIM(e.lote_producto), ''), lr.lote_referencia, e.codigo_lote) AS lote_mostrado,
+         e.codigo_producto,
+         e.nombre_producto,
+         e.cantidad_esperada,
+         e.cantidad_recibida,
          e.created_at
        FROM errores e
        LEFT JOIN lotes_referencia lr ON lr.codigo_lote = e.codigo_lote
