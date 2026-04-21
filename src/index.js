@@ -1236,7 +1236,7 @@ app.post('/api/control-inventario', async (req, res) => {
 
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'Consolidado').trim().toLowerCase();
-  const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 5000);
+  const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 500);
   const offset = Math.max(Number(req.query.offset || 0), 0);
   const desde = String(req.query.desde || '').trim();
   const hasta = String(req.query.hasta || '').trim();
