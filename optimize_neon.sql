@@ -96,10 +96,51 @@ CREATE TABLE IF NOT EXISTS control_inventario_guardia (
   almacen VARCHAR(20) NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS almacen09_clientes (
+  id_cliente BIGSERIAL PRIMARY KEY,
+  nombre VARCHAR(160) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS almacen09_vendedores (
+  id_vendedor BIGSERIAL PRIMARY KEY,
+  nombre VARCHAR(160) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS almacen09_zonas (
+  id_zona BIGSERIAL PRIMARY KEY,
+  nombre VARCHAR(120) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS almacen09_sucursales (
+  id_sucursal BIGSERIAL PRIMARY KEY,
+  nombre VARCHAR(160) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS almacen09_direcciones (
+  id_direccion BIGSERIAL PRIMARY KEY,
+  direccion VARCHAR(240) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS almacen09_salidas_facturas (
   id_factura BIGSERIAL PRIMARY KEY,
+  numero_control BIGINT NOT NULL UNIQUE,
   numero_factura VARCHAR(80) NOT NULL UNIQUE,
   fecha_emision TIMESTAMP NOT NULL,
+  cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
+  cliente_nombre VARCHAR(160),
+  vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL,
+  vendedor_nombre VARCHAR(160),
+  zona_id BIGINT REFERENCES almacen09_zonas(id_zona) ON DELETE SET NULL,
+  zona_nombre VARCHAR(120),
+  sucursal_id BIGINT REFERENCES almacen09_sucursales(id_sucursal) ON DELETE SET NULL,
+  sucursal_nombre VARCHAR(160),
+  direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
+  direccion_texto VARCHAR(240),
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
   estado VARCHAR(20) NOT NULL DEFAULT 'emitida'
 );
@@ -162,6 +203,11 @@ WHERE t.schemaname = 'public'
     'almacen_lotes_procesados',
     'historico_resultados_consolidado',
     'control_inventario_guardia',
+    'almacen09_clientes',
+    'almacen09_vendedores',
+    'almacen09_zonas',
+    'almacen09_sucursales',
+    'almacen09_direcciones',
     'almacen09_salidas_facturas',
     'almacen09_salidas_detalle',
     'auth_users',
