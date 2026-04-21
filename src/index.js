@@ -2237,7 +2237,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const sucursalRaw = normalizeSalidasText(req.body?.sucursal, 160);
   const direccionRaw = normalizeSalidasText(req.body?.direccion, 240);
 
-  const numeroFactura = normalizeSalidasText(numeroFacturaRaw, 4).replace(/\D+/g, '');
+  const numeroFacturaDigits = String(numeroFacturaRaw).replace(/\D+/g, '').slice(0, 4);
+  const numeroFactura = numeroFacturaDigits ? numeroFacturaDigits.padStart(4, '0') : '';
   const fechaEmision = /^\d{4}-\d{2}-\d{2}$/.test(fechaEmisionRaw)
     ? `${fechaEmisionRaw} 00:00:00`
     : fechaEmisionRaw;
@@ -2246,7 +2247,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     ? Math.floor(numeroControlProvided)
     : null;
 
-  if (!/^[0-9]{1,4}$/.test(numeroFactura)) {
+  if (!/^[0-9]{1,4}$/.test(numeroFacturaDigits)) {
     return res.status(400).json({ ok: false, error: 'numero_factura debe tener entre 1 y 4 dígitos numéricos' });
   }
   if (!detalleRaw.length) {
@@ -2289,7 +2290,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     }
 
     const duplicated = await client.query(
-      'SELECT 1 FROM almacen09_salidas_facturas WHERE UPPER(TRIM(numero_factura)) = $1 LIMIT 1',
+      'SELECT 1 FROM almacen09_salidas_facturas WHERE numero_factura = $1 LIMIT 1',
       [numeroFactura]
     );
     if (duplicated.rowCount) {
