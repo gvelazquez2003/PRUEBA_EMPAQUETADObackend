@@ -1,11 +1,21 @@
-DROP TABLE IF EXISTS empaquetados_detalle CASCADE;
-DROP TABLE IF EXISTS empaquetados_cabecera CASCADE;
-DROP TABLE IF EXISTS mermas_detalle CASCADE;
-DROP TABLE IF EXISTS mermas_cabecera CASCADE;
-DROP TABLE IF EXISTS productos CASCADE;
-DROP TABLE IF EXISTS responsables CASCADE;
-DROP TABLE IF EXISTS destinos CASCADE;
-DROP TABLE IF EXISTS sedes CASCADE;
+DROP TABLE IF EXISTS auth_sessions;
+DROP TABLE IF EXISTS auth_users;
+DROP TABLE IF EXISTS almacen09_salidas_detalle;
+DROP TABLE IF EXISTS almacen09_salidas_facturas;
+DROP TABLE IF EXISTS control_inventario_guardia;
+DROP TABLE IF EXISTS historico_resultados_consolidado;
+DROP TABLE IF EXISTS conteo_errores;
+DROP TABLE IF EXISTS almacen_lotes_procesados;
+DROP TABLE IF EXISTS lote_productos;
+DROP TABLE IF EXISTS lotes;
+DROP TABLE IF EXISTS mermas_detalle;
+DROP TABLE IF EXISTS mermas_cabecera;
+DROP TABLE IF EXISTS empaquetados_detalle;
+DROP TABLE IF EXISTS empaquetados_cabecera;
+DROP TABLE IF EXISTS productos;
+DROP TABLE IF EXISTS responsables;
+DROP TABLE IF EXISTS destinos;
+DROP TABLE IF EXISTS sedes;
 
 CREATE TABLE destinos (
     id_destino SERIAL PRIMARY KEY,
@@ -29,7 +39,8 @@ CREATE TABLE productos (
     unidad_primaria VARCHAR(50) NOT NULL,
     paquetes INT DEFAULT 0,
     cestas INT DEFAULT 0,
-    sobre_piso INT DEFAULT 0
+    sobre_piso INT DEFAULT 0,
+    activo BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 CREATE TABLE empaquetados_cabecera (
@@ -49,25 +60,14 @@ CREATE TABLE empaquetados_detalle (
     numero_lote VARCHAR(50) NOT NULL
 );
 
-CREATE TABLE mermas_cabecera (
-    id_merma_cabecera SERIAL PRIMARY KEY,
-    fecha_hora TIMESTAMP NOT NULL,
-    id_responsable INT REFERENCES responsables(id_responsable),
-    id_sede INT REFERENCES sedes(id_sede)
-);
-
-CREATE TABLE mermas_detalle (
-    id_merma_detalle SERIAL PRIMARY KEY,
-    id_merma_cabecera INT REFERENCES mermas_cabecera(id_merma_cabecera) ON DELETE CASCADE,
-    id_producto INT REFERENCES productos(id_producto),
-    cantidad INT NOT NULL,
-    motivo VARCHAR(200) NOT NULL,
-    numero_lote VARCHAR(50) NOT NULL
-);
-
 CREATE TABLE conteo_errores (
     id SERIAL PRIMARY KEY,
     codigo_lote VARCHAR(50),
+    lote_producto VARCHAR(120),
+    codigo_producto VARCHAR(30),
+    nombre_producto TEXT,
+    cantidad_esperada INT,
+    cantidad_recibida INT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -76,6 +76,24 @@ CREATE TABLE almacen_lotes_procesados (
     estado VARCHAR(20) NOT NULL DEFAULT 'validado',
     processed_at TIMESTAMP NOT NULL DEFAULT NOW(),
     resumen_validacion JSONB
+);
+
+CREATE TABLE historico_resultados_consolidado (
+    id_historico BIGSERIAL PRIMARY KEY,
+    fecha DATE,
+    fecha_empaquetado TIMESTAMP,
+    fecha_almacen09 TIMESTAMP,
+    codigo_producto VARCHAR(30),
+    producto TEXT NOT NULL,
+    cantidad INTEGER,
+    entregado_a VARCHAR(120),
+    numero_registro VARCHAR(50),
+    responsable VARCHAR(120),
+    sede VARCHAR(160),
+    numero_lote VARCHAR(80),
+    source_hash VARCHAR(64) UNIQUE NOT NULL,
+    origen_historico VARCHAR(20) NOT NULL DEFAULT 'csv',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE control_inventario_guardia (
@@ -109,6 +127,54 @@ CREATE TABLE almacen09_salidas_detalle (
     cantidad INT NOT NULL CHECK (cantidad > 0),
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE auth_users (
+    id_user SERIAL PRIMARY KEY,
+    username VARCHAR(10) NOT NULL UNIQUE,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'empaquetado', 'almacen')),
+    password_hash TEXT NOT NULL,
+    activo BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE auth_sessions (
+    token VARCHAR(128) PRIMARY KEY,
+    id_user INT NOT NULL REFERENCES auth_users(id_user) ON DELETE CASCADE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP NULL,
+    revoked_at TIMESTAMP NULL,
+    user_agent TEXT,
+    ip_address VARCHAR(80)
+);
+
+CREATE INDEX idx_auth_users_role ON auth_users(role);
+CREATE INDEX idx_auth_sessions_user ON auth_sessions(id_user);
+CREATE INDEX idx_auth_sessions_revoked ON auth_sessions(revoked_at);
+
+CREATE INDEX idx_productos_activo_codigo ON productos(activo, codigo_producto);
+CREATE INDEX idx_productos_codigo_upper ON productos(UPPER(TRIM(codigo_producto)));
+
+CREATE INDEX idx_empaquetados_cabecera_fecha_hora ON empaquetados_cabecera(fecha_hora DESC);
+CREATE INDEX idx_empaquetados_cabecera_numero_registro ON empaquetados_cabecera(numero_registro);
+CREATE INDEX idx_empaquetados_detalle_cabecera ON empaquetados_detalle(id_cabecera);
+CREATE INDEX idx_empaquetados_detalle_producto ON empaquetados_detalle(id_producto);
+CREATE INDEX idx_empaquetados_detalle_lote_upper ON empaquetados_detalle(UPPER(TRIM(numero_lote)));
+
+CREATE INDEX idx_conteo_errores_created_at ON conteo_errores(created_at DESC);
+CREATE INDEX idx_conteo_errores_codigo_lote ON conteo_errores(codigo_lote);
+CREATE INDEX idx_almacen_lotes_procesados_estado_processed ON almacen_lotes_procesados(estado, processed_at DESC);
+
+CREATE INDEX idx_historico_resultados_fecha_empaquetado ON historico_resultados_consolidado(fecha_empaquetado DESC);
+CREATE INDEX idx_historico_resultados_fecha_almacen09 ON historico_resultados_consolidado(fecha_almacen09 DESC);
+
+CREATE INDEX idx_control_inventario_guardia_created_at ON control_inventario_guardia(created_at DESC);
+CREATE INDEX idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC);
+
+CREATE INDEX idx_salidas09_facturas_fecha ON almacen09_salidas_facturas(fecha_emision DESC);
+CREATE INDEX idx_salidas09_detalle_codigo_lote ON almacen09_salidas_detalle(codigo_producto, numero_lote);
+CREATE INDEX idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura);
 
 -- Insert data
 INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, cestas, sobre_piso) VALUES

@@ -21,6 +21,8 @@ npm run dev
 
 Ejecuta el archivo `schema.sql` en tu proyecto de Neon.
 
+Si ya tienes una base en producción y solo quieres optimizar sin reset total, ejecuta `optimize_neon.sql`.
+
 ## 4) Endpoints principales
 
 - `GET /health`
@@ -31,35 +33,54 @@ Ejecuta el archivo `schema.sql` en tu proyecto de Neon.
 - `POST /productos`
 - `DELETE /productos/:codigo`
 - `POST /api/empaquetados`
-- `POST /api/mermas`
-- `GET /api/registros?tipo=Empaquetado|Merma&limit=20`
+- `GET /api/registros?tipo=Empaquetado|General|Almacen09|Consolidado&limit=200`
+- `POST /api/registros/delete`
 - `POST /api/control-inventario`
+- `GET /api/almacen09/lotes`
+- `POST /api/almacen09/validar-conteo`
+- `POST /api/almacen09/borrar-lotes`
+- `POST /api/almacen09/borrar-registros`
+- `GET /api/almacen09/errores-conteo?key=...`
 - `GET /api/almacen09/stock-actual`
 - `POST /api/almacen09/salidas-facturas`
 - `GET /api/almacen09/salidas-facturas?limit=100`
+- `POST /auth/register`
+- `POST /auth/login`
+- `GET /auth/session`
+- `POST /auth/logout`
+- `GET /auth/users`
+- `DELETE /auth/users/:username`
 
-## 5) Mapa front -> tablas SQL (Neon)
+## 5) Estructura Neon optimizada
 
-- Empaquetado (form principal):
-	- `empaquetados_cabecera`
-	- `empaquetados_detalle`
-	- catálogo auxiliar: `productos`, `destinos`, `responsables`, `sedes`
-- Almacén09 Entradas (validación de conteo):
-	- `almacen_lotes_procesados`
-	- `conteo_errores`
-	- referencia de origen: `empaquetados_cabecera`, `empaquetados_detalle`
-- Almacén09 Salidas (facturación):
-	- `almacen09_salidas_facturas`
-	- `almacen09_salidas_detalle`
-- Control de Inventario (cambio de guardia):
-	- `control_inventario_guardia`
-	- referencia de producto: `productos`
+Tablas activas por dominio:
+
+- Catálogos maestros:
+	- `destinos`: destinos de despacho para empaquetado.
+	- `sedes`: sedes disponibles.
+	- `responsables`: personal responsable.
+	- `productos`: catálogo oficial (con soft delete vía columna `activo`).
+- Operación de empaquetado:
+	- `empaquetados_cabecera`: encabezado por registro (fecha, destino, responsable, sede).
+	- `empaquetados_detalle`: líneas por producto/lote/cantidad.
+- Almacén09 (entradas y validación):
+	- `almacen_lotes_procesados`: estado por lote (validado/descartado) y resumen JSON de validación.
+	- `conteo_errores`: trazabilidad de diferencias por lote y por producto.
+- Almacén09 (salidas por facturación):
+	- `almacen09_salidas_facturas`: cabecera de facturas.
+	- `almacen09_salidas_detalle`: detalle por producto/lote/cantidad.
+- Control de inventario por guardia:
+	- `control_inventario_guardia`: conteos físicos por producto y fecha de elaboración.
 - Histórico consolidado:
-	- `historico_resultados_consolidado`
+	- `historico_resultados_consolidado`: consolidado importado desde CSV para reportes.
+- Seguridad/autenticación:
+	- `auth_users`: usuarios del sistema con rol.
+	- `auth_sessions`: sesiones activas con expiración y revocación.
 
 Notas:
-- `lotes` y `lote_productos` son tablas legacy y se eliminan automáticamente al iniciar el backend para evitar confusión.
+- `mermas_cabecera`, `mermas_detalle`, `lotes` y `lote_productos` se consideran legacy/no funcionales y se eliminan automáticamente al iniciar el backend.
 - El endpoint de stock (`/api/almacen09/stock-actual`) ya descuenta lo facturado en Salidas09.
+- Se agregaron índices de rendimiento para consultas de productos, empaquetado, almacén, control de inventario, auth e histórico.
 
 ## 6) Despliegue en Render
 

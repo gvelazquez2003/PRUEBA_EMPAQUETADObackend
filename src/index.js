@@ -620,6 +620,10 @@ async function ensureAlmacen09Tables() {
     ALTER TABLE almacen_lotes_procesados
     ADD COLUMN IF NOT EXISTS resumen_validacion JSONB
   `);
+
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_conteo_errores_created_at ON conteo_errores(created_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_conteo_errores_codigo_lote ON conteo_errores(codigo_lote)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_almacen_lotes_procesados_estado_processed ON almacen_lotes_procesados(estado, processed_at DESC)');
 }
 
 async function ensureProductosSoftDelete() {
@@ -718,10 +722,24 @@ async function ensureSalidas09Tables() {
   `);
 }
 
-async function dropLegacyLotesTables() {
-  // Tablas legacy no usadas por el flujo actual (Almacen09/Empaquetado).
+async function ensurePerformanceIndexes() {
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_activo_codigo ON productos(activo, codigo_producto)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_codigo_upper ON productos(UPPER(TRIM(codigo_producto)))');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_cabecera_fecha_hora ON empaquetados_cabecera(fecha_hora DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_cabecera_numero_registro ON empaquetados_cabecera(numero_registro)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_cabecera ON empaquetados_detalle(id_cabecera)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_producto ON empaquetados_detalle(id_producto)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_lote_upper ON empaquetados_detalle(UPPER(TRIM(numero_lote)))');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura)');
+}
+
+async function dropLegacyUnusedTables() {
+  // Tablas legacy/no funcionales que se limpian para mantener Neon enfocado en flujos activos.
   await pool.query('DROP TABLE IF EXISTS lote_productos CASCADE');
   await pool.query('DROP TABLE IF EXISTS lotes CASCADE');
+  await pool.query('DROP TABLE IF EXISTS mermas_detalle CASCADE');
+  await pool.query('DROP TABLE IF EXISTS mermas_cabecera CASCADE');
 }
 
 async function registrarErrorConteo(codigoLote, erroresDetalle) {
@@ -987,7 +1005,6 @@ app.post('/productos/purge-catalog', async (req, res) => {
          p.id_producto,
          p.codigo_producto,
          EXISTS(SELECT 1 FROM empaquetados_detalle ed WHERE ed.id_producto = p.id_producto) AS used_empaquetados,
-         EXISTS(SELECT 1 FROM mermas_detalle md WHERE md.id_producto = p.id_producto) AS used_mermas,
          EXISTS(SELECT 1 FROM control_inventario_guardia cg WHERE cg.id_producto = p.id_producto) AS used_control,
          EXISTS(SELECT 1 FROM almacen09_salidas_detalle sd WHERE sd.id_producto = p.id_producto) AS used_salidas
        FROM productos p
@@ -1000,7 +1017,7 @@ app.post('/productos/purge-catalog', async (req, res) => {
     const blockedRows = [];
 
     for (const row of candidates.rows) {
-      const hasRefs = Boolean(row.used_empaquetados) || Boolean(row.used_mermas) || Boolean(row.used_control) || Boolean(row.used_salidas);
+      const hasRefs = Boolean(row.used_empaquetados) || Boolean(row.used_control) || Boolean(row.used_salidas);
       if (hasRefs) {
         blockedRows.push(row);
       } else {
@@ -1048,7 +1065,6 @@ app.post('/productos/purge-catalog', async (req, res) => {
       blockedRefs: blockedRows.slice(0, 50).map((row) => ({
         codigo: row.codigo_producto,
         empaquetados: Boolean(row.used_empaquetados),
-        mermas: Boolean(row.used_mermas),
         control: Boolean(row.used_control),
         salidas: Boolean(row.used_salidas),
       })),
@@ -2321,7 +2337,8 @@ Promise.all([
   ensureHistoricoResultadosTable(),
   ensureControlInventarioTable(),
   ensureSalidas09Tables(),
-  dropLegacyLotesTables(),
+  ensurePerformanceIndexes(),
+  dropLegacyUnusedTables(),
 ])
   .then(async () => {
     await ensureInitialAdminUsers();
