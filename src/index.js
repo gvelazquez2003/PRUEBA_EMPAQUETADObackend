@@ -1237,6 +1237,7 @@ app.post('/api/control-inventario', async (req, res) => {
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'Consolidado').trim().toLowerCase();
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 5000);
+  const offset = Math.max(Number(req.query.offset || 0), 0);
   const desde = String(req.query.desde || '').trim();
   const hasta = String(req.query.hasta || '').trim();
   const semana = String(req.query.semana || '').trim();
@@ -1256,6 +1257,7 @@ app.get('/api/registros', async (req, res) => {
 
   try {
     if (tipo === 'consolidado') {
+      const fetchLimit = limit + 1;
       const wherePartsActual = [];
       const wherePartsHistorico = [];
       const params = [];
@@ -1294,7 +1296,8 @@ app.get('/api/registros', async (req, res) => {
         wherePartsActual.push(`TO_CHAR(ec.fecha_hora, 'YYYY') = $${params.length}`);
         wherePartsHistorico.push(`TO_CHAR(COALESCE(hr.fecha_empaquetado, hr.fecha::timestamp), 'YYYY') = $${params.length}`);
       }
-      params.push(limit);
+      params.push(fetchLimit);
+      params.push(offset);
       const whereClauseActual = wherePartsActual.length ? `WHERE ${wherePartsActual.join(' AND ')}` : '';
       const whereClauseHistorico = wherePartsHistorico.length ? `WHERE ${wherePartsHistorico.join(' AND ')}` : '';
 
@@ -1375,12 +1378,24 @@ app.get('/api/registros', async (req, res) => {
           "NUMERO DE LOTE"
         FROM unificado
         ORDER BY "__ORDER_TS" DESC NULLS LAST
-        LIMIT $${params.length}`,
+        LIMIT $${params.length - 1}
+        OFFSET $${params.length}`,
         params
       );
 
-      const headers = result.rows.length ? Object.keys(result.rows[0]) : [];
-      return res.json({ ok: true, sheet: 'Consolidado', headers, rows: result.rows, total: result.rows.length });
+      const hasMore = result.rows.length > limit;
+      const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+      const headers = rows.length ? Object.keys(rows[0]) : [];
+      return res.json({
+        ok: true,
+        sheet: 'Consolidado',
+        headers,
+        rows,
+        total: rows.length,
+        hasMore,
+        offset,
+        limit,
+      });
     }
 
     if (tipo === 'almacen09') {
