@@ -2035,10 +2035,10 @@ app.post('/api/almacen09/borrar-registros', async (req, res) => {
 });
 
 app.get('/api/almacen09/errores-conteo', async (req, res) => {
-  const { date, key } = req.query || {};
-  if (!isValidAdminKey(key)) {
-    return res.status(401).send('Clave inválida');
-  }
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const { date } = req.query || {};
 
   const targetDate = date ? String(date) : null;
 
