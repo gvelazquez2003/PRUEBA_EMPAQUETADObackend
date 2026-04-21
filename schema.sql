@@ -169,7 +169,6 @@ CREATE TABLE almacen09_salidas_detalle (
     codigo_producto VARCHAR(30) NOT NULL,
     producto TEXT NOT NULL,
     numero_lote VARCHAR(80) NOT NULL,
-    maquina VARCHAR(10),
     cantidad INT NOT NULL CHECK (cantidad > 0),
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );

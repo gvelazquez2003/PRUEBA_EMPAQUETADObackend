@@ -775,7 +775,6 @@ async function ensureSalidas09Tables() {
       codigo_producto VARCHAR(30) NOT NULL,
       producto TEXT NOT NULL,
       numero_lote VARCHAR(80) NOT NULL,
-      maquina VARCHAR(10),
       cantidad INT NOT NULL CHECK (cantidad > 0),
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
@@ -2262,7 +2261,6 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       codigo: String(linea?.codigo || '').trim().toUpperCase(),
       producto: String(linea?.producto || '').trim(),
       lote: String(linea?.lote || '').trim().toUpperCase(),
-      maquina: String(linea?.maquina || '').trim(),
       cantidad: Number(linea?.cantidad),
     }))
     .filter((linea) => linea.codigo && linea.lote && Number.isFinite(linea.cantidad) && linea.cantidad > 0);
@@ -2371,17 +2369,15 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
            codigo_producto,
            producto,
            numero_lote,
-           maquina,
            cantidad
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         VALUES ($1, $2, $3, $4, $5, $6)`,
         [
           idFactura,
           Number(product.id_producto),
           linea.codigo,
           linea.producto || product.descripcion,
           linea.lote,
-          linea.maquina || null,
           Math.floor(linea.cantidad),
         ]
       );
@@ -2428,7 +2424,6 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sd.codigo_producto,
          sd.producto,
          sd.numero_lote,
-         sd.maquina,
          sd.cantidad
        FROM almacen09_salidas_facturas sf
        JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
