@@ -13,6 +13,7 @@ DROP TABLE IF EXISTS conteo_errores;
 DROP TABLE IF EXISTS almacen_lotes_procesados;
 DROP TABLE IF EXISTS lote_productos;
 DROP TABLE IF EXISTS lotes;
+DROP TABLE IF EXISTS motivos_merma;
 DROP TABLE IF EXISTS mermas_detalle;
 DROP TABLE IF EXISTS mermas_cabecera;
 DROP TABLE IF EXISTS empaquetados_detalle;
@@ -35,6 +36,12 @@ CREATE TABLE sedes (
 CREATE TABLE responsables (
     id_responsable SERIAL PRIMARY KEY,
     nombre_completo VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE motivos_merma (
+    id_motivo SERIAL PRIMARY KEY,
+    nombre VARCHAR(160) NOT NULL UNIQUE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE productos (
@@ -63,6 +70,33 @@ CREATE TABLE empaquetados_detalle (
     id_producto INT REFERENCES productos(id_producto),
     cantidad INT NOT NULL,
     numero_lote VARCHAR(50) NOT NULL
+);
+
+
+CREATE INDEX idx_mermas_cabecera_fecha_hora ON mermas_cabecera(fecha_hora DESC);
+CREATE INDEX idx_mermas_cabecera_sede_responsable ON mermas_cabecera(id_sede, id_responsable);
+CREATE INDEX idx_mermas_detalle_merma ON mermas_detalle(id_merma);
+CREATE INDEX idx_mermas_detalle_producto_motivo ON mermas_detalle(id_producto, id_motivo);
+CREATE INDEX idx_mermas_detalle_lote_upper ON mermas_detalle(UPPER(TRIM(numero_lote)));
+CREATE TABLE mermas_cabecera (
+    id_merma BIGSERIAL PRIMARY KEY,
+    fecha_hora TIMESTAMP NOT NULL,
+    id_responsable INT NOT NULL REFERENCES responsables(id_responsable),
+    id_sede INT NOT NULL REFERENCES sedes(id_sede),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE mermas_detalle (
+    id_detalle BIGSERIAL PRIMARY KEY,
+    id_merma BIGINT NOT NULL REFERENCES mermas_cabecera(id_merma) ON DELETE CASCADE,
+    id_producto INT NOT NULL REFERENCES productos(id_producto),
+    codigo_producto VARCHAR(30) NOT NULL,
+    producto TEXT NOT NULL,
+    cantidad INT NOT NULL CHECK (cantidad > 0),
+    id_motivo INT NOT NULL REFERENCES motivos_merma(id_motivo),
+    motivo VARCHAR(160) NOT NULL,
+    numero_lote VARCHAR(80) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE conteo_errores (
@@ -337,7 +371,29 @@ INSERT INTO responsables (nombre_completo) VALUES
 ('Jesus Alcedo'),
 ('Eliezer N'),
 ('Odalis'),
-('Yosmar Blanco');
+('Yosmar Blanco'),
+('Alexander Guevara');
+
+INSERT INTO motivos_merma (nombre) VALUES
+('Adherido a Bandeja/Molde/Aro'),
+('Adherido al Silpad'),
+('Burbuja/Mancha en la Corona'),
+('Alveolado/Cavidad'),
+('Crudo'),
+('Color'),
+('Fermentado'),
+('Pan Pequeno'),
+('Pan Grande'),
+('Mal Formado'),
+('Deformado (Horno)'),
+('Mal Corte'),
+('Manchado'),
+('Aplastado/Maltratado/Roto'),
+('Sobrante en Buen Estado'),
+('Caido al Piso'),
+('Materia Extrana'),
+('Defecto de Mezcla'),
+('Masa de Descarte');
 
 INSERT INTO destinos (nombre) VALUES ('K FOOD'), ('DESPACHO');
 INSERT INTO sedes (nombre) VALUES ('PANIFICADORA COSTA DORADA, C.A.'), ('ALIMENTOS PB2, C.A.');

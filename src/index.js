@@ -19,6 +19,27 @@ const APP_ROLES = {
 };
 const INITIAL_ADMIN_USERNAMES = ['ATovar', 'EValerio', 'LGil'];
 const INITIAL_ADMIN_PASSWORD = String(process.env.INITIAL_ADMIN_PASSWORD || 'Admin12345');
+const MERMA_MOTIVOS = [
+  'Adherido a Bandeja/Molde/Aro',
+  'Adherido al Silpad',
+  'Burbuja/Mancha en la Corona',
+  'Alveolado/Cavidad',
+  'Crudo',
+  'Color',
+  'Fermentado',
+  'Pan Pequeno',
+  'Pan Grande',
+  'Mal Formado',
+  'Deformado (Horno)',
+  'Mal Corte',
+  'Manchado',
+  'Aplastado/Maltratado/Roto',
+  'Sobrante en Buen Estado',
+  'Caido al Piso',
+  'Materia Extrana',
+  'Defecto de Mezcla',
+  'Masa de Descarte',
+];
 
 function normalizeOrigin(value) {
   const raw = String(value || '').trim().replace(/^['"]|['"]$/g, '');
@@ -105,6 +126,12 @@ function combineFechaHora(fecha, hora) {
   if (!fecha) return null;
   const safeHora = hora && String(hora).trim() ? String(hora).trim() : '00:00';
   return `${fecha} ${safeHora}:00`;
+}
+
+function normalizeCatalogText(value, maxLength) {
+  const clean = String(value || '').trim().replace(/\s+/g, ' ');
+  if (!clean) return '';
+  return typeof maxLength === 'number' && maxLength > 0 ? clean.slice(0, maxLength) : clean;
 }
 
 function isValidAdminKey(sentKey) {
@@ -793,6 +820,97 @@ async function ensureSalidas09Tables() {
   `);
 }
 
+async function ensureMermaTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS motivos_merma (
+      id_motivo SERIAL PRIMARY KEY,
+      nombre VARCHAR(160) NOT NULL UNIQUE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mermas_cabecera (
+      id_merma BIGSERIAL PRIMARY KEY,
+      fecha_hora TIMESTAMP NOT NULL,
+      id_responsable INT NOT NULL REFERENCES responsables(id_responsable),
+      id_sede INT NOT NULL REFERENCES sedes(id_sede),
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mermas_detalle (
+      id_detalle BIGSERIAL PRIMARY KEY,
+      id_merma BIGINT NOT NULL REFERENCES mermas_cabecera(id_merma) ON DELETE CASCADE,
+      id_producto INT NOT NULL REFERENCES productos(id_producto),
+      codigo_producto VARCHAR(30) NOT NULL,
+      producto TEXT NOT NULL,
+      cantidad INT NOT NULL CHECK (cantidad > 0),
+      id_motivo INT NOT NULL REFERENCES motivos_merma(id_motivo),
+      motivo VARCHAR(160) NOT NULL,
+      numero_lote VARCHAR(80) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query('ALTER TABLE mermas_cabecera ADD COLUMN IF NOT EXISTS fecha_hora TIMESTAMP NOT NULL DEFAULT NOW()');
+  await pool.query('ALTER TABLE mermas_cabecera ADD COLUMN IF NOT EXISTS id_responsable INT REFERENCES responsables(id_responsable)');
+  await pool.query('ALTER TABLE mermas_cabecera ADD COLUMN IF NOT EXISTS id_sede INT REFERENCES sedes(id_sede)');
+  await pool.query('ALTER TABLE mermas_cabecera ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()');
+
+  await pool.query('ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS id_merma BIGINT REFERENCES mermas_cabecera(id_merma) ON DELETE CASCADE');
+  await pool.query('ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS id_producto INT REFERENCES productos(id_producto)');
+  await pool.query(`ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS codigo_producto VARCHAR(30) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS producto TEXT NOT NULL DEFAULT ''`);
+  await pool.query('ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS cantidad INT NOT NULL DEFAULT 1');
+  await pool.query('ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS id_motivo INT REFERENCES motivos_merma(id_motivo)');
+  await pool.query(`ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS motivo VARCHAR(160) NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS numero_lote VARCHAR(80) NOT NULL DEFAULT ''`);
+  await pool.query('ALTER TABLE mermas_detalle ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()');
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_mermas_cabecera_fecha_hora
+    ON mermas_cabecera (fecha_hora DESC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_mermas_cabecera_sede_responsable
+    ON mermas_cabecera (id_sede, id_responsable)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_mermas_detalle_merma
+    ON mermas_detalle (id_merma)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_mermas_detalle_producto_motivo
+    ON mermas_detalle (id_producto, id_motivo)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_mermas_detalle_lote_upper
+    ON mermas_detalle (UPPER(TRIM(numero_lote)))
+  `);
+
+  for (const nombre of MERMA_MOTIVOS) {
+    await pool.query(
+      `INSERT INTO motivos_merma (nombre)
+       SELECT $1
+       WHERE NOT EXISTS (
+         SELECT 1 FROM motivos_merma WHERE LOWER(TRIM(nombre)) = LOWER(TRIM($1))
+       )`,
+      [nombre]
+    );
+  }
+
+  await pool.query(
+    `INSERT INTO responsables (nombre_completo)
+     SELECT $1
+     WHERE NOT EXISTS (
+       SELECT 1 FROM responsables WHERE LOWER(TRIM(nombre_completo)) = LOWER(TRIM($1))
+     )`,
+    ['Alexander Guevara']
+  );
+}
+
 function normalizeSalidasText(value, maxLength) {
   const clean = String(value || '').trim().replace(/\s+/g, ' ');
   if (!clean) return '';
@@ -855,8 +973,6 @@ async function dropLegacyUnusedTables() {
   // Tablas legacy/no funcionales que se limpian para mantener Neon enfocado en flujos activos.
   await pool.query('DROP TABLE IF EXISTS lote_productos CASCADE');
   await pool.query('DROP TABLE IF EXISTS lotes CASCADE');
-  await pool.query('DROP TABLE IF EXISTS mermas_detalle CASCADE');
-  await pool.query('DROP TABLE IF EXISTS mermas_cabecera CASCADE');
 }
 
 async function registrarErrorConteo(codigoLote, erroresDetalle) {
@@ -940,6 +1056,165 @@ app.get('/responsables', async (_req, res) => {
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/motivos-merma', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id_motivo, nombre
+       FROM motivos_merma
+       ORDER BY nombre ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/mermas', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.EMPAQUETADO]);
+  if (!auth) return;
+
+  const { cabecera, detalle } = req.body || {};
+  if (!cabecera || !Array.isArray(detalle) || !detalle.length) {
+    return res.status(400).json({ ok: false, error: 'cabecera y detalle son obligatorios' });
+  }
+
+  const timestamp = combineFechaHora(cabecera.fecha, cabecera.hora);
+  const idResponsable = Number(cabecera.id_responsable);
+  const idSede = Number(cabecera.id_sede);
+
+  if (!timestamp || !Number.isInteger(idResponsable) || idResponsable <= 0 || !Number.isInteger(idSede) || idSede <= 0) {
+    return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios en cabecera' });
+  }
+
+  const detalleNormalizado = detalle.map((item) => ({
+    id_producto: Number(item?.id_producto),
+    cantidad: Number(item?.cantidad),
+    motivo: normalizeCatalogText(item?.motivo, 160),
+    numero_lote: normalizeCatalogText(item?.numero_lote, 80).toUpperCase(),
+  }));
+
+  const invalidDetalle = detalleNormalizado.find(
+    (item) =>
+      !Number.isInteger(item.id_producto) ||
+      item.id_producto <= 0 ||
+      !Number.isFinite(item.cantidad) ||
+      item.cantidad <= 0 ||
+      !item.motivo ||
+      !item.numero_lote
+  );
+  if (invalidDetalle) {
+    return res.status(400).json({ ok: false, error: 'Hay líneas inválidas en detalle' });
+  }
+
+  const productIds = [...new Set(detalleNormalizado.map((item) => item.id_producto))];
+  const motivos = [...new Set(detalleNormalizado.map((item) => item.motivo))];
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const responsableResult = await client.query(
+      `SELECT id_responsable
+       FROM responsables
+       WHERE id_responsable = $1
+       LIMIT 1`,
+      [idResponsable]
+    );
+    if (!responsableResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'Responsable inválido' });
+    }
+
+    const sedeResult = await client.query(
+      `SELECT id_sede
+       FROM sedes
+       WHERE id_sede = $1
+       LIMIT 1`,
+      [idSede]
+    );
+    if (!sedeResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'Sede inválida' });
+    }
+
+    const productResult = await client.query(
+      `SELECT id_producto, codigo_producto, descripcion
+       FROM productos
+       WHERE COALESCE(activo, TRUE) = TRUE
+         AND id_producto = ANY($1::int[])`,
+      [productIds]
+    );
+    const validProducts = new Map(productResult.rows.map((row) => [Number(row.id_producto), row]));
+    const missingProducts = productIds.filter((id) => !validProducts.has(id));
+    if (missingProducts.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: `Productos inválidos o inactivos: ${missingProducts.join(', ')}` });
+    }
+
+    const motivoResult = await client.query(
+      `SELECT id_motivo, nombre
+       FROM motivos_merma
+       WHERE LOWER(TRIM(nombre)) = ANY($1::text[])
+       ORDER BY nombre ASC`,
+      [motivos.map((motivo) => motivo.toLowerCase())]
+    );
+    const validMotivos = new Map(motivoResult.rows.map((row) => [String(row.nombre || '').trim().toLowerCase(), row]));
+    const missingMotivos = motivos.filter((motivo) => !validMotivos.has(motivo.toLowerCase()));
+    if (missingMotivos.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: `Motivos inválidos: ${missingMotivos.join(', ')}` });
+    }
+
+    const headerResult = await client.query(
+      `INSERT INTO mermas_cabecera (fecha_hora, id_responsable, id_sede)
+       VALUES ($1, $2, $3)
+       RETURNING id_merma`,
+      [timestamp, idResponsable, idSede]
+    );
+
+    const idMerma = headerResult.rows[0].id_merma;
+    const insertedRows = [];
+
+    for (const item of detalleNormalizado) {
+      const product = validProducts.get(item.id_producto);
+      const motivo = validMotivos.get(item.motivo.toLowerCase());
+      const inserted = await client.query(
+        `INSERT INTO mermas_detalle (
+           id_merma,
+           id_producto,
+           codigo_producto,
+           producto,
+           cantidad,
+           id_motivo,
+           motivo,
+           numero_lote
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id_detalle, id_merma, id_producto, codigo_producto, producto, cantidad, id_motivo, motivo, numero_lote, created_at`,
+        [
+          idMerma,
+          item.id_producto,
+          String(product.codigo_producto || '').trim().toUpperCase(),
+          String(product.descripcion || '').trim(),
+          Math.floor(item.cantidad),
+          motivo.id_motivo,
+          motivo.nombre,
+          item.numero_lote,
+        ]
+      );
+      insertedRows.push(inserted.rows[0]);
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({ ok: true, id_merma: idMerma, total: insertedRows.length, rows: insertedRows });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -2648,6 +2923,7 @@ Promise.all([
   ensureProductosSoftDelete(),
   ensureHistoricoResultadosTable(),
   ensureControlInventarioTable(),
+  ensureMermaTables(),
   ensureSalidas09Tables(),
   ensurePerformanceIndexes(),
   dropLegacyUnusedTables(),
