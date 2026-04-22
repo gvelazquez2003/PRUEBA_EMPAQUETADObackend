@@ -2430,17 +2430,36 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
   if (!auth) return;
 
+  const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 500);
+  const offset = Math.max(Number(req.query?.offset || 0), 0);
   const { date } = req.query || {};
+  const mes = String(req.query?.mes || '').trim();
+  const anio = String(req.query?.anio || '').trim();
 
   const targetDate = date ? String(date) : null;
+  const hasMes = /^\d{4}-\d{2}$/.test(mes);
+  const hasAnio = /^\d{4}$/.test(anio);
 
   try {
     const params = [];
-    let where = 'created_at::date = CURRENT_DATE';
+    const whereParts = [];
     if (targetDate) {
-      where = 'created_at::date = $1';
       params.push(targetDate);
+      whereParts.push(`created_at::date = $${params.length}`);
     }
+    if (hasMes) {
+      params.push(mes);
+      whereParts.push(`TO_CHAR(created_at, 'YYYY-MM') = $${params.length}`);
+    }
+    if (hasAnio) {
+      params.push(anio);
+      whereParts.push(`TO_CHAR(created_at, 'YYYY') = $${params.length}`);
+    }
+    if (!whereParts.length) {
+      whereParts.push(`created_at::date = CURRENT_DATE`);
+    }
+    params.push(limit + 1);
+    params.push(offset);
 
     const result = await pool.query(
       `WITH errores AS (
@@ -2454,7 +2473,7 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
            cantidad_recibida,
            created_at
          FROM conteo_errores
-         WHERE ${where}
+         WHERE ${whereParts.join(' AND ')}
        ),
        lotes_referencia AS (
          SELECT
@@ -2478,11 +2497,15 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
          e.created_at
        FROM errores e
        LEFT JOIN lotes_referencia lr ON lr.codigo_lote = e.codigo_lote
-       ORDER BY e.created_at DESC`,
+       ORDER BY e.created_at DESC
+       LIMIT $${params.length - 1}
+       OFFSET $${params.length}`,
       params
     );
 
-    return res.json({ ok: true, total: result.rows.length, items: result.rows });
+    const hasMore = result.rows.length > limit;
+    const items = hasMore ? result.rows.slice(0, limit) : result.rows;
+    return res.json({ ok: true, total: items.length, hasMore, offset, limit, items });
   } catch (error) {
     return res.status(500).send('Error al consultar errores');
   }
@@ -2708,10 +2731,25 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas', async (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query?.limit || 100), 1), 5000);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 500);
   const offset = Math.max(Number(req.query?.offset || 0), 0);
+  const mes = String(req.query?.mes || '').trim();
+  const anio = String(req.query?.anio || '').trim();
+  const hasMes = /^\d{4}-\d{2}$/.test(mes);
+  const hasAnio = /^\d{4}$/.test(anio);
   try {
     const fetchLimit = limit + 1;
+    const whereParts = [];
+    const params = [];
+    if (hasMes) {
+      params.push(mes);
+      whereParts.push(`TO_CHAR(sf.fecha_emision, 'YYYY-MM') = $${params.length}`);
+    }
+    if (hasAnio) {
+      params.push(anio);
+      whereParts.push(`TO_CHAR(sf.fecha_emision, 'YYYY') = $${params.length}`);
+    }
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const result = await pool.query(
       `SELECT
          sf.id_factura,
@@ -2739,10 +2777,11 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          TO_CHAR(sd.created_at, 'YYYY-MM-DD HH24:MI:SS') AS detalle_created_at
        FROM almacen09_salidas_facturas sf
        JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
+       ${whereSql}
        ORDER BY sf.fecha_emision DESC, sf.id_factura DESC, sd.id_detalle ASC
-       LIMIT $1
-       OFFSET $2`,
-      [fetchLimit, offset]
+       LIMIT $${params.length + 1}
+       OFFSET $${params.length + 2}`,
+      [...params, fetchLimit, offset]
     );
 
     const hasMore = result.rows.length > limit;
