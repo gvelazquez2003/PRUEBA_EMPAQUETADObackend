@@ -2213,6 +2213,31 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
   }
 });
 
+app.post('/api/almacen09/errores-conteo/delete', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids.map((value) => Number(value)).filter((id) => Number.isInteger(id) && id > 0)
+    : [];
+
+  if (!ids.length) {
+    return res.status(400).json({ ok: false, error: 'ids es obligatorio y debe contener valores válidos' });
+  }
+
+  try {
+    const deleted = await pool.query(
+      `DELETE FROM conteo_errores
+       WHERE id = ANY($1::int[])`,
+      [ids]
+    );
+
+    return res.json({ ok: true, deleted: deleted.rowCount || 0 });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/api/almacen09/salidas-facturas/next-control', async (_req, res) => {
   try {
     const siguiente = await getNextSalidasControlNumber(pool);
@@ -2450,6 +2475,65 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
     return res.json({ ok: true, rows, total: rows.length, hasMore, offset, limit });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const detalleIds = Array.isArray(req.body?.detalle_ids)
+    ? req.body.detalle_ids.map((value) => Number(value)).filter((id) => Number.isInteger(id) && id > 0)
+    : [];
+
+  if (!detalleIds.length) {
+    return res.status(400).json({ ok: false, error: 'detalle_ids es obligatorio y debe contener valores válidos' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const deletedDetalle = await client.query(
+      `DELETE FROM almacen09_salidas_detalle
+       WHERE id_detalle = ANY($1::bigint[])
+       RETURNING id_factura`,
+      [detalleIds]
+    );
+
+    const facturaIds = [...new Set(
+      deletedDetalle.rows
+        .map((row) => Number(row.id_factura))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    )];
+
+    let deletedFacturasCount = 0;
+    if (facturaIds.length) {
+      const deletedFacturas = await client.query(
+        `DELETE FROM almacen09_salidas_facturas sf
+         WHERE sf.id_factura = ANY($1::bigint[])
+           AND NOT EXISTS (
+             SELECT 1
+             FROM almacen09_salidas_detalle sd
+             WHERE sd.id_factura = sf.id_factura
+           )`,
+        [facturaIds]
+      );
+      deletedFacturasCount = deletedFacturas.rowCount || 0;
+    }
+
+    await client.query('COMMIT');
+    return res.json({
+      ok: true,
+      deleted: deletedDetalle.rowCount || 0,
+      deleted_detalle: deletedDetalle.rowCount || 0,
+      deleted_facturas: deletedFacturasCount,
+    });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
