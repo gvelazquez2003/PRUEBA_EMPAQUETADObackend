@@ -2408,30 +2408,46 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas', async (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query?.limit || 100), 1), 500);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 100), 1), 5000);
+  const offset = Math.max(Number(req.query?.offset || 0), 0);
   try {
+    const fetchLimit = limit + 1;
     const result = await pool.query(
       `SELECT
          sf.id_factura,
          sf.numero_control,
          sf.numero_factura,
          TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD HH24:MI:SS') AS fecha_emision,
+         sf.cliente_id,
          sf.cliente_nombre,
+         sf.vendedor_id,
          sf.vendedor_nombre,
+         sf.zona_id,
          sf.zona_nombre,
+         sf.sucursal_id,
          sf.sucursal_nombre,
+         sf.direccion_id,
          sf.direccion_texto,
+         TO_CHAR(sf.created_at, 'YYYY-MM-DD HH24:MI:SS') AS factura_created_at,
+         sf.estado,
+         sd.id_detalle,
+         sd.id_producto,
          sd.codigo_producto,
          sd.producto,
          sd.numero_lote,
-         sd.cantidad
+         sd.cantidad,
+         TO_CHAR(sd.created_at, 'YYYY-MM-DD HH24:MI:SS') AS detalle_created_at
        FROM almacen09_salidas_facturas sf
        JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
        ORDER BY sf.fecha_emision DESC, sf.id_factura DESC, sd.id_detalle ASC
-       LIMIT $1`,
-      [limit]
+       LIMIT $1
+       OFFSET $2`,
+      [fetchLimit, offset]
     );
-    return res.json({ ok: true, rows: result.rows, total: result.rowCount || 0 });
+
+    const hasMore = result.rows.length > limit;
+    const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+    return res.json({ ok: true, rows, total: rows.length, hasMore, offset, limit });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
