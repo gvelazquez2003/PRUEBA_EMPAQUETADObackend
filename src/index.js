@@ -893,19 +893,19 @@ async function ensureMermaTables() {
   for (const nombre of MERMA_MOTIVOS) {
     await pool.query(
       `INSERT INTO motivos_merma (nombre)
-       SELECT $1
-       WHERE NOT EXISTS (
-         SELECT 1 FROM motivos_merma WHERE LOWER(TRIM(nombre)) = LOWER(TRIM($1))
-       )`,
+       VALUES ($1::text)
+       ON CONFLICT (nombre) DO NOTHING`,
       [nombre]
     );
   }
 
   await pool.query(
     `INSERT INTO responsables (nombre_completo)
-     SELECT $1
+     SELECT $1::text
      WHERE NOT EXISTS (
-       SELECT 1 FROM responsables WHERE LOWER(TRIM(nombre_completo)) = LOWER(TRIM($1))
+       SELECT 1
+       FROM responsables
+       WHERE LOWER(TRIM(nombre_completo)) = LOWER(TRIM($1::text))
      )`,
     ['Alexander Guevara']
   );
