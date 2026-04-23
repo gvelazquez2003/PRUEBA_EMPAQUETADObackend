@@ -1648,6 +1648,81 @@ app.get('/api/registros', async (req, res) => {
   const hasAnio = /^\d{4}$/.test(anio);
 
   try {
+    if (tipo === 'merma') {
+      const fetchLimit = limit + 1;
+      const whereParts = [];
+      const params = [];
+
+      if (hasDesde) {
+        params.push(desde);
+        whereParts.push(`DATE(mc.fecha_hora) >= $${params.length}`);
+      }
+      if (hasHasta) {
+        params.push(hasta);
+        whereParts.push(`DATE(mc.fecha_hora) <= $${params.length}`);
+      }
+      if (hasSemana) {
+        params.push(semana);
+        whereParts.push(`TO_CHAR(mc.fecha_hora, 'IYYY-"W"IW') = $${params.length}`);
+      }
+      if (hasFecha) {
+        params.push(fecha);
+        whereParts.push(`DATE(mc.fecha_hora) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(mc.fecha_hora, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasMesNumero) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(mc.fecha_hora, 'MM') = $${params.length}`);
+      }
+      if (hasAnio) {
+        params.push(anio);
+        whereParts.push(`TO_CHAR(mc.fecha_hora, 'YYYY') = $${params.length}`);
+      }
+
+      params.push(fetchLimit);
+      params.push(offset);
+      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      const result = await pool.query(
+        `SELECT
+          md.id_detalle AS "__ROW_ID",
+          'mermas_detalle'::text AS "__ROW_SOURCE",
+          TO_CHAR(mc.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
+          TO_CHAR(mc.fecha_hora, 'DD/MM/YYYY HH24:MI') AS "Fecha y Hora",
+          md.codigo_producto AS "Codigo del producto",
+          md.producto AS "Nombre del producto",
+          md.cantidad AS "Cantidad",
+          md.motivo AS "Motivo",
+          md.numero_lote AS "Lote"
+        FROM mermas_detalle md
+        JOIN mermas_cabecera mc ON mc.id_merma = md.id_merma
+        ${whereClause}
+        ORDER BY mc.fecha_hora DESC, md.id_detalle DESC
+        LIMIT $${params.length - 1}
+        OFFSET $${params.length}`,
+        params
+      );
+
+      const hasMore = result.rows.length > limit;
+      const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+      const headers = rows.length
+        ? Object.keys(rows[0])
+        : ['Fecha y Hora', 'Codigo del producto', 'Nombre del producto', 'Cantidad', 'Motivo', 'Lote'];
+      return res.json({
+        ok: true,
+        sheet: 'Merma',
+        headers,
+        rows,
+        total: rows.length,
+        hasMore,
+        offset,
+        limit,
+      });
+    }
+
     if (tipo === 'consolidado') {
       const fetchLimit = limit + 1;
       const wherePartsActual = [];
@@ -2065,7 +2140,7 @@ app.post('/api/registros/delete', async (req, res) => {
     }))
     .filter((row) => {
       if (!/^\d+$/.test(row.id) || row.id === '0') return false;
-      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado';
+      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle';
     });
 
   const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
@@ -2075,10 +2150,15 @@ app.post('/api/registros/delete', async (req, res) => {
 
   const detalleIdsSet = new Set(legacyIds);
   const historicoIdsSet = new Set();
+  const mermaDetalleIdsSet = new Set();
 
   rows.forEach((row) => {
     if (row.source === 'empaquetados_detalle') {
       detalleIdsSet.add(Number(row.id));
+      return;
+    }
+    if (row.source === 'mermas_detalle') {
+      mermaDetalleIdsSet.add(Number(row.id));
       return;
     }
     historicoIdsSet.add(row.id);
@@ -2086,8 +2166,9 @@ app.post('/api/registros/delete', async (req, res) => {
 
   const detalleIds = Array.from(detalleIdsSet).filter((id) => Number.isInteger(id) && id > 0);
   const historicoIds = Array.from(historicoIdsSet);
+  const mermaDetalleIds = Array.from(mermaDetalleIdsSet).filter((id) => Number.isInteger(id) && id > 0);
 
-  if (!detalleIds.length && !historicoIds.length) {
+  if (!detalleIds.length && !historicoIds.length && !mermaDetalleIds.length) {
     return res.status(400).json({ ok: false, error: 'rows o ids es obligatorio y debe contener valores válidos' });
   }
 
@@ -2099,6 +2180,8 @@ app.post('/api/registros/delete', async (req, res) => {
     let deletedDetalleCount = 0;
     let deletedHistoricoCount = 0;
     let deletedCabecerasCount = 0;
+    let deletedMermaDetalleCount = 0;
+    let deletedMermaCabecerasCount = 0;
 
     if (detalleIds.length) {
       const deleted = await client.query(
@@ -2136,6 +2219,34 @@ app.post('/api/registros/delete', async (req, res) => {
       deletedTotal += deletedHistoricoCount;
     }
 
+    if (mermaDetalleIds.length) {
+      const deletedMerma = await client.query(
+        `DELETE FROM mermas_detalle
+         WHERE id_detalle = ANY($1::bigint[])
+         RETURNING id_merma`,
+        [mermaDetalleIds]
+      );
+      deletedMermaDetalleCount = deletedMerma.rowCount || 0;
+      deletedTotal += deletedMermaDetalleCount;
+
+      const mermaCabeceras = [
+        ...new Set(deletedMerma.rows.map((row) => Number(row.id_merma)).filter(Boolean)),
+      ];
+      if (mermaCabeceras.length) {
+        const deletedMermaCabeceras = await client.query(
+          `DELETE FROM mermas_cabecera mc
+           WHERE mc.id_merma = ANY($1::bigint[])
+             AND NOT EXISTS (
+               SELECT 1
+               FROM mermas_detalle md
+               WHERE md.id_merma = mc.id_merma
+             )`,
+          [mermaCabeceras]
+        );
+        deletedMermaCabecerasCount = deletedMermaCabeceras.rowCount || 0;
+      }
+    }
+
     await client.query('COMMIT');
     return res.json({
       ok: true,
@@ -2143,6 +2254,8 @@ app.post('/api/registros/delete', async (req, res) => {
       deleted_detalle: deletedDetalleCount,
       deleted_historico: deletedHistoricoCount,
       deleted_cabeceras: deletedCabecerasCount,
+      deleted_merma_detalle: deletedMermaDetalleCount,
+      deleted_merma_cabeceras: deletedMermaCabecerasCount,
     });
   } catch (error) {
     await client.query('ROLLBACK');
