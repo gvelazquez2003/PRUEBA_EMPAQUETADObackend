@@ -14,7 +14,7 @@ const STOCK_RESET_DATE = String(process.env.STOCK_RESET_DATE || '2026-03-30').tr
 const AUTH_SESSION_TTL_HOURS = Number(process.env.AUTH_SESSION_TTL_HOURS || 168);
 const APP_ROLES = {
   ADMIN: 'administrador',
-  EMPAQUETADO: 'empaquetado',
+  PRODUCCION: 'produccion',
   ALMACEN: 'almacen',
 };
 const INITIAL_ADMIN_USERNAMES = ['ATovar', 'EValerio', 'LGil'];
@@ -143,7 +143,7 @@ function isValidAdminKey(sentKey) {
 function normalizeAuthRole(value) {
   const role = String(value || '').trim().toLowerCase();
   if (role === APP_ROLES.ADMIN) return APP_ROLES.ADMIN;
-  if (role === APP_ROLES.EMPAQUETADO) return APP_ROLES.EMPAQUETADO;
+  if (role === APP_ROLES.PRODUCCION || role === 'empaquetado') return APP_ROLES.PRODUCCION;
   if (role === APP_ROLES.ALMACEN) return APP_ROLES.ALMACEN;
   return '';
 }
@@ -299,12 +299,29 @@ async function ensureAuthTables() {
     CREATE TABLE IF NOT EXISTS auth_users (
       id_user SERIAL PRIMARY KEY,
       username VARCHAR(10) NOT NULL UNIQUE,
-      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'empaquetado', 'almacen')),
+      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'almacen')),
       password_hash TEXT NOT NULL,
       activo BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE auth_users
+    DROP CONSTRAINT IF EXISTS auth_users_role_check
+  `);
+
+  await pool.query(`
+    ALTER TABLE auth_users
+    ADD CONSTRAINT auth_users_role_check
+    CHECK (role IN ('administrador', 'produccion', 'almacen'))
+  `);
+
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'produccion'
+     WHERE role = 'empaquetado'
   `);
 
   await pool.query(`
@@ -481,7 +498,7 @@ async function listRegisteredUsers(_auth, res) {
          CASE role
            WHEN 'administrador' THEN 0
            WHEN 'almacen' THEN 1
-           WHEN 'empaquetado' THEN 2
+           WHEN 'produccion' THEN 2
            ELSE 9
          END,
          username ASC`
@@ -1073,7 +1090,7 @@ app.get('/motivos-merma', async (_req, res) => {
 });
 
 app.post('/api/mermas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.EMPAQUETADO]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
   if (!auth) return;
 
   const { cabecera, detalle } = req.body || {};
@@ -1470,7 +1487,7 @@ app.post('/productos/purge-catalog', async (req, res) => {
 });
 
 app.post('/api/empaquetados', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.EMPAQUETADO]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
   if (!auth) return;
 
   const { cabecera, detalle } = req.body || {};

@@ -33,7 +33,7 @@ Si ya tienes una base en producción y solo quieres optimizar sin reset total, e
 - `POST /productos`
 - `DELETE /productos/:codigo`
 - `POST /api/empaquetados`
-- `GET /api/registros?tipo=Empaquetado|General|Almacen09|Consolidado&limit=200`
+- `GET /api/registros?tipo=Produccion|General|Almacen09|Consolidado&limit=200`
 - `POST /api/registros/delete`
 - `POST /api/control-inventario`
 - `GET /api/almacen09/lotes`
@@ -74,10 +74,11 @@ Tablas activas por dominio:
 - Histórico consolidado:
 	- `historico_resultados_consolidado`: consolidado importado desde CSV para reportes.
 - Seguridad/autenticación:
-	- `auth_users`: usuarios del sistema con rol.
+	- `auth_users`: usuarios del sistema con rol (`administrador`, `produccion`, `almacen`).
 	- `auth_sessions`: sesiones activas con expiración y revocación.
 
 Notas:
+- El rol antiguo `empaquetado` se migra automáticamente a `produccion` al iniciar el backend.
 - `mermas_cabecera`, `mermas_detalle`, `lotes` y `lote_productos` se consideran legacy/no funcionales y se eliminan automáticamente al iniciar el backend.
 - El endpoint de stock (`/api/almacen09/stock-actual`) ya descuenta lo facturado en Salidas09.
 - Se agregaron índices de rendimiento para consultas de productos, empaquetado, almacén, control de inventario, auth e histórico.

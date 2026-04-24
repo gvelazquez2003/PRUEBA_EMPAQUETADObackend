@@ -210,7 +210,7 @@ CREATE TABLE almacen09_salidas_detalle (
 CREATE TABLE auth_users (
     id_user SERIAL PRIMARY KEY,
     username VARCHAR(10) NOT NULL UNIQUE,
-    role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'empaquetado', 'almacen')),
+    role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'almacen')),
     password_hash TEXT NOT NULL,
     activo BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
