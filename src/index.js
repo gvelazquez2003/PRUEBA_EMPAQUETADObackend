@@ -52,6 +52,14 @@ function normalizeOrigin(value) {
   }
 }
 
+function stripDiacritics(text){
+  try {
+    return String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  } catch (_) {
+    return String(text || '');
+  }
+}
+
 const rawCorsOrigin = String(process.env.CORS_ORIGIN || '').trim();
 const corsOrigins = rawCorsOrigin
   ? rawCorsOrigin
@@ -141,10 +149,11 @@ function isValidAdminKey(sentKey) {
 }
 
 function normalizeAuthRole(value) {
-  const role = String(value || '').trim().toLowerCase();
-  if (role === APP_ROLES.ADMIN) return APP_ROLES.ADMIN;
-  if (role === APP_ROLES.PRODUCCION || role === 'empaquetado') return APP_ROLES.PRODUCCION;
-  if (role === APP_ROLES.ALMACEN) return APP_ROLES.ALMACEN;
+  const raw = String(value || '').trim();
+  const role = stripDiacritics(raw).toLowerCase();
+  if (role === APP_ROLES.ADMIN || role === 'administrador') return APP_ROLES.ADMIN;
+  if (role === APP_ROLES.PRODUCCION || role === 'empaquetado' || role === 'produccion' || role === 'producción') return APP_ROLES.PRODUCCION;
+  if (role === APP_ROLES.ALMACEN || role === 'almacen') return APP_ROLES.ALMACEN;
   return '';
 }
 
