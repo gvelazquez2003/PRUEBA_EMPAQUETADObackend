@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "import:historicos": "node scripts/import-historicos.js"
+    "import:historicos": "node scripts/import-historicos.js",
+    "import:clientes": "node scripts/import-clientes.js"
   },
   "dependencies": {
     "express": "^4.18.2",

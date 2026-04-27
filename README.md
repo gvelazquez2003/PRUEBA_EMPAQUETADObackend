@@ -23,6 +23,16 @@ Ejecuta el archivo `schema.sql` en tu proyecto de Neon.
 
 Si ya tienes una base en producción y solo quieres optimizar sin reset total, ejecuta `optimize_neon.sql`.
 
+## 3.1) Importar clientes masivos
+
+Para cargar `Clientes.csv` en la tabla `"Nuevas Tablas".clientes`:
+
+```bash
+npm run import:clientes -- "C:\Users\gvela\OneDrive\Escritorio\Clientes.csv"
+```
+
+Si tu tabla está en otra ruta o esquema, puedes pasar la ruta del CSV, el esquema y el nombre de la tabla como argumentos adicionales.
+
 ## 4) Endpoints principales
 
 - `GET /health`
