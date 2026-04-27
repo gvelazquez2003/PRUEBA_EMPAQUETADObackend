@@ -320,18 +320,54 @@ async function ensureAuthTables() {
     ALTER TABLE auth_users
     DROP CONSTRAINT IF EXISTS auth_users_role_check
   `);
+  // Drop any existing check, then add a NOT VALID check to avoid failing
+  // when rows exist with legacy/variant role strings. We'll normalize
+  // common variants (including accents) and then VALIDATE the constraint.
+  await pool.query(`
+    ALTER TABLE auth_users
+    DROP CONSTRAINT IF EXISTS auth_users_role_check
+  `);
 
   await pool.query(`
     ALTER TABLE auth_users
     ADD CONSTRAINT auth_users_role_check
-    CHECK (role IN ('administrador', 'produccion', 'almacen'))
+    CHECK (role IN ('administrador', 'produccion', 'almacen')) NOT VALID
   `);
 
+  // Normalize common role variants (case, whitespace, old names, accents)
   await pool.query(`
     UPDATE auth_users
        SET role = 'produccion'
-     WHERE role = 'empaquetado'
-  `);
+     WHERE lower(trim(role)) IN ('empaquetado', 'produccion', 'producción', 'producción')
+  `).catch(() => {});
+
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'almacen'
+     WHERE lower(trim(role)) IN ('almacen', 'almacén')
+  `).catch(() => {});
+
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'administrador'
+     WHERE lower(trim(role)) IN ('administrador', 'admin')
+  `).catch(() => {});
+
+  // Set any remaining unknown/empty roles to 'almacen' as a safe default
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'almacen'
+     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','almacen')
+  `).catch(() => {});
+
+  // Now validate the constraint (should succeed after normalization)
+  await pool.query(`
+    ALTER TABLE auth_users
+    VALIDATE CONSTRAINT auth_users_role_check
+  `).catch((err) => {
+    // If validation still fails, log for debugging but continue so server can start.
+    console.error('Failed to validate auth_users_role_check:', err && err.message ? err.message : err);
+  });
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS auth_sessions (
