@@ -1134,6 +1134,32 @@ app.get('/motivos-merma', async (_req, res) => {
   }
 });
 
+async function resolveResponsableIdFromAuth(client, auth) {
+  const username = String(auth?.username || '').trim();
+  if (!username) {
+    throw new Error('No se pudo identificar el usuario autenticado');
+  }
+
+  const existing = await client.query(
+    `SELECT id_responsable
+     FROM responsables
+     WHERE LOWER(TRIM(nombre_completo)) = LOWER(TRIM($1))
+     LIMIT 1`,
+    [username]
+  );
+  if (existing.rowCount) {
+    return Number(existing.rows[0].id_responsable);
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO responsables (nombre_completo)
+     VALUES ($1)
+     RETURNING id_responsable`,
+    [username]
+  );
+  return Number(inserted.rows[0].id_responsable);
+}
+
 app.post('/api/mermas', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
   if (!auth) return;
@@ -1144,10 +1170,9 @@ app.post('/api/mermas', async (req, res) => {
   }
 
   const timestamp = combineFechaHora(cabecera.fecha, cabecera.hora);
-  const idResponsable = Number(cabecera.id_responsable);
   const idSede = Number(cabecera.id_sede);
 
-  if (!timestamp || !Number.isInteger(idResponsable) || idResponsable <= 0 || !Number.isInteger(idSede) || idSede <= 0) {
+  if (!timestamp || !Number.isInteger(idSede) || idSede <= 0) {
     return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios en cabecera' });
   }
 
@@ -1177,18 +1202,7 @@ app.post('/api/mermas', async (req, res) => {
 
   try {
     await client.query('BEGIN');
-
-    const responsableResult = await client.query(
-      `SELECT id_responsable
-       FROM responsables
-       WHERE id_responsable = $1
-       LIMIT 1`,
-      [idResponsable]
-    );
-    if (!responsableResult.rows.length) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ ok: false, error: 'Responsable inválido' });
-    }
+    const idResponsable = await resolveResponsableIdFromAuth(client, auth);
 
     const sedeResult = await client.query(
       `SELECT id_sede
@@ -1541,13 +1555,14 @@ app.post('/api/empaquetados', async (req, res) => {
   }
 
   const timestamp = combineFechaHora(cabecera.fecha, cabecera.hora);
-  if (!timestamp || !cabecera.id_destino || !cabecera.id_responsable || !cabecera.id_sede) {
+  if (!timestamp || !cabecera.id_destino || !cabecera.id_sede) {
     return res.status(400).json({ ok: false, error: 'Faltan campos en cabecera' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const idResponsable = await resolveResponsableIdFromAuth(client, auth);
     const headerResult = await client.query(
       `INSERT INTO empaquetados_cabecera (fecha_hora, id_destino, numero_registro, id_responsable, id_sede)
        VALUES ($1, $2, $3, $4, $5)
@@ -1556,7 +1571,7 @@ app.post('/api/empaquetados', async (req, res) => {
         timestamp,
         Number(cabecera.id_destino),
         String(cabecera.numero_registro || '').trim(),
-        Number(cabecera.id_responsable),
+        idResponsable,
         Number(cabecera.id_sede),
       ]
     );
