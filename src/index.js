@@ -2296,6 +2296,8 @@ app.post('/api/registros/delete', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
   if (!auth) return;
 
+  const tipo = String(req.body?.tipo || '').trim().toLowerCase();
+
   const rowsRaw = Array.isArray(req.body?.rows) ? req.body.rows : [];
   const rows = rowsRaw
     .map((row) => ({
@@ -2304,7 +2306,7 @@ app.post('/api/registros/delete', async (req, res) => {
     }))
     .filter((row) => {
       if (!/^\d+$/.test(row.id) || row.id === '0') return false;
-      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle';
+      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle' || row.source === 'control_inventario_guardia';
     });
 
   const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
@@ -2315,6 +2317,7 @@ app.post('/api/registros/delete', async (req, res) => {
   const detalleIdsSet = new Set(legacyIds);
   const historicoIdsSet = new Set();
   const mermaDetalleIdsSet = new Set();
+  const controlInventarioIdsSet = new Set();
 
   rows.forEach((row) => {
     if (row.source === 'empaquetados_detalle') {
@@ -2325,14 +2328,19 @@ app.post('/api/registros/delete', async (req, res) => {
       mermaDetalleIdsSet.add(Number(row.id));
       return;
     }
+    if (row.source === 'control_inventario_guardia') {
+      controlInventarioIdsSet.add(Number(row.id));
+      return;
+    }
     historicoIdsSet.add(row.id);
   });
 
   const detalleIds = Array.from(detalleIdsSet).filter((id) => Number.isInteger(id) && id > 0);
   const historicoIds = Array.from(historicoIdsSet);
   const mermaDetalleIds = Array.from(mermaDetalleIdsSet).filter((id) => Number.isInteger(id) && id > 0);
+  const controlInventarioIds = Array.from(controlInventarioIdsSet).filter((id) => Number.isInteger(id) && id > 0);
 
-  if (!detalleIds.length && !historicoIds.length && !mermaDetalleIds.length) {
+  if (!detalleIds.length && !historicoIds.length && !mermaDetalleIds.length && !controlInventarioIds.length) {
     return res.status(400).json({ ok: false, error: 'rows o ids es obligatorio y debe contener valores válidos' });
   }
 
@@ -2346,6 +2354,7 @@ app.post('/api/registros/delete', async (req, res) => {
     let deletedCabecerasCount = 0;
     let deletedMermaDetalleCount = 0;
     let deletedMermaCabecerasCount = 0;
+    let deletedControlInventarioCount = 0;
 
     if (detalleIds.length) {
       const deleted = await client.query(
@@ -2411,6 +2420,16 @@ app.post('/api/registros/delete', async (req, res) => {
       }
     }
 
+    if (controlInventarioIds.length) {
+      const deletedControlInventario = await client.query(
+        `DELETE FROM control_inventario_guardia
+         WHERE id_control = ANY($1::bigint[])`,
+        [controlInventarioIds]
+      );
+      deletedControlInventarioCount = deletedControlInventario.rowCount || 0;
+      deletedTotal += deletedControlInventarioCount;
+    }
+
     await client.query('COMMIT');
     return res.json({
       ok: true,
@@ -2420,6 +2439,7 @@ app.post('/api/registros/delete', async (req, res) => {
       deleted_cabeceras: deletedCabecerasCount,
       deleted_merma_detalle: deletedMermaDetalleCount,
       deleted_merma_cabeceras: deletedMermaCabecerasCount,
+      deleted_control_inventario: deletedControlInventarioCount,
     });
   } catch (error) {
     await client.query('ROLLBACK');
