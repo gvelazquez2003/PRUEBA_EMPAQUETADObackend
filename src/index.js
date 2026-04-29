@@ -1810,6 +1810,83 @@ app.get('/api/registros', async (req, res) => {
       });
     }
 
+    if (tipo === 'control-inventario') {
+      const fetchLimit = limit + 1;
+      const whereParts = [];
+      const params = [];
+
+      if (hasDesde) {
+        params.push(desde);
+        whereParts.push(`DATE(cg.created_at) >= $${params.length}`);
+      }
+      if (hasHasta) {
+        params.push(hasta);
+        whereParts.push(`DATE(cg.created_at) <= $${params.length}`);
+      }
+      if (hasSemana) {
+        params.push(semana);
+        whereParts.push(`TO_CHAR(cg.created_at, 'IYYY-"W"IW') = $${params.length}`);
+      }
+      if (hasFecha) {
+        params.push(fecha);
+        whereParts.push(`DATE(cg.created_at) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(cg.created_at, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasMesNumero) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(cg.created_at, 'MM') = $${params.length}`);
+      }
+      if (hasAnio) {
+        params.push(anio);
+        whereParts.push(`TO_CHAR(cg.created_at, 'YYYY') = $${params.length}`);
+      }
+
+      params.push(fetchLimit);
+      params.push(offset);
+      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      const result = await pool.query(
+        `SELECT
+          cg.id_control AS "__ROW_ID",
+          'control_inventario_guardia'::text AS "__ROW_SOURCE",
+          TO_CHAR(cg.created_at, 'YYYY-MM-DD') AS "FECHA",
+          TO_CHAR(cg.created_at, 'DD/MM/YYYY HH24:MI:SS') AS "Fecha",
+          p.codigo_producto AS "Codigo",
+          p.descripcion AS "Producto",
+          cg.cantidad_fisica_contada AS "Cantidad contada",
+          COALESCE(NULLIF(TRIM(cg.responsable), ''), NULLIF(TRIM(cg.almacenista), ''), '') AS "Almacenista",
+          cg.turno_actual AS "Turno",
+          cg.momento_conteo AS "Momento",
+          cg.almacen AS "Almacen"
+         FROM control_inventario_guardia cg
+         JOIN productos p ON p.id_producto = cg.id_producto
+         ${whereClause}
+         ORDER BY cg.created_at DESC, cg.id_control DESC
+         LIMIT $${params.length - 1}
+         OFFSET $${params.length}`,
+        params
+      );
+
+      const hasMore = result.rows.length > limit;
+      const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+      const headers = rows.length
+        ? Object.keys(rows[0])
+        : ['Fecha', 'Codigo', 'Producto', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen'];
+      return res.json({
+        ok: true,
+        sheet: 'Control de Inventario',
+        headers,
+        rows,
+        total: rows.length,
+        hasMore,
+        offset,
+        limit,
+      });
+    }
+
     if (tipo === 'consolidado') {
       const fetchLimit = limit + 1;
       const wherePartsActual = [];
