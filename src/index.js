@@ -1772,10 +1772,12 @@ app.get('/api/registros', async (req, res) => {
           md.codigo_producto AS "Codigo del producto",
           md.producto AS "Nombre del producto",
           md.cantidad AS "Cantidad",
+          r.nombre_completo AS "RESPONSABLE",
           md.motivo AS "Motivo",
           md.numero_lote AS "Lote"
         FROM mermas_detalle md
         JOIN mermas_cabecera mc ON mc.id_merma = md.id_merma
+        JOIN responsables r ON r.id_responsable = mc.id_responsable
         ${whereClause}
         ORDER BY mc.fecha_hora DESC, md.id_detalle DESC
         LIMIT $${params.length - 1}
@@ -1787,7 +1789,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha y Hora', 'Codigo del producto', 'Nombre del producto', 'Cantidad', 'Motivo', 'Lote'];
+        : ['Fecha y Hora', 'Codigo del producto', 'Nombre del producto', 'Cantidad', 'RESPONSABLE', 'Motivo', 'Lote'];
       return res.json({
         ok: true,
         sheet: 'Merma',
