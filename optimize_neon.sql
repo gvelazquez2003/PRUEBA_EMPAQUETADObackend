@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS control_inventario_guardia (
   id_control BIGSERIAL PRIMARY KEY,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
   almacenista VARCHAR(120) NOT NULL,
+  responsable VARCHAR(120) NOT NULL DEFAULT '',
   turno_actual VARCHAR(120) NOT NULL,
   momento_conteo VARCHAR(180) NOT NULL,
   id_producto INT NOT NULL REFERENCES productos(id_producto),

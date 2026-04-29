@@ -760,6 +760,7 @@ async function ensureControlInventarioTable() {
       id_control BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       almacenista VARCHAR(120) NOT NULL,
+      responsable VARCHAR(120) NOT NULL DEFAULT '',
       turno_actual VARCHAR(120) NOT NULL,
       momento_conteo VARCHAR(180) NOT NULL,
       id_producto INT NOT NULL REFERENCES productos(id_producto),
@@ -767,6 +768,11 @@ async function ensureControlInventarioTable() {
       fecha_elaboracion DATE NOT NULL,
       almacen VARCHAR(20) NOT NULL
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE control_inventario_guardia
+    ADD COLUMN IF NOT EXISTS responsable VARCHAR(120) NOT NULL DEFAULT ''
   `);
 
   await pool.query(`
@@ -1606,12 +1612,12 @@ app.post('/api/control-inventario', async (req, res) => {
   const hasDetalle = Array.isArray(body.detalle);
   const cabecera = hasDetalle ? body.cabecera || {} : body;
 
-  const cleanAlmacenista = String(cabecera.almacenista || '').trim();
+  const cleanResponsable = String(auth?.username || '').trim();
   const cleanTurno = String(cabecera.turno_actual || '').trim();
   const cleanMomento = String(cabecera.momento_conteo || '').trim();
   const cleanAlmacen = String(cabecera.almacen || '').trim();
 
-  if (!cleanAlmacenista || !cleanTurno || !cleanMomento || !cleanAlmacen) {
+  if (!cleanResponsable || !cleanTurno || !cleanMomento || !cleanAlmacen) {
     return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios en cabecera' });
   }
 
@@ -1671,6 +1677,7 @@ app.post('/api/control-inventario', async (req, res) => {
       const inserted = await client.query(
         `INSERT INTO control_inventario_guardia (
            almacenista,
+           responsable,
            turno_actual,
            momento_conteo,
            id_producto,
@@ -1678,10 +1685,11 @@ app.post('/api/control-inventario', async (req, res) => {
            fecha_elaboracion,
            almacen
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id_control, created_at, id_producto, cantidad_fisica_contada, fecha_elaboracion`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id_control, created_at, id_producto, cantidad_fisica_contada, fecha_elaboracion, responsable`,
         [
-          cleanAlmacenista,
+          cleanResponsable,
+          cleanResponsable,
           cleanTurno,
           cleanMomento,
           item.id_producto,
