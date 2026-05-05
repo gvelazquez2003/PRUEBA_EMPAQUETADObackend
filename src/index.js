@@ -770,6 +770,7 @@ async function ensureControlInventarioTable() {
       momento_conteo VARCHAR(180) NOT NULL,
       id_producto INT NOT NULL REFERENCES productos(id_producto),
       cantidad_fisica_contada INT NOT NULL,
+      fecha_conteo DATE,
       fecha_elaboracion DATE NOT NULL,
       almacen VARCHAR(20) NOT NULL
     )
@@ -779,6 +780,17 @@ async function ensureControlInventarioTable() {
     ALTER TABLE control_inventario_guardia
     ADD COLUMN IF NOT EXISTS responsable VARCHAR(120) NOT NULL DEFAULT ''
   `);
+
+  await pool.query(`
+    ALTER TABLE control_inventario_guardia
+    ADD COLUMN IF NOT EXISTS fecha_conteo DATE
+  `);
+
+  await pool.query(`
+    UPDATE control_inventario_guardia
+       SET fecha_conteo = COALESCE(fecha_conteo, fecha_elaboracion)
+     WHERE fecha_conteo IS NULL
+  `).catch(() => {});
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_created_at
@@ -1635,6 +1647,7 @@ app.post('/api/control-inventario', async (req, res) => {
         {
           id_producto: body.id_producto,
           cantidad_fisica_contada: body.cantidad_fisica_contada,
+          fecha_conteo: body.fecha_conteo,
           fecha_elaboracion: body.fecha_elaboracion,
         },
       ];
@@ -1642,7 +1655,8 @@ app.post('/api/control-inventario', async (req, res) => {
   const detalleNormalizado = (detalle || []).map((item) => ({
     id_producto: Number(item?.id_producto),
     cantidad_fisica_contada: Number(item?.cantidad_fisica_contada),
-    fecha_elaboracion: String(item?.fecha_elaboracion || '').trim(),
+    fecha_conteo: String(item?.fecha_conteo || cabecera.fecha_conteo || cabecera.fecha_elaboracion || '').trim(),
+    fecha_elaboracion: String(item?.fecha_elaboracion || cabecera.fecha_elaboracion || cabecera.fecha_conteo || '').trim(),
   }));
 
   if (!detalleNormalizado.length) {
@@ -1655,6 +1669,7 @@ app.post('/api/control-inventario', async (req, res) => {
       item.id_producto <= 0 ||
       !Number.isFinite(item.cantidad_fisica_contada) ||
       item.cantidad_fisica_contada <= 0 ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(item.fecha_conteo) ||
       !/^\d{4}-\d{2}-\d{2}$/.test(item.fecha_elaboracion)
   );
   if (invalidItem) {
@@ -1690,11 +1705,12 @@ app.post('/api/control-inventario', async (req, res) => {
            momento_conteo,
            id_producto,
            cantidad_fisica_contada,
+           fecha_conteo,
            fecha_elaboracion,
            almacen
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING id_control, created_at, id_producto, cantidad_fisica_contada, fecha_elaboracion, responsable`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id_control, created_at, id_producto, cantidad_fisica_contada, fecha_conteo, fecha_elaboracion, responsable`,
         [
           cleanResponsable,
           cleanResponsable,
@@ -1702,6 +1718,7 @@ app.post('/api/control-inventario', async (req, res) => {
           cleanMomento,
           item.id_producto,
           Math.floor(item.cantidad_fisica_contada),
+          item.fecha_conteo,
           item.fecha_elaboracion,
           cleanAlmacen,
         ]
@@ -1862,6 +1879,7 @@ app.get('/api/registros', async (req, res) => {
           'control_inventario_guardia'::text AS "__ROW_SOURCE",
           TO_CHAR(cg.created_at, 'YYYY-MM-DD') AS "FECHA",
           TO_CHAR(cg.created_at, 'DD/MM/YYYY HH24:MI:SS') AS "Fecha",
+          TO_CHAR(cg.fecha_elaboracion, 'DD/MM/YYYY') AS "FECHA DE ELABORACION",
           p.codigo_producto AS "Codigo",
           p.descripcion AS "Producto",
           cg.cantidad_fisica_contada AS "Cantidad contada",
@@ -1882,7 +1900,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha', 'Codigo', 'Producto', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen'];
+        : ['Fecha', 'FECHA DE ELABORACION', 'Codigo', 'Producto', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen'];
       return res.json({
         ok: true,
         sheet: 'Control de Inventario',

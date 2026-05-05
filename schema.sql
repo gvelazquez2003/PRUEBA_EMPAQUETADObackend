@@ -144,6 +144,7 @@ CREATE TABLE control_inventario_guardia (
     momento_conteo VARCHAR(180) NOT NULL,
     id_producto INT NOT NULL REFERENCES productos(id_producto),
     cantidad_fisica_contada INT NOT NULL,
+    fecha_conteo DATE,
     fecha_elaboracion DATE NOT NULL,
     almacen VARCHAR(20) NOT NULL
 );
