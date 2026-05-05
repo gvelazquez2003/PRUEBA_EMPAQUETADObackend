@@ -2770,6 +2770,7 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
       `WITH errores AS (
          SELECT
            id,
+           usuario,
            codigo_lote,
            lote_producto,
            codigo_producto,
