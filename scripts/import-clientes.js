@@ -50,7 +50,7 @@ function parseTimestamp(value) {
     const [, y, m, d, hh = '00', mm = '00', ss = '00', ms = '0'] = match;
     return `${y}-${m}-${d} ${hh}:${mm}:${ss}${ms ? `.${ms.padEnd(3, '0')}` : ''}`;
   }
-  return raw;
+  return null;
 }
 
 function quoteIdentifier(value) {
