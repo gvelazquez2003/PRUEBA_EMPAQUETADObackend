@@ -655,6 +655,7 @@ async function ensureAlmacen09Tables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conteo_errores (
       id SERIAL PRIMARY KEY,
+      usuario VARCHAR(32),
       codigo_lote VARCHAR(50),
       lote_producto VARCHAR(120),
       codigo_producto VARCHAR(30),
@@ -685,6 +686,10 @@ async function ensureAlmacen09Tables() {
   await pool.query(`
     ALTER TABLE conteo_errores
     ADD COLUMN IF NOT EXISTS cantidad_recibida INT
+  `);
+  await pool.query(`
+    ALTER TABLE conteo_errores
+    ADD COLUMN IF NOT EXISTS usuario VARCHAR(32)
   `);
 
   await pool.query(`
@@ -1043,13 +1048,15 @@ async function dropLegacyUnusedTables() {
   await pool.query('DROP TABLE IF EXISTS lotes CASCADE');
 }
 
-async function registrarErrorConteo(codigoLote, erroresDetalle) {
+async function registrarErrorConteo(codigoLote, erroresDetalle, username) {
   try {
     const cleanCodigoLote = String(codigoLote || '').trim().toUpperCase() || null;
+    const cleanUsuario = normalizeAuthUsername(username);
+    const usuario = cleanUsuario || null;
     const detalles = Array.isArray(erroresDetalle) ? erroresDetalle : [];
 
     if (!detalles.length) {
-      await pool.query('INSERT INTO conteo_errores (codigo_lote) VALUES ($1)', [cleanCodigoLote]);
+      await pool.query('INSERT INTO conteo_errores (usuario, codigo_lote) VALUES ($1, $2)', [usuario, cleanCodigoLote]);
       return;
     }
 
@@ -1065,6 +1072,7 @@ async function registrarErrorConteo(codigoLote, erroresDetalle) {
 
       await pool.query(
         `INSERT INTO conteo_errores (
+           usuario,
            codigo_lote,
            lote_producto,
            codigo_producto,
@@ -1072,8 +1080,8 @@ async function registrarErrorConteo(codigoLote, erroresDetalle) {
            cantidad_esperada,
            cantidad_recibida
          )
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [cleanCodigoLote, loteProducto, codigoProducto, nombreProducto, esperado, recibido]
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [usuario, cleanCodigoLote, loteProducto, codigoProducto, nombreProducto, esperado, recibido]
       );
     }
   } catch (error) {
@@ -2614,7 +2622,7 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
 
     if (erroresConteoDetalle.length) {
       await client.query('ROLLBACK');
-      await registrarErrorConteo(codigoRegistro, erroresConteoDetalle);
+      await registrarErrorConteo(codigoRegistro, erroresConteoDetalle, auth?.username);
       return res.status(400).send('ERROR: Las cantidades no coinciden con el registro de Empaquetado. CUENTE DE NUEVO');
     }
 
@@ -2785,6 +2793,7 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
        )
        SELECT
          e.id,
+         e.usuario,
          e.codigo_lote,
          COALESCE(NULLIF(TRIM(e.lote_producto), ''), lr.lote_referencia, e.codigo_lote) AS lote_mostrado,
          e.codigo_producto,
