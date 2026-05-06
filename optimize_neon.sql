@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS control_inventario_guardia (
   cantidad_fisica_contada INT NOT NULL,
   fecha_conteo DATE,
   fecha_elaboracion DATE NOT NULL,
-  almacen VARCHAR(20) NOT NULL
+  almacen VARCHAR(20) NOT NULL,
+  numero_lote VARCHAR(80)
 );
 
 CREATE TABLE IF NOT EXISTS almacen09_clientes (
