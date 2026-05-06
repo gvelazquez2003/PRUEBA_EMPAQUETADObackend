@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS almacen09_direcciones (
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS almacen09_salidas_facturas (
+CREATE TABLE IF NOT EXISTS salidas_facturas (
   id_factura BIGSERIAL PRIMARY KEY,
   numero_control BIGINT NOT NULL UNIQUE,
   numero_factura VARCHAR(80) NOT NULL UNIQUE,
@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS almacen09_salidas_facturas (
 
 CREATE TABLE IF NOT EXISTS almacen09_salidas_detalle (
   id_detalle BIGSERIAL PRIMARY KEY,
-  id_factura BIGINT NOT NULL REFERENCES almacen09_salidas_facturas(id_factura) ON DELETE CASCADE,
+  id_factura BIGINT NOT NULL REFERENCES salidas_facturas(id_factura) ON DELETE CASCADE,
   id_producto INT NOT NULL REFERENCES productos(id_producto),
   codigo_producto VARCHAR(30) NOT NULL,
   producto TEXT NOT NULL,
@@ -181,7 +181,7 @@ CREATE INDEX IF NOT EXISTS idx_historico_resultados_fecha_almacen09 ON historico
 CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_created_at ON control_inventario_guardia(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC);
 
-CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_fecha ON almacen09_salidas_facturas(fecha_emision DESC);
+CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_fecha ON salidas_facturas(fecha_emision DESC);
 CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_codigo_lote ON almacen09_salidas_detalle(codigo_producto, numero_lote);
 CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura);
 
@@ -209,7 +209,7 @@ WHERE t.schemaname = 'public'
     'almacen09_zonas',
     'almacen09_sucursales',
     'almacen09_direcciones',
-    'almacen09_salidas_facturas',
+    'salidas_facturas',
     'almacen09_salidas_detalle',
     'auth_users',
     'auth_sessions'

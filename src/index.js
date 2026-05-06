@@ -840,7 +840,7 @@ async function ensureSalidas09Tables() {
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS almacen09_salidas_facturas (
+    CREATE TABLE IF NOT EXISTS salidas_facturas (
       id_factura BIGSERIAL PRIMARY KEY,
       numero_control BIGINT,
       numero_factura VARCHAR(80) NOT NULL UNIQUE,
@@ -860,29 +860,29 @@ async function ensureSalidas09Tables() {
     )
   `);
 
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS numero_control BIGINT');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS cliente_nombre VARCHAR(160)');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_nombre VARCHAR(160)');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS zona_id BIGINT REFERENCES almacen09_zonas(id_zona) ON DELETE SET NULL');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS zona_nombre VARCHAR(120)');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS sucursal_id BIGINT REFERENCES almacen09_sucursales(id_sucursal) ON DELETE SET NULL');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS sucursal_nombre VARCHAR(160)');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL');
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS numero_control BIGINT');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_nombre VARCHAR(160)');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_nombre VARCHAR(160)');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS zona_id BIGINT REFERENCES almacen09_zonas(id_zona) ON DELETE SET NULL');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS zona_nombre VARCHAR(120)');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS sucursal_id BIGINT REFERENCES almacen09_sucursales(id_sucursal) ON DELETE SET NULL');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS sucursal_nombre VARCHAR(160)');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)');
 
   await pool.query(`
-    UPDATE almacen09_salidas_facturas
+    UPDATE salidas_facturas
        SET numero_control = COALESCE(numero_control, id_factura)
      WHERE numero_control IS NULL
   `);
-  await pool.query('ALTER TABLE almacen09_salidas_facturas ALTER COLUMN numero_control SET NOT NULL');
+  await pool.query('ALTER TABLE salidas_facturas ALTER COLUMN numero_control SET NOT NULL');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS almacen09_salidas_detalle (
       id_detalle BIGSERIAL PRIMARY KEY,
-      id_factura BIGINT NOT NULL REFERENCES almacen09_salidas_facturas(id_factura) ON DELETE CASCADE,
+      id_factura BIGINT NOT NULL REFERENCES salidas_facturas(id_factura) ON DELETE CASCADE,
       id_producto INT NOT NULL REFERENCES productos(id_producto),
       codigo_producto VARCHAR(30) NOT NULL,
       producto TEXT NOT NULL,
@@ -894,10 +894,10 @@ async function ensureSalidas09Tables() {
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_fecha
-    ON almacen09_salidas_facturas (fecha_emision DESC)
+    ON salidas_facturas (fecha_emision DESC)
   `);
 
-  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_numero_control ON almacen09_salidas_facturas(numero_control)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_numero_control ON salidas_facturas(numero_control)');
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_codigo_lote
@@ -1038,7 +1038,7 @@ async function upsertSalidasCatalogValue(client, catalogKey, rawValue) {
 }
 
 async function getNextSalidasControlNumber(client) {
-  const result = await client.query('SELECT COALESCE(MAX(numero_control), 0) + 1 AS siguiente FROM almacen09_salidas_facturas');
+  const result = await client.query('SELECT COALESCE(MAX(numero_control), 0) + 1 AS siguiente FROM salidas_facturas');
   return Math.max(1, Number(result.rows[0]?.siguiente || 1));
 }
 
@@ -2922,12 +2922,12 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('LOCK TABLE almacen09_salidas_facturas IN EXCLUSIVE MODE');
+    await client.query('LOCK TABLE salidas_facturas IN EXCLUSIVE MODE');
 
     const numeroControl = numeroControlManual || await getNextSalidasControlNumber(client);
 
     const duplicatedControl = await client.query(
-      'SELECT 1 FROM almacen09_salidas_facturas WHERE numero_control = $1 LIMIT 1',
+      'SELECT 1 FROM salidas_facturas WHERE numero_control = $1 LIMIT 1',
       [numeroControl]
     );
     if (duplicatedControl.rowCount) {
@@ -2936,7 +2936,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     }
 
     const duplicated = await client.query(
-      'SELECT 1 FROM almacen09_salidas_facturas WHERE numero_factura = $1 LIMIT 1',
+      'SELECT 1 FROM salidas_facturas WHERE numero_factura = $1 LIMIT 1',
       [numeroFactura]
     );
     if (duplicated.rowCount) {
@@ -2972,7 +2972,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     const direccion = await upsertSalidasCatalogValue(client, 'direccion', direccionRaw);
 
     const facturaInsert = await client.query(
-      `INSERT INTO almacen09_salidas_facturas (
+      `INSERT INTO salidas_facturas (
          numero_control,
          numero_factura,
          fecha_emision,
@@ -3100,7 +3100,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sd.numero_lote,
          sd.cantidad,
          TO_CHAR(sd.created_at, 'YYYY-MM-DD HH24:MI:SS') AS detalle_created_at
-       FROM almacen09_salidas_facturas sf
+      FROM salidas_facturas sf
        JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
        ${whereSql}
        ORDER BY sf.fecha_emision DESC, sf.id_factura DESC, sd.id_detalle ASC
@@ -3149,7 +3149,7 @@ app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
     let deletedFacturasCount = 0;
     if (facturaIds.length) {
       const deletedFacturas = await client.query(
-        `DELETE FROM almacen09_salidas_facturas sf
+        `DELETE FROM salidas_facturas sf
          WHERE sf.id_factura = ANY($1::bigint[])
            AND NOT EXISTS (
              SELECT 1
@@ -3236,7 +3236,7 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
            UPPER(TRIM(sd.numero_lote)) AS numero_lote,
            SUM(sd.cantidad)::int AS cantidad_salida
          FROM almacen09_salidas_detalle sd
-         JOIN almacen09_salidas_facturas sf ON sf.id_factura = sd.id_factura
+         JOIN salidas_facturas sf ON sf.id_factura = sd.id_factura
          WHERE DATE(sf.fecha_emision) >= $1
          GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
        ),

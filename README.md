@@ -77,7 +77,7 @@ Tablas activas por dominio:
 	- `almacen_lotes_procesados`: estado por lote (validado/descartado) y resumen JSON de validación.
 	- `conteo_errores`: trazabilidad de diferencias por lote y por producto.
 - Almacén09 (salidas por facturación):
-	- `almacen09_salidas_facturas`: cabecera de facturas.
+	- `salidas_facturas`: cabecera de facturas.
 	- `almacen09_salidas_detalle`: detalle por producto/lote/cantidad.
 - Control de inventario por guardia:
 	- `control_inventario_guardia`: conteos físicos por producto y fecha de elaboración.
