@@ -720,6 +720,33 @@ async function ensureAlmacen09Tables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_almacen_lotes_procesados_estado_processed ON almacen_lotes_procesados(estado, processed_at DESC)');
 }
 
+async function ensureCambiosProductosTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS almacen09_cambios_razones (
+      id_razon BIGSERIAL PRIMARY KEY,
+      nombre VARCHAR(180) NOT NULL UNIQUE,
+      activo BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS almacen09_cambios_productos (
+      id_cambio BIGSERIAL PRIMARY KEY,
+      cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
+      cliente_nombre VARCHAR(180) NOT NULL,
+      razon_id BIGINT REFERENCES almacen09_cambios_razones(id_razon) ON DELETE SET NULL,
+      razon_texto VARCHAR(240) NOT NULL,
+      responsable VARCHAR(180) NOT NULL,
+      detalle_productos JSONB NOT NULL,
+      usuario VARCHAR(32),
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_productos_created_at ON almacen09_cambios_productos(created_at DESC)');
+}
+
 async function ensureProductosSoftDelete() {
   await pool.query(`
     ALTER TABLE productos
@@ -1163,6 +1190,120 @@ app.get('/motivos-merma', async (_req, res) => {
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT nombre
+       FROM (
+         SELECT DISTINCT TRIM(nombre) AS nombre
+         FROM almacen09_clientes
+         WHERE TRIM(COALESCE(nombre, '')) <> ''
+         UNION
+         SELECT DISTINCT TRIM(cliente_nombre) AS nombre
+         FROM salidas_facturas
+         WHERE TRIM(COALESCE(cliente_nombre, '')) <> ''
+       ) base
+       ORDER BY nombre ASC`
+    );
+    return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/almacen09/cambios/razones', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id_razon, nombre
+       FROM almacen09_cambios_razones
+       WHERE activo = TRUE
+       ORDER BY nombre ASC`
+    );
+    return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/almacen09/cambios', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  if (!auth) return;
+
+  const clienteRaw = normalizeSalidasText(req.body?.cliente, 180);
+  const responsableRaw = normalizeSalidasText(req.body?.responsable, 180);
+  const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
+
+  const detalle = detalleRaw
+    .map((item) => ({
+      codigo: String(item?.codigo || '').trim().toUpperCase(),
+      producto: normalizeSalidasText(item?.producto, 180),
+      razon: normalizeSalidasText(item?.razon, 240),
+      cantidad: Number(item?.cantidad),
+    }))
+    .filter((item) => item.codigo && item.producto && item.razon && Number.isFinite(item.cantidad) && item.cantidad > 0)
+    .map((item) => ({ ...item, cantidad: Math.floor(item.cantidad) }));
+
+  if (!clienteRaw || !responsableRaw) {
+    return res.status(400).json({ ok: false, error: 'cliente y responsable son obligatorios' });
+  }
+  if (!detalle.length) {
+    return res.status(400).json({ ok: false, error: 'detalle debe incluir productos con razon y cantidades validas' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const clienteCatalog = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
+    const razonesDistinct = [...new Set(detalle.map((item) => String(item.razon || '').trim()).filter(Boolean))];
+    for (const razon of razonesDistinct) {
+      await client.query(
+        `INSERT INTO almacen09_cambios_razones (nombre)
+         VALUES ($1)
+         ON CONFLICT (nombre) DO UPDATE SET nombre = EXCLUDED.nombre`,
+        [razon]
+      );
+    }
+
+    const insertResult = await client.query(
+      `INSERT INTO almacen09_cambios_productos (
+         cliente_id,
+         cliente_nombre,
+         razon_id,
+         razon_texto,
+         responsable,
+         detalle_productos,
+         usuario
+       )
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+       RETURNING id_cambio, created_at`,
+      [
+        clienteCatalog.id,
+        clienteCatalog.value || clienteRaw,
+        null,
+        'DETALLE_POR_PRODUCTO',
+        responsableRaw,
+        JSON.stringify(detalle),
+        String(auth.username || '').trim() || null,
+      ]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      ok: true,
+      cambio: {
+        id_cambio: Number(insertResult.rows[0]?.id_cambio || 0),
+        created_at: insertResult.rows[0]?.created_at || null,
+      },
+    });
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -3345,6 +3486,7 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
 Promise.all([
   ensureAuthTables(),
   ensureAlmacen09Tables(),
+  ensureCambiosProductosTables(),
   ensureProductosSoftDelete(),
   ensureHistoricoResultadosTable(),
   ensureControlInventarioTable(),
