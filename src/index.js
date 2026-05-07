@@ -722,29 +722,96 @@ async function ensureAlmacen09Tables() {
 
 async function ensureCambiosProductosTables() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS almacen09_cambios_razones (
-      id_razon BIGSERIAL PRIMARY KEY,
-      nombre VARCHAR(180) NOT NULL UNIQUE,
-      activo BOOLEAN NOT NULL DEFAULT TRUE,
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'almacen09_cambios_razones'
+      ) AND NOT EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'cambios_razones'
+      ) THEN
+        ALTER TABLE almacen09_cambios_razones RENAME TO cambios_razones;
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'almacen09_cambios_productos'
+      ) AND NOT EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'cambios_registros'
+      ) THEN
+        ALTER TABLE almacen09_cambios_productos RENAME TO cambios_registros;
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cambios_razones (
+      razon_id BIGSERIAL PRIMARY KEY,
+      razon_texto VARCHAR(180) NOT NULL UNIQUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS almacen09_cambios_productos (
+    CREATE TABLE IF NOT EXISTS cambios_registros (
       id_cambio BIGSERIAL PRIMARY KEY,
-      cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
-      cliente_nombre VARCHAR(180) NOT NULL,
-      razon_id BIGINT REFERENCES almacen09_cambios_razones(id_razon) ON DELETE SET NULL,
-      razon_texto VARCHAR(240) NOT NULL,
+      id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
+      nombre_cliente VARCHAR(180) NOT NULL,
       responsable VARCHAR(180) NOT NULL,
-      detalle_productos JSONB NOT NULL,
-      usuario VARCHAR(32),
+      producto JSONB NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_productos_created_at ON almacen09_cambios_productos(created_at DESC)');
+  await pool.query(`ALTER TABLE cambios_razones ADD COLUMN IF NOT EXISTS razon_id BIGSERIAL`);
+  await pool.query(`ALTER TABLE cambios_razones ADD COLUMN IF NOT EXISTS razon_texto VARCHAR(180)`);
+  await pool.query(`UPDATE cambios_razones SET razon_texto = COALESCE(razon_texto, nombre) WHERE razon_texto IS NULL`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS id_razon`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS nombre`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS activo`).catch(() => {});
+
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS responsable VARCHAR(180)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS producto JSONB`);
+  await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => {});
+  await pool.query(`UPDATE cambios_registros SET nombre_cliente = COALESCE(nombre_cliente, cliente_nombre) WHERE nombre_cliente IS NULL`).catch(() => {});
+  await pool.query(`UPDATE cambios_registros SET producto = COALESCE(producto, detalle_productos) WHERE producto IS NULL`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_id`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_nombre`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS razon_id`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS razon_texto`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS detalle_productos`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS usuario`).catch(() => {});
+
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto ON cambios_razones(razon_texto)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_created_at ON cambios_registros(created_at DESC)');
+
+  const razonesEjemplo = [
+    'Vencimiento cercano',
+    'Empaque deteriorado',
+    'Error de despacho',
+    'Cambio por calidad',
+  ];
+  for (const razon of razonesEjemplo) {
+    await pool.query(
+      `INSERT INTO cambios_razones (razon_texto)
+       VALUES ($1)
+       ON CONFLICT (razon_texto) DO NOTHING`,
+      [razon]
+    );
+  }
 }
 
 async function ensureProductosSoftDelete() {
@@ -1217,10 +1284,9 @@ app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
 app.get('/api/almacen09/cambios/razones', async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id_razon, nombre
-       FROM almacen09_cambios_razones
-       WHERE activo = TRUE
-       ORDER BY nombre ASC`
+      `SELECT razon_id, razon_texto
+       FROM cambios_razones
+       ORDER BY razon_texto ASC`
     );
     return res.json({ ok: true, rows: result.rows });
   } catch (error) {
@@ -1261,33 +1327,27 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     const razonesDistinct = [...new Set(detalle.map((item) => String(item.razon || '').trim()).filter(Boolean))];
     for (const razon of razonesDistinct) {
       await client.query(
-        `INSERT INTO almacen09_cambios_razones (nombre)
+        `INSERT INTO cambios_razones (razon_texto)
          VALUES ($1)
-         ON CONFLICT (nombre) DO UPDATE SET nombre = EXCLUDED.nombre`,
+         ON CONFLICT (razon_texto) DO UPDATE SET razon_texto = EXCLUDED.razon_texto`,
         [razon]
       );
     }
 
     const insertResult = await client.query(
-      `INSERT INTO almacen09_cambios_productos (
-         cliente_id,
-         cliente_nombre,
-         razon_id,
-         razon_texto,
+      `INSERT INTO cambios_registros (
+         id_cliente,
+         nombre_cliente,
          responsable,
-         detalle_productos,
-         usuario
+         producto
        )
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+       VALUES ($1, $2, $3, $4::jsonb)
        RETURNING id_cambio, created_at`,
       [
         clienteCatalog.id,
         clienteCatalog.value || clienteRaw,
-        null,
-        'DETALLE_POR_PRODUCTO',
         responsableRaw,
         JSON.stringify(detalle),
-        String(auth.username || '').trim() || null,
       ]
     );
 
