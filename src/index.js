@@ -1281,14 +1281,28 @@ app.get('/motivos-merma', async (_req, res) => {
 
 app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
   try {
+    const rawQuery = normalizeSalidasText(_req.query?.q, 160);
+    const limit = Math.min(Math.max(Number(_req.query?.limit || 40), 1), 200);
+    const params = [];
+    const whereParts = ["TRIM(COALESCE(nombre, '')) <> ''"];
+
+    if (rawQuery) {
+      params.push(`%${rawQuery}%`);
+      whereParts.push(`nombre ILIKE $${params.length}`);
+    }
+
+    params.push(limit);
+
     const result = await pool.query(
-      `SELECT descripcion AS nombre
+      `SELECT id_cliente, nombre
        FROM (
-         SELECT DISTINCT TRIM(descripcion) AS descripcion
-         FROM clientes
-         WHERE TRIM(COALESCE(descripcion, '')) <> ''
+         SELECT DISTINCT id_cliente, TRIM(nombre) AS nombre
+         FROM almacen09_clientes
+         WHERE ${whereParts.join(' AND ')}
        ) base
-       ORDER BY descripcion ASC`
+       ORDER BY nombre ASC
+       LIMIT $${params.length}`,
+      params
     );
     return res.json({ ok: true, rows: result.rows });
   } catch (error) {
