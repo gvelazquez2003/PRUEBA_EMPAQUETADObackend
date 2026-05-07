@@ -757,7 +757,7 @@ async function ensureCambiosProductosTables() {
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cambios_razones (
-      razon_id BIGSERIAL PRIMARY KEY,
+      id_razon BIGSERIAL PRIMARY KEY,
       razon_texto VARCHAR(180) NOT NULL UNIQUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
@@ -774,12 +774,31 @@ async function ensureCambiosProductosTables() {
     )
   `);
 
-  await pool.query(`ALTER TABLE cambios_razones ADD COLUMN IF NOT EXISTS razon_id BIGSERIAL`);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'cambios_razones' AND column_name = 'razon_id'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'cambios_razones' AND column_name = 'id_razon'
+      ) THEN
+        ALTER TABLE cambios_razones RENAME COLUMN razon_id TO id_razon;
+      END IF;
+    END $$;
+  `);
+  await pool.query(`ALTER TABLE cambios_razones ADD COLUMN IF NOT EXISTS id_razon BIGSERIAL`);
   await pool.query(`ALTER TABLE cambios_razones ADD COLUMN IF NOT EXISTS razon_texto VARCHAR(180)`);
   await pool.query(`UPDATE cambios_razones SET razon_texto = COALESCE(razon_texto, nombre) WHERE razon_texto IS NULL`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS id_razon`).catch(() => {});
   await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS nombre`).catch(() => {});
   await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS activo`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS created_at`).catch(() => {});
+
+  await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN id_razon SET NOT NULL`).catch(() => {});
+  await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN razon_texto SET NOT NULL`).catch(() => {});
+  await pool.query('ALTER TABLE cambios_razones DROP CONSTRAINT IF EXISTS cambios_razones_pkey').catch(() => {});
+  await pool.query('ALTER TABLE cambios_razones ADD CONSTRAINT cambios_razones_pkey PRIMARY KEY (id_razon)').catch(() => {});
 
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
@@ -1263,17 +1282,13 @@ app.get('/motivos-merma', async (_req, res) => {
 app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT nombre
+      `SELECT descripcion AS nombre
        FROM (
-         SELECT DISTINCT TRIM(nombre) AS nombre
-         FROM almacen09_clientes
-         WHERE TRIM(COALESCE(nombre, '')) <> ''
-         UNION
-         SELECT DISTINCT TRIM(cliente_nombre) AS nombre
-         FROM salidas_facturas
-         WHERE TRIM(COALESCE(cliente_nombre, '')) <> ''
+         SELECT DISTINCT TRIM(descripcion) AS descripcion
+         FROM clientes
+         WHERE TRIM(COALESCE(descripcion, '')) <> ''
        ) base
-       ORDER BY nombre ASC`
+       ORDER BY descripcion ASC`
     );
     return res.json({ ok: true, rows: result.rows });
   } catch (error) {
@@ -1284,7 +1299,7 @@ app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
 app.get('/api/almacen09/cambios/razones', async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT razon_id, razon_texto
+      `SELECT id_razon, razon_texto
        FROM cambios_razones
        ORDER BY razon_texto ASC`
     );
