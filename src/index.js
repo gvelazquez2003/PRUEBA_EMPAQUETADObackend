@@ -1297,7 +1297,7 @@ app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
       `SELECT nombre
        FROM (
          SELECT DISTINCT TRIM(descripcion) AS nombre
-         FROM "Nuevas Tablas".clientes
+         FROM public.clientes
          WHERE ${whereParts.join(' AND ')}
        ) base
        ORDER BY nombre ASC
