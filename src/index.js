@@ -1282,22 +1282,22 @@ app.get('/motivos-merma', async (_req, res) => {
 app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
   try {
     const rawQuery = normalizeSalidasText(_req.query?.q, 160);
-    const limit = Math.min(Math.max(Number(_req.query?.limit || 40), 1), 200);
+    const limit = Math.min(Math.max(Number(_req.query?.limit || 50), 1), 50);
     const params = [];
-    const whereParts = ["TRIM(COALESCE(nombre, '')) <> ''"];
+    const whereParts = ["TRIM(COALESCE(descripcion, '')) <> ''"];
 
     if (rawQuery) {
       params.push(`%${rawQuery}%`);
-      whereParts.push(`nombre ILIKE $${params.length}`);
+      whereParts.push(`descripcion ILIKE $${params.length}`);
     }
 
     params.push(limit);
 
     const result = await pool.query(
-      `SELECT id_cliente, nombre
+      `SELECT nombre
        FROM (
-         SELECT DISTINCT id_cliente, TRIM(nombre) AS nombre
-         FROM almacen09_clientes
+         SELECT DISTINCT TRIM(descripcion) AS nombre
+         FROM "Nuevas Tablas".clientes
          WHERE ${whereParts.join(' AND ')}
        ) base
        ORDER BY nombre ASC
