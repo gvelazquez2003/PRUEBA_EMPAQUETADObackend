@@ -1002,6 +1002,7 @@ async function ensureSalidas09Tables() {
     CREATE TABLE IF NOT EXISTS almacen09_salidas_detalle (
       id_detalle BIGSERIAL PRIMARY KEY,
       id_factura BIGINT NOT NULL REFERENCES salidas_facturas(id_factura) ON DELETE CASCADE,
+      id_cambio BIGINT,
       id_producto INT NOT NULL REFERENCES productos(id_producto),
       codigo_producto VARCHAR(30) NOT NULL,
       producto TEXT NOT NULL,
@@ -1010,6 +1011,8 @@ async function ensureSalidas09Tables() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
+  await pool.query('ALTER TABLE almacen09_salidas_detalle ADD COLUMN IF NOT EXISTS id_cambio BIGINT');
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_fecha
@@ -1021,6 +1024,11 @@ async function ensureSalidas09Tables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_codigo_lote
     ON almacen09_salidas_detalle (codigo_producto, numero_lote)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_id_cambio
+    ON almacen09_salidas_detalle (id_cambio)
   `);
 }
 
@@ -1393,6 +1401,55 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
+  }
+});
+
+app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  if (!auth) return;
+
+  const clienteRaw = normalizeSalidasText(req.query?.cliente, 180);
+  if (clienteRaw.length < 2) {
+    return res.json({ ok: true, rows: [], total: 0 });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         cr.id_cambio,
+         cr.nombre_cliente,
+         cr.responsable,
+         TO_CHAR(cr.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+         item.ord AS item_index,
+         UPPER(TRIM(item.value->>'codigo')) AS codigo,
+         TRIM(item.value->>'producto') AS producto,
+         TRIM(item.value->>'razon') AS razon,
+         COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int AS cantidad
+       FROM cambios_registros cr
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE
+           WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
+           WHEN jsonb_typeof(cr.producto) = 'object' THEN jsonb_build_array(cr.producto)
+           ELSE '[]'::jsonb
+         END
+       ) WITH ORDINALITY AS item(value, ord)
+       WHERE LOWER(TRIM(cr.nombre_cliente)) = LOWER(TRIM($1))
+         AND NULLIF(TRIM(item.value->>'codigo'), '') IS NOT NULL
+         AND NULLIF(TRIM(item.value->>'producto'), '') IS NOT NULL
+         AND COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int > 0
+         AND NOT EXISTS (
+           SELECT 1
+           FROM almacen09_salidas_detalle sd
+           WHERE sd.id_cambio = cr.id_cambio
+             AND UPPER(TRIM(sd.codigo_producto)) = UPPER(TRIM(item.value->>'codigo'))
+         )
+       ORDER BY cr.created_at DESC, cr.id_cambio DESC, item.ord ASC`,
+      [clienteRaw]
+    );
+
+    return res.json({ ok: true, rows: result.rows, total: result.rows.length });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -3327,6 +3384,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       producto: String(linea?.producto || '').trim(),
       lote: String(linea?.lote || '').trim().toUpperCase(),
       cantidad: Number(linea?.cantidad),
+      id_cambio: Number(linea?.id_cambio || 0),
     }))
     .filter((linea) => linea.codigo && linea.lote && Number.isFinite(linea.cantidad) && linea.cantidad > 0);
 
@@ -3382,6 +3440,57 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       return res.status(400).json({ ok: false, error: `Códigos no encontrados: ${missingCodigos.join(', ')}` });
     }
 
+    const cambioLineas = detalle.filter((linea) => Number.isInteger(linea.id_cambio) && linea.id_cambio > 0);
+    if (cambioLineas.length) {
+      const cambioIds = [...new Set(cambioLineas.map((linea) => linea.id_cambio))];
+      const cambiosResult = await client.query(
+        `SELECT
+           cr.id_cambio,
+           LOWER(TRIM(cr.nombre_cliente)) AS cliente_key,
+           UPPER(TRIM(item.value->>'codigo')) AS codigo,
+           COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int AS cantidad
+         FROM cambios_registros cr
+         CROSS JOIN LATERAL jsonb_array_elements(
+           CASE
+             WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
+             WHEN jsonb_typeof(cr.producto) = 'object' THEN jsonb_build_array(cr.producto)
+             ELSE '[]'::jsonb
+           END
+         ) AS item(value)
+         WHERE cr.id_cambio = ANY($1::bigint[])`,
+        [cambioIds]
+      );
+      const cambioMap = new Map();
+      cambiosResult.rows.forEach((row) => {
+        cambioMap.set(`${Number(row.id_cambio)}::${String(row.codigo || '').trim().toUpperCase()}`, {
+          clienteKey: String(row.cliente_key || '').trim(),
+          cantidad: Number(row.cantidad) || 0,
+        });
+      });
+
+      const clienteKey = clienteRaw.trim().toLowerCase();
+      for (const linea of cambioLineas) {
+        const cambioMeta = cambioMap.get(`${linea.id_cambio}::${linea.codigo}`);
+        if (!cambioMeta || cambioMeta.clienteKey !== clienteKey || Number(cambioMeta.cantidad) !== Math.floor(linea.cantidad)) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ ok: false, error: 'Una linea de cambio no coincide con el cliente, producto o cantidad registrada' });
+        }
+      }
+
+      const usedCambio = await client.query(
+        `SELECT 1
+         FROM almacen09_salidas_detalle
+         WHERE id_cambio = ANY($1::bigint[])
+           AND UPPER(TRIM(codigo_producto)) = ANY($2::text[])
+         LIMIT 1`,
+        [cambioIds, cambioLineas.map((linea) => linea.codigo)]
+      );
+      if (usedCambio.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ ok: false, error: 'Uno de los cambios seleccionados ya fue agregado a una factura' });
+      }
+    }
+
     const cliente = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
     const vendedor = await upsertSalidasCatalogValue(client, 'vendedor', vendedorRaw);
     const zona = await upsertSalidasCatalogValue(client, 'zona', zonaRaw);
@@ -3430,15 +3539,17 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       await client.query(
         `INSERT INTO almacen09_salidas_detalle (
            id_factura,
+           id_cambio,
            id_producto,
            codigo_producto,
            producto,
            numero_lote,
            cantidad
          )
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
           idFactura,
+          Number.isInteger(linea.id_cambio) && linea.id_cambio > 0 ? linea.id_cambio : null,
           Number(product.id_producto),
           linea.codigo,
           linea.producto || product.descripcion,
@@ -3512,6 +3623,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sf.estado,
          sd.id_detalle,
          sd.id_producto,
+         sd.id_cambio,
          sd.codigo_producto,
          sd.producto,
          sd.numero_lote,
