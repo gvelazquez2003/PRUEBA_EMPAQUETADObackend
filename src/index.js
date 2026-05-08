@@ -768,6 +768,8 @@ async function ensureCambiosProductosTables() {
       id_cambio BIGSERIAL PRIMARY KEY,
       id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       nombre_cliente VARCHAR(180) NOT NULL,
+      direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
+      direccion_texto VARCHAR(240),
       responsable VARCHAR(180) NOT NULL,
       producto JSONB NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -802,6 +804,8 @@ async function ensureCambiosProductosTables() {
 
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS responsable VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS producto JSONB`);
   await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => {});
@@ -1302,12 +1306,21 @@ app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
     params.push(limit);
 
     const result = await pool.query(
-      `SELECT nombre
+      `SELECT
+         nombre,
+         COALESCE(
+           JSON_AGG(direccion ORDER BY direccion) FILTER (WHERE direccion <> ''),
+           '[]'::json
+         ) AS direcciones
        FROM (
-         SELECT DISTINCT TRIM(descripcion) AS nombre
+         SELECT
+           TRIM(descripcion) AS nombre,
+           TRIM(COALESCE(direccion, '')) AS direccion
          FROM public.clientes
          WHERE ${whereParts.join(' AND ')}
+         GROUP BY TRIM(descripcion), TRIM(COALESCE(direccion, ''))
        ) base
+       GROUP BY nombre
        ORDER BY nombre ASC
        LIMIT $${params.length}`,
       params
@@ -1336,6 +1349,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 180);
+  const direccionRaw = normalizeSalidasText(req.body?.direccion, 240);
   const responsableRaw = normalizeSalidasText(req.body?.responsable, 180);
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
 
@@ -1361,6 +1375,9 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     await client.query('BEGIN');
 
     const clienteCatalog = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
+    const direccionCatalog = direccionRaw
+      ? await upsertSalidasCatalogValue(client, 'direccion', direccionRaw)
+      : { id: null, value: '' };
     const razonesDistinct = [...new Set(detalle.map((item) => String(item.razon || '').trim()).filter(Boolean))];
     for (const razon of razonesDistinct) {
       await client.query(
@@ -1375,14 +1392,18 @@ app.post('/api/almacen09/cambios', async (req, res) => {
       `INSERT INTO cambios_registros (
          id_cliente,
          nombre_cliente,
+         direccion_id,
+         direccion_texto,
          responsable,
          producto
        )
-       VALUES ($1, $2, $3, $4::jsonb)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
        RETURNING id_cambio, created_at`,
       [
         clienteCatalog.id,
         clienteCatalog.value || clienteRaw,
+        direccionCatalog.id,
+        direccionCatalog.value || direccionRaw || null,
         responsableRaw,
         JSON.stringify(detalle),
       ]
