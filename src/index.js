@@ -2048,6 +2048,114 @@ app.get('/api/registros', async (req, res) => {
   const hasAnio = /^\d{4}$/.test(anio);
 
   try {
+    if (tipo === 'cambios') {
+      const fetchLimit = limit + 1;
+      const whereParts = [];
+      const params = [];
+
+      if (hasDesde) {
+        params.push(desde);
+        whereParts.push(`DATE(cr.created_at) >= $${params.length}`);
+      }
+      if (hasHasta) {
+        params.push(hasta);
+        whereParts.push(`DATE(cr.created_at) <= $${params.length}`);
+      }
+      if (hasSemana) {
+        params.push(semana);
+        whereParts.push(`TO_CHAR(cr.created_at, 'IYYY-"W"IW') = $${params.length}`);
+      }
+      if (hasFecha) {
+        params.push(fecha);
+        whereParts.push(`DATE(cr.created_at) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(cr.created_at, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasMesNumero) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(cr.created_at, 'MM') = $${params.length}`);
+      }
+      if (hasAnio) {
+        params.push(anio);
+        whereParts.push(`TO_CHAR(cr.created_at, 'YYYY') = $${params.length}`);
+      }
+
+      params.push(fetchLimit);
+      params.push(offset);
+      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      const result = await pool.query(
+        `SELECT
+          cr.id_cambio AS "__ROW_ID",
+          'cambios_registros'::text AS "__ROW_SOURCE",
+          TO_CHAR(cr.created_at, 'YYYY-MM-DD') AS "FECHA",
+          TO_CHAR(cr.created_at, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
+          cr.nombre_cliente AS "Nombre del cliente",
+          COALESCE(productos.productos_cambiados, '') AS "Producto(s) cambiados",
+          COALESCE(productos.cantidades, '') AS "Cantidad de cada uno",
+          COALESCE(productos.razones, '') AS "Razon del cambio",
+          cr.responsable AS "Responsable del registro"
+        FROM cambios_registros cr
+        LEFT JOIN LATERAL (
+          SELECT
+            STRING_AGG(
+              NULLIF(TRIM(CONCAT(
+                NULLIF(TRIM(elem.value->>'codigo'), ''),
+                CASE
+                  WHEN NULLIF(TRIM(elem.value->>'codigo'), '') IS NOT NULL
+                   AND NULLIF(TRIM(elem.value->>'producto'), '') IS NOT NULL
+                  THEN ' - '
+                  ELSE ''
+                END,
+                NULLIF(TRIM(elem.value->>'producto'), '')
+              )), ''),
+              ' | '
+              ORDER BY ord
+            ) AS productos_cambiados,
+            STRING_AGG(
+              CONCAT(
+                COALESCE(NULLIF(TRIM(elem.value->>'producto'), ''), NULLIF(TRIM(elem.value->>'codigo'), ''), 'Producto'),
+                ': ',
+                COALESCE(NULLIF(TRIM(elem.value->>'cantidad'), ''), '0')
+              ),
+              ' | '
+              ORDER BY ord
+            ) AS cantidades,
+            STRING_AGG(DISTINCT NULLIF(TRIM(elem.value->>'razon'), ''), ' | ') AS razones
+          FROM jsonb_array_elements(
+            CASE
+              WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
+              WHEN jsonb_typeof(cr.producto) = 'object' THEN jsonb_build_array(cr.producto)
+              ELSE '[]'::jsonb
+            END
+          ) WITH ORDINALITY AS elem(value, ord)
+        ) productos ON true
+        ${whereClause}
+        ORDER BY cr.created_at DESC, cr.id_cambio DESC
+        LIMIT $${params.length - 1}
+        OFFSET $${params.length}`,
+        params
+      );
+
+      const hasMore = result.rows.length > limit;
+      const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+      const headers = rows.length
+        ? Object.keys(rows[0])
+        : ['Fecha de registro', 'Nombre del cliente', 'Producto(s) cambiados', 'Cantidad de cada uno', 'Razon del cambio', 'Responsable del registro'];
+      return res.json({
+        ok: true,
+        sheet: 'Cambios',
+        headers,
+        rows,
+        total: rows.length,
+        hasMore,
+        offset,
+        limit,
+      });
+    }
+
     if (tipo === 'merma') {
       const fetchLimit = limit + 1;
       const whereParts = [];
@@ -2623,7 +2731,7 @@ app.post('/api/registros/delete', async (req, res) => {
     }))
     .filter((row) => {
       if (!/^\d+$/.test(row.id) || row.id === '0') return false;
-      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle' || row.source === 'control_inventario_guardia';
+      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle' || row.source === 'control_inventario_guardia' || row.source === 'cambios_registros';
     });
 
   const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
@@ -2635,6 +2743,7 @@ app.post('/api/registros/delete', async (req, res) => {
   const historicoIdsSet = new Set();
   const mermaDetalleIdsSet = new Set();
   const controlInventarioIdsSet = new Set();
+  const cambiosIdsSet = new Set();
 
   rows.forEach((row) => {
     if (row.source === 'empaquetados_detalle') {
@@ -2649,6 +2758,10 @@ app.post('/api/registros/delete', async (req, res) => {
       controlInventarioIdsSet.add(Number(row.id));
       return;
     }
+    if (row.source === 'cambios_registros') {
+      cambiosIdsSet.add(Number(row.id));
+      return;
+    }
     historicoIdsSet.add(row.id);
   });
 
@@ -2656,8 +2769,9 @@ app.post('/api/registros/delete', async (req, res) => {
   const historicoIds = Array.from(historicoIdsSet);
   const mermaDetalleIds = Array.from(mermaDetalleIdsSet).filter((id) => Number.isInteger(id) && id > 0);
   const controlInventarioIds = Array.from(controlInventarioIdsSet).filter((id) => Number.isInteger(id) && id > 0);
+  const cambiosIds = Array.from(cambiosIdsSet).filter((id) => Number.isInteger(id) && id > 0);
 
-  if (!detalleIds.length && !historicoIds.length && !mermaDetalleIds.length && !controlInventarioIds.length) {
+  if (!detalleIds.length && !historicoIds.length && !mermaDetalleIds.length && !controlInventarioIds.length && !cambiosIds.length) {
     return res.status(400).json({ ok: false, error: 'rows o ids es obligatorio y debe contener valores válidos' });
   }
 
@@ -2672,6 +2786,7 @@ app.post('/api/registros/delete', async (req, res) => {
     let deletedMermaDetalleCount = 0;
     let deletedMermaCabecerasCount = 0;
     let deletedControlInventarioCount = 0;
+    let deletedCambiosCount = 0;
 
     if (detalleIds.length) {
       const deleted = await client.query(
@@ -2747,6 +2862,16 @@ app.post('/api/registros/delete', async (req, res) => {
       deletedTotal += deletedControlInventarioCount;
     }
 
+    if (cambiosIds.length) {
+      const deletedCambios = await client.query(
+        `DELETE FROM cambios_registros
+         WHERE id_cambio = ANY($1::bigint[])`,
+        [cambiosIds]
+      );
+      deletedCambiosCount = deletedCambios.rowCount || 0;
+      deletedTotal += deletedCambiosCount;
+    }
+
     await client.query('COMMIT');
     return res.json({
       ok: true,
@@ -2757,6 +2882,7 @@ app.post('/api/registros/delete', async (req, res) => {
       deleted_merma_detalle: deletedMermaDetalleCount,
       deleted_merma_cabeceras: deletedMermaCabecerasCount,
       deleted_control_inventario: deletedControlInventarioCount,
+      deleted_cambios: deletedCambiosCount,
     });
   } catch (error) {
     await client.query('ROLLBACK');
