@@ -983,6 +983,22 @@ async function ensureSalidas09Tables() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS salidas_cliente_sucursales (
+      id_relacion BIGSERIAL PRIMARY KEY,
+      cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
+      cliente_nombre VARCHAR(160) NOT NULL,
+      cliente_key VARCHAR(160) NOT NULL,
+      sucursal_nombre VARCHAR(160) NOT NULL,
+      sucursal_key VARCHAR(160) NOT NULL,
+      zona_nombre VARCHAR(120),
+      direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
+      direccion_texto VARCHAR(240),
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS numero_control BIGINT');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_nombre VARCHAR(160)');
@@ -994,6 +1010,28 @@ async function ensureSalidas09Tables() {
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS sucursal_nombre VARCHAR(160)');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)');
+
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS cliente_nombre VARCHAR(160)');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS cliente_key VARCHAR(160)');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS sucursal_nombre VARCHAR(160)');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS sucursal_key VARCHAR(160)');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS zona_nombre VARCHAR(120)');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()');
+  await pool.query('ALTER TABLE salidas_cliente_sucursales ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()');
+
+  await pool.query(`
+    UPDATE salidas_cliente_sucursales
+       SET cliente_key = LOWER(TRIM(COALESCE(cliente_nombre, '')))
+     WHERE TRIM(COALESCE(cliente_key, '')) = ''
+  `).catch(() => {});
+  await pool.query(`
+    UPDATE salidas_cliente_sucursales
+       SET sucursal_key = LOWER(TRIM(COALESCE(sucursal_nombre, '')))
+     WHERE TRIM(COALESCE(sucursal_key, '')) = ''
+  `).catch(() => {});
 
   await pool.query(`
     UPDATE salidas_facturas
@@ -1024,6 +1062,8 @@ async function ensureSalidas09Tables() {
   `);
 
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_numero_control ON salidas_facturas(numero_control)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas_cliente_sucursal_key ON salidas_cliente_sucursales(cliente_key, sucursal_key)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas_cliente_sucursal_updated ON salidas_cliente_sucursales(updated_at DESC)');
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_codigo_lote
@@ -1171,6 +1211,145 @@ async function upsertSalidasCatalogValue(client, catalogKey, rawValue) {
 async function getNextSalidasControlNumber(client) {
   const result = await client.query('SELECT COALESCE(MAX(numero_control), 0) + 1 AS siguiente FROM salidas_facturas');
   return Math.max(1, Number(result.rows[0]?.siguiente || 1));
+}
+
+function normalizeSalidasLookupKey(value, maxLength) {
+  return normalizeSalidasText(value, maxLength).toLowerCase();
+}
+
+async function listDireccionesByCliente(client, clienteRaw) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  if (!cliente) return [];
+  const result = await client.query(
+    `SELECT TRIM(COALESCE(direccion, '')) AS direccion
+     FROM public.clientes
+     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
+       AND TRIM(COALESCE(direccion, '')) <> ''
+     GROUP BY TRIM(COALESCE(direccion, ''))
+     ORDER BY TRIM(COALESCE(direccion, '')) ASC`,
+    [cliente]
+  );
+  return result.rows
+    .map((row) => normalizeSalidasText(row?.direccion, 240))
+    .filter(Boolean);
+}
+
+async function listSucursalMetaByCliente(client, clienteRaw) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  const clienteKey = normalizeSalidasLookupKey(clienteRaw, 160);
+  if (!cliente || !clienteKey) return [];
+
+  const tableRows = await client.query(
+    `SELECT
+       TRIM(COALESCE(sucursal_nombre, '')) AS sucursal,
+       TRIM(COALESCE(zona_nombre, '')) AS zona,
+       TRIM(COALESCE(direccion_texto, '')) AS direccion,
+       updated_at
+     FROM salidas_cliente_sucursales
+     WHERE cliente_key = $1
+       AND TRIM(COALESCE(sucursal_nombre, '')) <> ''
+     ORDER BY updated_at DESC`,
+    [clienteKey]
+  );
+
+  const facturaRows = await client.query(
+    `SELECT
+       TRIM(COALESCE(sucursal_nombre, '')) AS sucursal,
+       TRIM(COALESCE(zona_nombre, '')) AS zona,
+       TRIM(COALESCE(direccion_texto, '')) AS direccion,
+       MAX(created_at) AS updated_at
+     FROM salidas_facturas
+     WHERE LOWER(TRIM(COALESCE(cliente_nombre, ''))) = $1
+       AND TRIM(COALESCE(sucursal_nombre, '')) <> ''
+     GROUP BY
+       TRIM(COALESCE(sucursal_nombre, '')),
+       TRIM(COALESCE(zona_nombre, '')),
+       TRIM(COALESCE(direccion_texto, ''))
+     ORDER BY MAX(created_at) DESC`,
+    [clienteKey]
+  );
+
+  const dedupe = new Map();
+  [...tableRows.rows, ...facturaRows.rows].forEach((row) => {
+    const sucursal = normalizeSalidasText(row?.sucursal, 160);
+    if (!sucursal) return;
+    const key = normalizeSalidasLookupKey(sucursal, 160);
+    if (!key || dedupe.has(key)) return;
+    dedupe.set(key, {
+      sucursal,
+      sucursal_key: key,
+      zona: normalizeSalidasText(row?.zona, 120),
+      direccion: normalizeSalidasText(row?.direccion, 240),
+    });
+  });
+
+  return Array.from(dedupe.values());
+}
+
+async function resolveClienteSucursalAutofill(client, clienteRaw, sucursalRaw) {
+  const sucursal = normalizeSalidasText(sucursalRaw, 160);
+  const sucursalKey = normalizeSalidasLookupKey(sucursalRaw, 160);
+  if (!sucursal || !sucursalKey) return null;
+
+  const rows = await listSucursalMetaByCliente(client, clienteRaw);
+  const exact = rows.find((row) => row.sucursal_key === sucursalKey);
+  if (exact && (exact.zona || exact.direccion)) {
+    return { sucursal: exact.sucursal, zona: exact.zona, direccion: exact.direccion, match_type: 'exact' };
+  }
+
+  const prefix = rows.find((row) => row.sucursal_key.startsWith(sucursalKey));
+  if (prefix && (prefix.zona || prefix.direccion)) {
+    return { sucursal: prefix.sucursal, zona: prefix.zona, direccion: prefix.direccion, match_type: 'prefix' };
+  }
+
+  const contains = rows.find((row) => row.sucursal_key.includes(sucursalKey));
+  if (contains && (contains.zona || contains.direccion)) {
+    return { sucursal: contains.sucursal, zona: contains.zona, direccion: contains.direccion, match_type: 'contains' };
+  }
+
+  const direcciones = await listDireccionesByCliente(client, clienteRaw);
+  if (direcciones.length === 1) {
+    return { sucursal, zona: '', direccion: direcciones[0], match_type: 'single_direccion' };
+  }
+  return null;
+}
+
+async function upsertClienteSucursalMeta(client, payload) {
+  const clienteNombre = normalizeSalidasText(payload?.cliente_nombre, 160);
+  const sucursalNombre = normalizeSalidasText(payload?.sucursal_nombre, 160);
+  if (!clienteNombre || !sucursalNombre) return;
+
+  const clienteKey = normalizeSalidasLookupKey(clienteNombre, 160);
+  const sucursalKey = normalizeSalidasLookupKey(sucursalNombre, 160);
+  const zonaNombre = normalizeSalidasText(payload?.zona_nombre, 120);
+  const direccionTexto = normalizeSalidasText(payload?.direccion_texto, 240);
+  const clienteId = Number(payload?.cliente_id) > 0 ? Number(payload.cliente_id) : null;
+  const direccionId = Number(payload?.direccion_id) > 0 ? Number(payload.direccion_id) : null;
+
+  await client.query(
+    `INSERT INTO salidas_cliente_sucursales (
+       cliente_id,
+       cliente_nombre,
+       cliente_key,
+       sucursal_nombre,
+       sucursal_key,
+       zona_nombre,
+       direccion_id,
+       direccion_texto,
+       updated_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+     ON CONFLICT (cliente_key, sucursal_key)
+     DO UPDATE SET
+       cliente_id = COALESCE(EXCLUDED.cliente_id, salidas_cliente_sucursales.cliente_id),
+       cliente_nombre = EXCLUDED.cliente_nombre,
+       sucursal_nombre = EXCLUDED.sucursal_nombre,
+       zona_nombre = EXCLUDED.zona_nombre,
+       direccion_id = COALESCE(EXCLUDED.direccion_id, salidas_cliente_sucursales.direccion_id),
+       direccion_texto = EXCLUDED.direccion_texto,
+       updated_at = NOW()`,
+    [clienteId, clienteNombre, clienteKey, sucursalNombre, sucursalKey, zonaNombre || null, direccionId, direccionTexto || null]
+  );
 }
 
 async function ensurePerformanceIndexes() {
@@ -1326,6 +1505,26 @@ app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
       params
     );
     return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  if (!auth) return;
+
+  const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
+  const sucursalRaw = normalizeSalidasText(req.query?.sucursal, 160);
+  if (clienteRaw.length < 2) {
+    return res.json({ ok: true, cliente: clienteRaw, direcciones: [], sucursales: [], autofill: null });
+  }
+
+  try {
+    const direcciones = await listDireccionesByCliente(pool, clienteRaw);
+    const sucursales = await listSucursalMetaByCliente(pool, clienteRaw);
+    const autofill = sucursalRaw ? await resolveClienteSucursalAutofill(pool, clienteRaw, sucursalRaw) : null;
+    return res.json({ ok: true, cliente: clienteRaw, direcciones, sucursales, autofill });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
@@ -3375,9 +3574,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 160);
   const vendedorRaw = normalizeSalidasText(req.body?.vendedor, 160);
-  const zonaRaw = normalizeSalidasText(req.body?.zona, 120);
+  const zonaInputRaw = normalizeSalidasText(req.body?.zona, 120);
   const sucursalRaw = normalizeSalidasText(req.body?.sucursal, 160);
-  const direccionRaw = normalizeSalidasText(req.body?.direccion, 240);
+  const direccionInputRaw = normalizeSalidasText(req.body?.direccion, 240);
 
   const numeroFacturaDigits = String(numeroFacturaRaw).replace(/\D+/g, '').slice(0, 4);
   const numeroFactura = numeroFacturaDigits ? numeroFacturaDigits.padStart(4, '0') : '';
@@ -3395,8 +3594,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   if (!detalleRaw.length) {
     return res.status(400).json({ ok: false, error: 'detalle es obligatorio' });
   }
-  if (!clienteRaw || !vendedorRaw || !zonaRaw || !sucursalRaw || !direccionRaw || !fechaEmision) {
-    return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera' });
+  if (!clienteRaw || !vendedorRaw || !sucursalRaw || !fechaEmision) {
+    return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera (cliente, vendedor, sucursal y fecha)' });
   }
 
   const detalle = detalleRaw
@@ -3512,6 +3711,23 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       }
     }
 
+    let zonaRaw = zonaInputRaw;
+    let direccionRaw = direccionInputRaw;
+    if (!zonaRaw || !direccionRaw) {
+      const autofill = await resolveClienteSucursalAutofill(client, clienteRaw, sucursalRaw);
+      if (autofill) {
+        if (!zonaRaw && autofill.zona) zonaRaw = normalizeSalidasText(autofill.zona, 120);
+        if (!direccionRaw && autofill.direccion) direccionRaw = normalizeSalidasText(autofill.direccion, 240);
+      }
+    }
+    if (!zonaRaw || !direccionRaw) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'No se pudo completar zona/direccion automaticamente para esa sucursal. Ingresa ambos campos manualmente para guardar y crear la relacion.'
+      });
+    }
+
     const cliente = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
     const vendedor = await upsertSalidasCatalogValue(client, 'vendedor', vendedorRaw);
     const zona = await upsertSalidasCatalogValue(client, 'zona', zonaRaw);
@@ -3579,6 +3795,15 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
         ]
       );
     }
+
+    await upsertClienteSucursalMeta(client, {
+      cliente_id: cliente.id,
+      cliente_nombre: cliente.value || clienteRaw,
+      sucursal_nombre: sucursal.value || sucursalRaw,
+      zona_nombre: zona.value || zonaRaw,
+      direccion_id: direccion.id,
+      direccion_texto: direccion.value || direccionRaw,
+    });
 
     await client.query('COMMIT');
     return res.status(201).json({
