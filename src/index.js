@@ -933,10 +933,37 @@ async function ensureSalidas09Tables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS almacen09_vendedores (
       id_vendedor BIGSERIAL PRIMARY KEY,
-      nombre VARCHAR(160) NOT NULL UNIQUE,
+      codigo_ven VARCHAR(10),
+      tipo VARCHAR(10),
+      descripcion VARCHAR(200) NOT NULL,
+      cedula VARCHAR(40),
+      direc1 VARCHAR(240),
+      direc2 VARCHAR(240),
+      telefonos VARCHAR(120),
+      fecha_creacion TIMESTAMP,
+      estado BOOLEAN,
+      codigo_zona VARCHAR(20),
+      nombre VARCHAR(200),
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS codigo_ven VARCHAR(10)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS tipo VARCHAR(10)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS descripcion VARCHAR(200)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS cedula VARCHAR(40)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS direc1 VARCHAR(240)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS direc2 VARCHAR(240)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS telefonos VARCHAR(120)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMP`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS estado BOOLEAN`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS codigo_zona VARCHAR(20)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS nombre VARCHAR(200)`);
+  await pool.query(`ALTER TABLE almacen09_vendedores DROP CONSTRAINT IF EXISTS almacen09_vendedores_nombre_key`).catch(() => {});
+  await pool.query(`UPDATE almacen09_vendedores SET descripcion = COALESCE(NULLIF(TRIM(descripcion), ''), NULLIF(TRIM(nombre), '')) WHERE COALESCE(TRIM(descripcion), '') = ''`).catch(() => {});
+  await pool.query(`UPDATE almacen09_vendedores SET nombre = COALESCE(NULLIF(TRIM(nombre), ''), NULLIF(TRIM(descripcion), '')) WHERE COALESCE(TRIM(nombre), '') = ''`).catch(() => {});
+  await pool.query(`ALTER TABLE almacen09_vendedores ALTER COLUMN descripcion SET NOT NULL`).catch(() => {});
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_almacen09_vendedores_codigo ON almacen09_vendedores(codigo_ven)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_almacen09_vendedores_descripcion ON almacen09_vendedores(LOWER(TRIM(descripcion)))`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS almacen09_zonas (
@@ -1175,7 +1202,7 @@ function normalizeSalidasText(value, maxLength) {
 
 const SALIDAS_CATALOGS = {
   cliente: { table: 'almacen09_clientes', idColumn: 'id_cliente', valueColumn: 'nombre', maxLength: 160 },
-  vendedor: { table: 'almacen09_vendedores', idColumn: 'id_vendedor', valueColumn: 'nombre', maxLength: 160 },
+  vendedor: { table: 'almacen09_vendedores', idColumn: 'id_vendedor', valueColumn: 'descripcion', maxLength: 200 },
   zona: { table: 'almacen09_zonas', idColumn: 'id_zona', valueColumn: 'nombre', maxLength: 120 },
   sucursal: { table: 'almacen09_sucursales', idColumn: 'id_sucursal', valueColumn: 'nombre', maxLength: 160 },
   direccion: { table: 'almacen09_direcciones', idColumn: 'id_direccion', valueColumn: 'direccion', maxLength: 240 },
@@ -1190,6 +1217,32 @@ async function upsertSalidasCatalogValue(client, catalogKey, rawValue) {
   const cleanValue = normalizeSalidasText(rawValue, config.maxLength);
   if (!cleanValue) {
     return { id: null, value: '' };
+  }
+
+  if (catalogKey === 'vendedor') {
+    const existing = await client.query(
+      `SELECT id_vendedor AS id_value, descripcion AS value_text
+       FROM almacen09_vendedores
+       WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
+       LIMIT 1`,
+      [cleanValue]
+    );
+    if (existing.rowCount) {
+      return {
+        id: Number(existing.rows[0].id_value) || null,
+        value: String(existing.rows[0].value_text || cleanValue).trim(),
+      };
+    }
+    const inserted = await client.query(
+      `INSERT INTO almacen09_vendedores (descripcion, nombre, estado)
+       VALUES ($1, $1, TRUE)
+       RETURNING id_vendedor AS id_value, descripcion AS value_text`,
+      [cleanValue]
+    );
+    return {
+      id: Number(inserted.rows[0]?.id_value) || null,
+      value: String(inserted.rows[0]?.value_text || cleanValue).trim(),
+    };
   }
 
   const result = await client.query(
@@ -1548,6 +1601,38 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
     const sucursales = await listSucursalMetaByCliente(pool, clienteRaw);
     const autofill = sucursalRaw ? await resolveClienteSucursalAutofill(pool, clienteRaw, sucursalRaw) : null;
     return res.json({ ok: true, cliente: clienteRaw, direcciones, sucursales, autofill });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/almacen09/vendedores', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  if (!auth) return;
+
+  const rawQuery = normalizeSalidasText(req.query?.q, 200);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 40), 1), 100);
+  try {
+    const params = [];
+    const whereParts = [`TRIM(COALESCE(descripcion, '')) <> ''`];
+    if (rawQuery) {
+      params.push(`%${rawQuery}%`);
+      whereParts.push(`descripcion ILIKE $${params.length}`);
+    }
+    params.push(limit);
+
+    const result = await pool.query(
+      `SELECT
+         id_vendedor,
+         TRIM(COALESCE(codigo_ven, '')) AS codigo_ven,
+         TRIM(COALESCE(descripcion, '')) AS descripcion
+       FROM almacen09_vendedores
+       WHERE ${whereParts.join(' AND ')}
+       ORDER BY descripcion ASC
+       LIMIT $${params.length}`,
+      params
+    );
+    return res.json({ ok: true, rows: result.rows });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
