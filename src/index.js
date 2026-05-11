@@ -1314,6 +1314,29 @@ async function resolveClienteSucursalAutofill(client, clienteRaw, sucursalRaw) {
   return null;
 }
 
+async function getExactClienteSucursalMeta(client, clienteRaw, sucursalRaw) {
+  const clienteKey = normalizeSalidasLookupKey(clienteRaw, 160);
+  const sucursalKey = normalizeSalidasLookupKey(sucursalRaw, 160);
+  if (!clienteKey || !sucursalKey) return null;
+  const result = await client.query(
+    `SELECT
+       TRIM(COALESCE(sucursal_nombre, '')) AS sucursal,
+       TRIM(COALESCE(zona_nombre, '')) AS zona,
+       TRIM(COALESCE(direccion_texto, '')) AS direccion
+     FROM salidas_cliente_sucursales
+     WHERE cliente_key = $1
+       AND sucursal_key = $2
+     LIMIT 1`,
+    [clienteKey, sucursalKey]
+  );
+  if (!result.rowCount) return null;
+  return {
+    sucursal: normalizeSalidasText(result.rows[0]?.sucursal, 160),
+    zona: normalizeSalidasText(result.rows[0]?.zona, 120),
+    direccion: normalizeSalidasText(result.rows[0]?.direccion, 240),
+  };
+}
+
 async function upsertClienteSucursalMeta(client, payload) {
   const clienteNombre = normalizeSalidasText(payload?.cliente_nombre, 160);
   const sucursalNombre = normalizeSalidasText(payload?.sucursal_nombre, 160);
@@ -3713,6 +3736,18 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 
     let zonaRaw = zonaInputRaw;
     let direccionRaw = direccionInputRaw;
+    const exactMeta = await getExactClienteSucursalMeta(client, clienteRaw, sucursalRaw);
+    if (exactMeta && (exactMeta.zona || exactMeta.direccion)) {
+      if ((zonaRaw && exactMeta.zona && zonaRaw !== exactMeta.zona) || (direccionRaw && exactMeta.direccion && direccionRaw !== exactMeta.direccion)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          ok: false,
+          error: 'La sucursal ya tiene zona/direccion fijas para este cliente. Actualiza esos datos solo en base de datos.'
+        });
+      }
+      if (exactMeta.zona) zonaRaw = exactMeta.zona;
+      if (exactMeta.direccion) direccionRaw = exactMeta.direccion;
+    }
     if (!zonaRaw || !direccionRaw) {
       const autofill = await resolveClienteSucursalAutofill(client, clienteRaw, sucursalRaw);
       if (autofill) {
