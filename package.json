@@ -8,6 +8,7 @@
     "dev": "nodemon src/index.js",
     "import:historicos": "node scripts/import-historicos.js",
     "import:clientes": "node scripts/import-clientes.js",
+    "import:public-clientes": "node scripts/import-public-clientes.js",
     "import:zonas": "node scripts/import-zonas.js",
     "import:vendedores": "node scripts/import-vendedores.js"
   },

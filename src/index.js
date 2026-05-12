@@ -1001,6 +1001,8 @@ async function ensureSalidas09Tables() {
       vendedor_nombre VARCHAR(160),
       zona_id BIGINT REFERENCES almacen09_zonas(id_zona) ON DELETE SET NULL,
       zona_nombre VARCHAR(120),
+      ruta_nombre VARCHAR(120),
+      transporte_nombre VARCHAR(120),
       sucursal_id BIGINT REFERENCES almacen09_sucursales(id_sucursal) ON DELETE SET NULL,
       sucursal_nombre VARCHAR(160),
       direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
@@ -1033,6 +1035,8 @@ async function ensureSalidas09Tables() {
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_nombre VARCHAR(160)');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS zona_id BIGINT REFERENCES almacen09_zonas(id_zona) ON DELETE SET NULL');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS zona_nombre VARCHAR(120)');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS ruta_nombre VARCHAR(120)');
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS transporte_nombre VARCHAR(120)');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS sucursal_id BIGINT REFERENCES almacen09_sucursales(id_sucursal) ON DELETE SET NULL');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS sucursal_nombre VARCHAR(160)');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL');
@@ -1287,6 +1291,98 @@ async function listDireccionesByCliente(client, clienteRaw) {
     .filter(Boolean);
 }
 
+function normalizeClienteZonaRow(row) {
+  return {
+    zona: normalizeSalidasText(row?.zona, 120),
+    ruta: normalizeSalidasText(row?.ruta, 120),
+    total: Number(row?.total || 0),
+  };
+}
+
+function normalizeClienteDireccionMeta(row) {
+  return {
+    direccion: normalizeSalidasText(row?.direccion, 240),
+    zona: normalizeSalidasText(row?.zona, 120),
+    ruta: normalizeSalidasText(row?.ruta, 120),
+    transporte: normalizeSalidasText(row?.transporte, 120),
+  };
+}
+
+async function listZonasByCliente(client, clienteRaw) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  if (!cliente) return [];
+  const result = await client.query(
+    `SELECT
+       TRIM(COALESCE(zona, '')) AS zona,
+       TRIM(COALESCE(ruta, '')) AS ruta,
+       COUNT(*)::int AS total
+     FROM public.clientes
+     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
+       AND TRIM(COALESCE(zona, '')) <> ''
+     GROUP BY TRIM(COALESCE(zona, '')), TRIM(COALESCE(ruta, ''))
+     ORDER BY TRIM(COALESCE(zona, '')) ASC`,
+    [cliente]
+  );
+  const dedupe = new Map();
+  result.rows.map(normalizeClienteZonaRow).forEach((row) => {
+    if (!row.zona) return;
+    const key = normalizeSalidasLookupKey(row.zona, 120);
+    const current = dedupe.get(key);
+    if (!current || row.total > current.total) {
+      dedupe.set(key, row);
+    }
+  });
+  return Array.from(dedupe.values()).sort((a, b) => a.zona.localeCompare(b.zona, 'es', { sensitivity: 'base' }));
+}
+
+async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  const zona = normalizeSalidasText(zonaRaw, 120);
+  if (!cliente || !zona) return [];
+  const result = await client.query(
+    `SELECT
+       TRIM(COALESCE(direccion, '')) AS direccion,
+       TRIM(COALESCE(zona, '')) AS zona,
+       TRIM(COALESCE(ruta, '')) AS ruta,
+       TRIM(COALESCE(transporte, '')) AS transporte
+     FROM public.clientes
+     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
+       AND LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))
+       AND TRIM(COALESCE(direccion, '')) <> ''
+     GROUP BY
+       TRIM(COALESCE(direccion, '')),
+       TRIM(COALESCE(zona, '')),
+       TRIM(COALESCE(ruta, '')),
+       TRIM(COALESCE(transporte, ''))
+     ORDER BY TRIM(COALESCE(direccion, '')) ASC`,
+    [cliente, zona]
+  );
+  return result.rows.map(normalizeClienteDireccionMeta).filter((row) => row.direccion);
+}
+
+async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direccionRaw) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  const zona = normalizeSalidasText(zonaRaw, 120);
+  const direccion = normalizeSalidasText(direccionRaw, 240);
+  if (!cliente || !zona || !direccion) return null;
+  const result = await client.query(
+    `SELECT
+       TRIM(COALESCE(direccion, '')) AS direccion,
+       TRIM(COALESCE(zona, '')) AS zona,
+       TRIM(COALESCE(ruta, '')) AS ruta,
+       TRIM(COALESCE(transporte, '')) AS transporte
+     FROM public.clientes
+     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
+       AND LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))
+       AND LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($3))
+     ORDER BY TRIM(COALESCE(direccion, '')) ASC
+     LIMIT 1`,
+    [cliente, zona, direccion]
+  );
+  if (!result.rowCount) return null;
+  return normalizeClienteDireccionMeta(result.rows[0]);
+}
+
 async function listSucursalMetaByCliente(client, clienteRaw) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   const clienteKey = normalizeSalidasLookupKey(clienteRaw, 160);
@@ -1438,6 +1534,8 @@ async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_lote_upper ON empaquetados_detalle(UPPER(TRIM(numero_lote)))');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_zona ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(zona)))').catch(() => {});
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_direccion ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(direccion)))').catch(() => {});
 }
 
 async function dropLegacyUnusedTables() {
@@ -1564,16 +1662,24 @@ app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
       `SELECT
          nombre,
          COALESCE(
-           JSON_AGG(direccion ORDER BY direccion) FILTER (WHERE direccion <> ''),
+           JSON_AGG(DISTINCT direccion ORDER BY direccion) FILTER (WHERE direccion <> ''),
            '[]'::json
-         ) AS direcciones
+         ) AS direcciones,
+         COALESCE(
+           JSON_AGG(DISTINCT zona ORDER BY zona) FILTER (WHERE zona <> ''),
+           '[]'::json
+         ) AS zonas
        FROM (
          SELECT
            TRIM(descripcion) AS nombre,
-           TRIM(COALESCE(direccion, '')) AS direccion
+           TRIM(COALESCE(direccion, '')) AS direccion,
+           TRIM(COALESCE(zona, '')) AS zona
          FROM public.clientes
          WHERE ${whereParts.join(' AND ')}
-         GROUP BY TRIM(descripcion), TRIM(COALESCE(direccion, ''))
+         GROUP BY
+           TRIM(descripcion),
+           TRIM(COALESCE(direccion, '')),
+           TRIM(COALESCE(zona, ''))
        ) base
        GROUP BY nombre
        ORDER BY nombre ASC
@@ -1591,16 +1697,27 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
-  const sucursalRaw = normalizeSalidasText(req.query?.sucursal, 160);
+  const zonaRaw = normalizeSalidasText(req.query?.zona, 120);
+  const direccionRaw = normalizeSalidasText(req.query?.direccion, 240);
   if (clienteRaw.length < 2) {
-    return res.json({ ok: true, cliente: clienteRaw, direcciones: [], sucursales: [], autofill: null });
+    return res.json({ ok: true, cliente: clienteRaw, zonas: [], direcciones: [], direcciones_meta: [], sucursales: [], autofill: null });
   }
 
   try {
-    const direcciones = await listDireccionesByCliente(pool, clienteRaw);
-    const sucursales = await listSucursalMetaByCliente(pool, clienteRaw);
-    const autofill = sucursalRaw ? await resolveClienteSucursalAutofill(pool, clienteRaw, sucursalRaw) : null;
-    return res.json({ ok: true, cliente: clienteRaw, direcciones, sucursales, autofill });
+    const zonas = await listZonasByCliente(pool, clienteRaw);
+    const direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw) : [];
+    const autofill = direccionRaw
+      ? await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw)
+      : null;
+    return res.json({
+      ok: true,
+      cliente: clienteRaw,
+      zonas,
+      direcciones: direccionesMeta.map((row) => row.direccion).filter(Boolean),
+      direcciones_meta: direccionesMeta,
+      sucursales: [],
+      autofill,
+    });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
@@ -3683,8 +3800,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 160);
   const vendedorRaw = normalizeSalidasText(req.body?.vendedor, 160);
   const zonaInputRaw = normalizeSalidasText(req.body?.zona, 120);
-  const sucursalRaw = normalizeSalidasText(req.body?.sucursal, 160);
   const direccionInputRaw = normalizeSalidasText(req.body?.direccion, 240);
+  const rutaInputRaw = normalizeSalidasText(req.body?.ruta, 120);
+  const transporteInputRaw = normalizeSalidasText(req.body?.transporte, 120);
 
   const numeroFacturaDigits = String(numeroFacturaRaw).replace(/\D+/g, '').slice(0, 4);
   const numeroFactura = numeroFacturaDigits ? numeroFacturaDigits.padStart(4, '0') : '';
@@ -3702,8 +3820,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   if (!detalleRaw.length) {
     return res.status(400).json({ ok: false, error: 'detalle es obligatorio' });
   }
-  if (!clienteRaw || !vendedorRaw || !sucursalRaw || !fechaEmision) {
-    return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera (cliente, vendedor, sucursal y fecha)' });
+  if (!clienteRaw || !vendedorRaw || !zonaInputRaw || !direccionInputRaw || !fechaEmision) {
+    return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera (cliente, vendedor, zona, direccion y fecha)' });
   }
 
   const detalle = detalleRaw
@@ -3819,39 +3937,30 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       }
     }
 
-    let zonaRaw = zonaInputRaw;
-    let direccionRaw = direccionInputRaw;
-    const exactMeta = await getExactClienteSucursalMeta(client, clienteRaw, sucursalRaw);
-    if (exactMeta && (exactMeta.zona || exactMeta.direccion)) {
-      if ((zonaRaw && exactMeta.zona && zonaRaw !== exactMeta.zona) || (direccionRaw && exactMeta.direccion && direccionRaw !== exactMeta.direccion)) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          ok: false,
-          error: 'La sucursal ya tiene zona/direccion fijas para este cliente. Actualiza esos datos solo en base de datos.'
-        });
-      }
-      if (exactMeta.zona) zonaRaw = exactMeta.zona;
-      if (exactMeta.direccion) direccionRaw = exactMeta.direccion;
-    }
-    if (!zonaRaw || !direccionRaw) {
-      const autofill = await resolveClienteSucursalAutofill(client, clienteRaw, sucursalRaw);
-      if (autofill) {
-        if (!zonaRaw && autofill.zona) zonaRaw = normalizeSalidasText(autofill.zona, 120);
-        if (!direccionRaw && autofill.direccion) direccionRaw = normalizeSalidasText(autofill.direccion, 240);
-      }
-    }
-    if (!zonaRaw || !direccionRaw) {
+    const direccionMeta = await getExactClienteDireccionMeta(client, clienteRaw, zonaInputRaw, direccionInputRaw);
+    if (!direccionMeta || !direccionMeta.zona || !direccionMeta.direccion) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         ok: false,
-        error: 'No se pudo completar zona/direccion automaticamente para esa sucursal. Ingresa ambos campos manualmente para guardar y crear la relacion.'
+        error: 'Selecciona una zona y direccion validas para el cliente desde el catalogo.'
+      });
+    }
+
+    const zonaRaw = direccionMeta.zona;
+    const direccionRaw = direccionMeta.direccion;
+    const rutaRaw = direccionMeta.ruta;
+    const transporteRaw = direccionMeta.transporte;
+    if ((rutaInputRaw && rutaRaw && rutaInputRaw !== rutaRaw) || (transporteInputRaw && transporteRaw && transporteInputRaw !== transporteRaw)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        ok: false,
+        error: 'Ruta o transporte no coinciden con la direccion seleccionada.'
       });
     }
 
     const cliente = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
     const vendedor = await upsertSalidasCatalogValue(client, 'vendedor', vendedorRaw);
     const zona = await upsertSalidasCatalogValue(client, 'zona', zonaRaw);
-    const sucursal = await upsertSalidasCatalogValue(client, 'sucursal', sucursalRaw);
     const direccion = await upsertSalidasCatalogValue(client, 'direccion', direccionRaw);
 
     const facturaInsert = await client.query(
@@ -3865,13 +3974,15 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
          vendedor_nombre,
          zona_id,
          zona_nombre,
+         ruta_nombre,
+         transporte_nombre,
          sucursal_id,
          sucursal_nombre,
          direccion_id,
          direccion_texto,
          estado
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'emitida')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, NULL, $12, $13, 'emitida')
        RETURNING id_factura, numero_control, numero_factura, fecha_emision`,
       [
         numeroControl,
@@ -3883,8 +3994,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
         vendedor.value,
         zona.id,
         zona.value,
-        sucursal.id,
-        sucursal.value,
+        rutaRaw || null,
+        transporteRaw || null,
         direccion.id,
         direccion.value,
       ]
@@ -3916,15 +4027,6 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       );
     }
 
-    await upsertClienteSucursalMeta(client, {
-      cliente_id: cliente.id,
-      cliente_nombre: cliente.value || clienteRaw,
-      sucursal_nombre: sucursal.value || sucursalRaw,
-      zona_nombre: zona.value || zonaRaw,
-      direccion_id: direccion.id,
-      direccion_texto: direccion.value || direccionRaw,
-    });
-
     await client.query('COMMIT');
     return res.status(201).json({
       ok: true,
@@ -3937,7 +4039,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
         cliente: cliente.value,
         vendedor: vendedor.value,
         zona: zona.value,
-        sucursal: sucursal.value,
+        ruta: rutaRaw,
+        transporte: transporteRaw,
+        sucursal: null,
         direccion: direccion.value,
       },
     });
@@ -3981,6 +4085,8 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sf.vendedor_nombre,
          sf.zona_id,
          sf.zona_nombre,
+         sf.ruta_nombre,
+         sf.transporte_nombre,
          sf.sucursal_id,
          sf.sucursal_nombre,
          sf.direccion_id,

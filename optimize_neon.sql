@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS salidas_facturas (
   vendedor_nombre VARCHAR(160),
   zona_id BIGINT REFERENCES almacen09_zonas(id_zona) ON DELETE SET NULL,
   zona_nombre VARCHAR(120),
+  ruta_nombre VARCHAR(120),
+  transporte_nombre VARCHAR(120),
   sucursal_id BIGINT REFERENCES almacen09_sucursales(id_sucursal) ON DELETE SET NULL,
   sucursal_nombre VARCHAR(160),
   direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
