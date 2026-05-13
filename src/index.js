@@ -842,6 +842,15 @@ async function ensureProductosSoftDelete() {
     ALTER TABLE productos
     ADD COLUMN IF NOT EXISTS activo BOOLEAN NOT NULL DEFAULT TRUE
   `);
+  await pool.query(`
+    ALTER TABLE productos
+    ADD COLUMN IF NOT EXISTS codigo_barras TEXT
+  `);
+  await pool.query(`
+    UPDATE productos
+       SET codigo_barras = CONCAT('PDT', LPAD(id_producto::text, 6, '0'))
+     WHERE TRIM(COALESCE(codigo_barras, '')) = ''
+  `).catch(() => {});
 }
 
 async function ensureHistoricoResultadosTable() {
@@ -890,7 +899,8 @@ async function ensureControlInventarioTable() {
       numero_lote VARCHAR(80) NOT NULL DEFAULT '',
       fecha_conteo DATE,
       fecha_elaboracion DATE NOT NULL,
-      almacen VARCHAR(20) NOT NULL
+      almacen VARCHAR(20) NOT NULL,
+      cestas INT NOT NULL DEFAULT 0
     )
   `);
 
@@ -907,6 +917,11 @@ async function ensureControlInventarioTable() {
   await pool.query(`
     ALTER TABLE control_inventario_guardia
     ADD COLUMN IF NOT EXISTS numero_lote VARCHAR(80) NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE control_inventario_guardia
+    ADD COLUMN IF NOT EXISTS cestas INT NOT NULL DEFAULT 0
   `);
 
   await pool.query(`
@@ -1531,6 +1546,12 @@ async function upsertClienteSucursalMeta(client, payload) {
 async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_activo_codigo ON productos(activo, codigo_producto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_codigo_upper ON productos(UPPER(TRIM(codigo_producto)))');
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_barras_unique
+    ON productos (UPPER(TRIM(codigo_barras)))
+    WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_productos_codigo_barras_lookup
+    ON productos (codigo_barras)
+    WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_cabecera_fecha_hora ON empaquetados_cabecera(fecha_hora DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_cabecera_numero_registro ON empaquetados_cabecera(numero_registro)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_cabecera ON empaquetados_detalle(id_cabecera)');
@@ -2088,6 +2109,7 @@ app.get('/productos', async (req, res) => {
       SELECT
         id_producto,
         codigo_producto,
+        codigo_barras,
         descripcion AS nombre_producto,
         descripcion,
         unidad_primaria,
@@ -2128,6 +2150,51 @@ app.get('/productos', async (req, res) => {
   }
 });
 
+app.get('/api/control-inventario/producto-barcode', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  if (!auth) return;
+
+  const codigo = String(req.query?.codigo || req.query?.barcode || '').trim();
+  if (!codigo) {
+    return res.status(400).json({ ok: false, error: 'codigo es obligatorio' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         id_producto,
+         codigo_producto,
+         descripcion,
+         codigo_barras
+       FROM productos
+       WHERE COALESCE(activo, TRUE) = TRUE
+         AND (
+           UPPER(TRIM(COALESCE(codigo_barras, ''))) = UPPER(TRIM($1))
+           OR UPPER(TRIM(COALESCE(codigo_producto, ''))) = UPPER(TRIM($1))
+         )
+       ORDER BY
+         CASE
+           WHEN UPPER(TRIM(COALESCE(codigo_barras, ''))) = UPPER(TRIM($1)) THEN 0
+           ELSE 1
+         END,
+         codigo_producto ASC
+       LIMIT 2`,
+      [codigo]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, error: 'Producto no encontrado para el codigo escaneado' });
+    }
+    if (result.rows.length > 1) {
+      return res.status(409).json({ ok: false, error: 'El codigo escaneado coincide con mas de un producto' });
+    }
+
+    return res.json({ ok: true, producto: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.post('/productos', async (req, res) => {
   const { codigo, descripcion, unidad, paquetes, sobre_piso } = req.body;
   if (!(await hasAdminAccess(req))) {
@@ -2153,10 +2220,17 @@ app.post('/productos', async (req, res) => {
         String(descripcion).trim().toUpperCase(),
         String(unidad || 'PAQ').trim().toUpperCase(),
         Number.isFinite(Number(paquetes)) ? Number(paquetes) : 0,
-        Number.isFinite(Number(sobre_piso)) ? Number(sobre_piso) : 0,
+         Number.isFinite(Number(sobre_piso)) ? Number(sobre_piso) : 0,
       ]
     );
-    res.status(201).json({ ok: true, product: result.rows[0] });
+    const barcodeResult = await pool.query(
+      `UPDATE productos
+          SET codigo_barras = COALESCE(NULLIF(TRIM(codigo_barras), ''), CONCAT('PDT', LPAD(id_producto::text, 6, '0')))
+        WHERE id_producto = $1
+        RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
+      [result.rows[0].id_producto]
+    );
+    res.status(201).json({ ok: true, product: barcodeResult.rows[0] || result.rows[0] });
   } catch (error) {
     if (error.code === '23505') {
       return res.status(409).json({ ok: false, error: 'Código de producto ya existe' });
@@ -2429,9 +2503,14 @@ app.post('/api/control-inventario', async (req, res) => {
   const cleanTurno = String(cabecera.turno_actual || '').trim();
   const cleanMomento = String(cabecera.momento_conteo || '').trim();
   const cleanAlmacen = String(cabecera.almacen || '').trim();
+  const rawCestas = cabecera.cestas ?? cabecera.cantidad_cestas;
+  const cleanCestas = Number(rawCestas);
 
   if (!cleanResponsable || !cleanTurno || !cleanMomento || !cleanAlmacen) {
     return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios en cabecera' });
+  }
+  if (rawCestas === undefined || rawCestas === null || String(rawCestas).trim() === '' || !Number.isInteger(cleanCestas) || cleanCestas < 0) {
+    return res.status(400).json({ ok: false, error: 'cestas debe ser un numero entero valido' });
   }
 
   const detalle = hasDetalle
@@ -2500,13 +2579,14 @@ app.post('/api/control-inventario', async (req, res) => {
            momento_conteo,
            id_producto,
            cantidad_fisica_contada,
-           numero_lote,
-           fecha_conteo,
-           fecha_elaboracion,
-           almacen
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         RETURNING id_control, created_at, id_producto, cantidad_fisica_contada, numero_lote, fecha_conteo, fecha_elaboracion, responsable`,
+            numero_lote,
+            fecha_conteo,
+            fecha_elaboracion,
+            almacen,
+            cestas
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          RETURNING id_control, created_at, id_producto, cantidad_fisica_contada, numero_lote, fecha_conteo, fecha_elaboracion, cestas, responsable`,
         [
           cleanResponsable,
           cleanResponsable,
@@ -2518,6 +2598,7 @@ app.post('/api/control-inventario', async (req, res) => {
           item.fecha_conteo,
           item.fecha_elaboracion,
           cleanAlmacen,
+          cleanCestas,
         ]
       );
       insertedRows.push(inserted.rows[0]);
@@ -2792,7 +2873,8 @@ app.get('/api/registros', async (req, res) => {
           COALESCE(NULLIF(TRIM(cg.responsable), ''), NULLIF(TRIM(cg.almacenista), ''), '') AS "Almacenista",
           cg.turno_actual AS "Turno",
           cg.momento_conteo AS "Momento",
-          cg.almacen AS "Almacen"
+          cg.almacen AS "Almacen",
+          cg.cestas AS "Cestas"
          FROM control_inventario_guardia cg
          JOIN productos p ON p.id_producto = cg.id_producto
          ${whereClause}
@@ -2806,7 +2888,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha', 'FECHA DE ELABORACION', 'Codigo', 'Producto', 'Lote', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen'];
+        : ['Fecha', 'FECHA DE ELABORACION', 'Codigo', 'Producto', 'Lote', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen', 'Cestas'];
       return res.json({
         ok: true,
         sheet: 'Control de Inventario',
