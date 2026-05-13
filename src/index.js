@@ -2869,7 +2869,6 @@ app.get('/api/registros', async (req, res) => {
           TO_CHAR(cg.fecha_elaboracion, 'DD/MM/YYYY') AS "FECHA DE ELABORACION",
           p.codigo_producto AS "Codigo",
           p.descripcion AS "Producto",
-          NULLIF(TRIM(cg.numero_lote), '') AS "Lote",
           cg.cantidad_fisica_contada AS "Cantidad contada",
           COALESCE(NULLIF(TRIM(cg.responsable), ''), NULLIF(TRIM(cg.almacenista), ''), '') AS "Almacenista",
           cg.turno_actual AS "Turno",
@@ -2889,7 +2888,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha', 'FECHA DE ELABORACION', 'Codigo', 'Producto', 'Lote', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen', 'Cestas'];
+        : ['Fecha', 'FECHA DE ELABORACION', 'Codigo', 'Producto', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen', 'Cestas'];
       return res.json({
         ok: true,
         sheet: 'Control de Inventario',
