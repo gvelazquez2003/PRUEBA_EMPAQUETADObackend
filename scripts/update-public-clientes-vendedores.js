@@ -12,7 +12,7 @@ if (!process.env.DATABASE_URL) {
 }
 
 if (!csvPath || !fs.existsSync(csvPath)) {
-  console.error('Uso: node scripts/import-public-clientes.js "C:\\ruta\\ventas_clientes_neon_zonas.csv"');
+  console.error('Uso: node scripts/update-public-clientes-vendedores.js "C:\\ruta\\Filtro Clientes SinDup - Sheet1.csv"');
   process.exit(1);
 }
 
@@ -102,85 +102,85 @@ function parseCsv(filePath) {
   });
 }
 
-function assertColumns(rows) {
-  const required = ['id_cliente', 'descripcion', 'tipo_cliente', 'direccion', 'zona', 'ruta', 'transporte'];
-  const first = rows[0] || {};
-  const missing = required.filter((column) => !(column in first));
-  if (missing.length) {
-    throw new Error(`Faltan columnas requeridas en el CSV: ${missing.join(', ')}`);
+function pickField(row, fields) {
+  for (const field of fields) {
+    const value = row[field];
+    if (cleanText(value)) return value;
   }
+  return '';
+}
+
+function buildPayload(row) {
+  return {
+    id_cliente: cleanText(pickField(row, ['id_cliente', 'C\u00f3digo de Cliente', 'CÃ³digo de Cliente', 'Codigo de Cliente'])),
+    direccion: cleanText(pickField(row, ['direccion', 'dire2'])),
+    vendedor: cleanText(pickField(row, ['vendedor', 'Nombre Vendedor'])),
+  };
 }
 
 async function main() {
-  const rows = parseCsv(csvPath);
+  const rows = parseCsv(csvPath).map(buildPayload).filter((row) => row.id_cliente && row.vendedor);
   if (!rows.length) {
-    console.log('No se encontraron filas en el CSV.');
+    console.log('No se encontraron vendedores validos en el CSV.');
     return;
   }
-  assertColumns(rows);
+
+  const dedupe = new Map();
+  rows.forEach((row) => {
+    if (!dedupe.has(row.id_cliente)) dedupe.set(row.id_cliente, row);
+  });
+  const payload = Array.from(dedupe.values());
 
   const client = await pool.connect();
-  let inserted = 0;
+  let updated = 0;
 
   try {
     await client.query('BEGIN');
     await client.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS vendedor TEXT');
-    await client.query('TRUNCATE TABLE public.clientes');
+    await client.query('UPDATE public.clientes SET vendedor = NULL');
 
-    const validRows = rows
-      .map((row) => ({
-        id_cliente: cleanText(row.id_cliente),
-        descripcion: cleanText(row.descripcion),
-        tipo_cliente: cleanText(row.tipo_cliente),
-        direccion: cleanText(row.direccion),
-        ruta: cleanText(row.ruta),
-        transporte: cleanText(row.transporte),
-        zona: cleanText(row.zona),
-        vendedor: cleanText(row.vendedor || row['Nombre Vendedor']),
-      }))
-      .filter((row) => row.id_cliente);
-
-    const chunkSize = 250;
-    for (let offset = 0; offset < validRows.length; offset += chunkSize) {
-      const chunk = validRows.slice(offset, offset + chunkSize);
+    const chunkSize = 300;
+    for (let offset = 0; offset < payload.length; offset += chunkSize) {
+      const chunk = payload.slice(offset, offset + chunkSize);
       const values = [];
       const placeholders = chunk.map((row, rowIndex) => {
-        const base = rowIndex * 8;
-        values.push(
-          row.id_cliente,
-          row.descripcion,
-          row.tipo_cliente,
-          row.direccion,
-          row.ruta,
-          row.transporte,
-          row.zona,
-          row.vendedor
-        );
-        return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8})`;
+        const base = rowIndex * 3;
+        values.push(row.id_cliente, row.direccion, row.vendedor);
+        return `($${base + 1}, $${base + 2}, $${base + 3})`;
       });
 
-      await client.query(
-        `INSERT INTO public.clientes (
-           id_cliente,
-           descripcion,
-           tipo_cliente,
-           direccion,
-           ruta,
-           transporte,
-           zona,
-           vendedor
+      const result = await client.query(
+        `WITH incoming(id_cliente, direccion, vendedor) AS (
+           VALUES ${placeholders.join(', ')}
          )
-         VALUES ${placeholders.join(', ')}`,
+         UPDATE public.clientes AS c
+            SET vendedor = incoming.vendedor
+           FROM incoming
+          WHERE c.id_cliente = incoming.id_cliente
+             OR (
+               c.id_cliente ~ '^[0-9]+$'
+               AND incoming.id_cliente ~ '^[0-9]+$'
+               AND REGEXP_REPLACE(c.id_cliente, '^0+', '') = REGEXP_REPLACE(incoming.id_cliente, '^0+', '')
+             )`,
         values
       );
-      inserted += chunk.length;
+      updated += result.rowCount || 0;
     }
 
+    const summary = await client.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE TRIM(COALESCE(vendedor, '')) <> '')::int AS con_vendedor,
+        COUNT(*) FILTER (WHERE TRIM(COALESCE(vendedor, '')) = '')::int AS sin_vendedor
+      FROM public.clientes
+    `);
+
     await client.query('COMMIT');
-    console.log(`Importacion completada: ${inserted} clientes insertados en public.clientes.`);
+    console.log(`Actualizacion completada: ${updated} clientes con vendedor actualizado.`);
+    console.table(summary.rows);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('Error al importar public.clientes:', error.message);
+    console.error('Error al actualizar vendedores de public.clientes:', error.message);
     process.exitCode = 1;
   } finally {
     client.release();

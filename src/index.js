@@ -1305,6 +1305,7 @@ function normalizeClienteDireccionMeta(row) {
     zona: normalizeSalidasText(row?.zona, 120),
     ruta: normalizeSalidasText(row?.ruta, 120),
     transporte: normalizeSalidasText(row?.transporte, 120),
+    vendedor: normalizeSalidasText(row?.vendedor, 160),
   };
 }
 
@@ -1344,7 +1345,8 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw) {
        TRIM(COALESCE(direccion, '')) AS direccion,
        TRIM(COALESCE(zona, '')) AS zona,
        TRIM(COALESCE(ruta, '')) AS ruta,
-       TRIM(COALESCE(transporte, '')) AS transporte
+       TRIM(COALESCE(transporte, '')) AS transporte,
+       TRIM(COALESCE(vendedor, '')) AS vendedor
      FROM public.clientes
      WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
        AND LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))
@@ -1353,7 +1355,8 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw) {
        TRIM(COALESCE(direccion, '')),
        TRIM(COALESCE(zona, '')),
        TRIM(COALESCE(ruta, '')),
-       TRIM(COALESCE(transporte, ''))
+       TRIM(COALESCE(transporte, '')),
+       TRIM(COALESCE(vendedor, ''))
      ORDER BY TRIM(COALESCE(direccion, '')) ASC`,
     [cliente, zona]
   );
@@ -1370,7 +1373,8 @@ async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direcci
        TRIM(COALESCE(direccion, '')) AS direccion,
        TRIM(COALESCE(zona, '')) AS zona,
        TRIM(COALESCE(ruta, '')) AS ruta,
-       TRIM(COALESCE(transporte, '')) AS transporte
+       TRIM(COALESCE(transporte, '')) AS transporte,
+       TRIM(COALESCE(vendedor, '')) AS vendedor
      FROM public.clientes
      WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
        AND LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))
@@ -1534,6 +1538,7 @@ async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_lote_upper ON empaquetados_detalle(UPPER(TRIM(numero_lote)))');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura)');
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS vendedor TEXT').catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_zona ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(zona)))').catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_direccion ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(direccion)))').catch(() => {});
 }
@@ -3820,8 +3825,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   if (!detalleRaw.length) {
     return res.status(400).json({ ok: false, error: 'detalle es obligatorio' });
   }
-  if (!clienteRaw || !vendedorRaw || !zonaInputRaw || !direccionInputRaw || !fechaEmision) {
-    return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera (cliente, vendedor, zona, direccion y fecha)' });
+  if (!clienteRaw || !zonaInputRaw || !direccionInputRaw || !fechaEmision) {
+    return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera (cliente, zona, direccion y fecha)' });
   }
 
   const detalle = detalleRaw
@@ -3950,6 +3955,21 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     const direccionRaw = direccionMeta.direccion;
     const rutaRaw = direccionMeta.ruta;
     const transporteRaw = direccionMeta.transporte;
+    const vendedorCatalogRaw = direccionMeta.vendedor || vendedorRaw;
+    if (!vendedorCatalogRaw) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        ok: false,
+        error: 'La direccion seleccionada no tiene vendedor asociado.'
+      });
+    }
+    if (vendedorRaw && direccionMeta.vendedor && vendedorRaw !== direccionMeta.vendedor) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        ok: false,
+        error: 'El vendedor no coincide con la direccion seleccionada.'
+      });
+    }
     if ((rutaInputRaw && rutaRaw && rutaInputRaw !== rutaRaw) || (transporteInputRaw && transporteRaw && transporteInputRaw !== transporteRaw)) {
       await client.query('ROLLBACK');
       return res.status(409).json({
@@ -3959,7 +3979,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     }
 
     const cliente = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
-    const vendedor = await upsertSalidasCatalogValue(client, 'vendedor', vendedorRaw);
+    const vendedor = await upsertSalidasCatalogValue(client, 'vendedor', vendedorCatalogRaw);
     const zona = await upsertSalidasCatalogValue(client, 'zona', zonaRaw);
     const direccion = await upsertSalidasCatalogValue(client, 'direccion', direccionRaw);
 
