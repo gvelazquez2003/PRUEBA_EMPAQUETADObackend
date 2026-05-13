@@ -848,8 +848,9 @@ async function ensureProductosSoftDelete() {
   `);
   await pool.query(`
     UPDATE productos
-       SET codigo_barras = CONCAT('PDT', LPAD(id_producto::text, 6, '0'))
-     WHERE TRIM(COALESCE(codigo_barras, '')) = ''
+       SET codigo_barras = UPPER(TRIM(codigo_producto))
+     WHERE UPPER(TRIM(COALESCE(codigo_barras, ''))) <> UPPER(TRIM(COALESCE(codigo_producto, '')))
+       AND TRIM(COALESCE(codigo_producto, '')) <> ''
   `).catch(() => {});
 }
 
@@ -2225,7 +2226,7 @@ app.post('/productos', async (req, res) => {
     );
     const barcodeResult = await pool.query(
       `UPDATE productos
-          SET codigo_barras = COALESCE(NULLIF(TRIM(codigo_barras), ''), CONCAT('PDT', LPAD(id_producto::text, 6, '0')))
+          SET codigo_barras = UPPER(TRIM(codigo_producto))
         WHERE id_producto = $1
         RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
       [result.rows[0].id_producto]
