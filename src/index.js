@@ -1886,12 +1886,13 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
   }
 
   try {
+    const cambioTsVzExpr = `(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
     const result = await pool.query(
       `SELECT
          cr.id_cambio,
          cr.nombre_cliente,
          cr.responsable,
-         TO_CHAR(cr.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+         TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
          item.ord AS item_index,
          UPPER(TRIM(item.value->>'codigo')) AS codigo,
          TRIM(item.value->>'producto') AS producto,
@@ -2641,34 +2642,35 @@ app.get('/api/registros', async (req, res) => {
       const fetchLimit = limit + 1;
       const whereParts = [];
       const params = [];
+      const cambioTsVzExpr = `(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
 
       if (hasDesde) {
         params.push(desde);
-        whereParts.push(`DATE(cr.created_at) >= $${params.length}`);
+        whereParts.push(`DATE(${cambioTsVzExpr}) >= $${params.length}`);
       }
       if (hasHasta) {
         params.push(hasta);
-        whereParts.push(`DATE(cr.created_at) <= $${params.length}`);
+        whereParts.push(`DATE(${cambioTsVzExpr}) <= $${params.length}`);
       }
       if (hasSemana) {
         params.push(semana);
-        whereParts.push(`TO_CHAR(cr.created_at, 'IYYY-"W"IW') = $${params.length}`);
+        whereParts.push(`TO_CHAR(${cambioTsVzExpr}, 'IYYY-"W"IW') = $${params.length}`);
       }
       if (hasFecha) {
         params.push(fecha);
-        whereParts.push(`DATE(cr.created_at) = $${params.length}`);
+        whereParts.push(`DATE(${cambioTsVzExpr}) = $${params.length}`);
       }
       if (hasMes) {
         params.push(mes);
-        whereParts.push(`TO_CHAR(cr.created_at, 'YYYY-MM') = $${params.length}`);
+        whereParts.push(`TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM') = $${params.length}`);
       }
       if (hasMesNumero) {
         params.push(mes);
-        whereParts.push(`TO_CHAR(cr.created_at, 'MM') = $${params.length}`);
+        whereParts.push(`TO_CHAR(${cambioTsVzExpr}, 'MM') = $${params.length}`);
       }
       if (hasAnio) {
         params.push(anio);
-        whereParts.push(`TO_CHAR(cr.created_at, 'YYYY') = $${params.length}`);
+        whereParts.push(`TO_CHAR(${cambioTsVzExpr}, 'YYYY') = $${params.length}`);
       }
 
       params.push(fetchLimit);
@@ -2679,8 +2681,8 @@ app.get('/api/registros', async (req, res) => {
         `SELECT
           cr.id_cambio AS "__ROW_ID",
           'cambios_registros'::text AS "__ROW_SOURCE",
-          TO_CHAR(cr.created_at, 'YYYY-MM-DD') AS "FECHA",
-          TO_CHAR(cr.created_at, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
+          TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
+          TO_CHAR(${cambioTsVzExpr}, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
           cr.nombre_cliente AS "Nombre del cliente",
           COALESCE(productos.productos_cambiados, '') AS "Producto(s) cambiados",
           COALESCE(productos.cantidades, '') AS "Cantidad de cada uno",
