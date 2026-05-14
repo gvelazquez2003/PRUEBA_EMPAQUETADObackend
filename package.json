@@ -11,7 +11,8 @@
     "import:public-clientes": "node scripts/import-public-clientes.js",
     "update:public-clientes-vendedores": "node scripts/update-public-clientes-vendedores.js",
     "import:zonas": "node scripts/import-zonas.js",
-    "import:vendedores": "node scripts/import-vendedores.js"
+    "import:vendedores": "node scripts/import-vendedores.js",
+    "sync:auth-roles": "node scripts/sync-auth-roles.js"
   },
   "dependencies": {
     "express": "^4.18.2",

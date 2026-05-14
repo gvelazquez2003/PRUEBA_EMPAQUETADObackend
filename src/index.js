@@ -16,6 +16,8 @@ const APP_ROLES = {
   ADMIN: 'administrador',
   PRODUCCION: 'produccion',
   ALMACEN: 'almacen',
+  FACTURACION: 'facturacion',
+  VENTAS: 'ventas',
 };
 const INITIAL_ADMIN_USERNAMES = ['ATovar', 'EValerio', 'LGil'];
 const INITIAL_ADMIN_PASSWORD = String(process.env.INITIAL_ADMIN_PASSWORD || 'Admin12345');
@@ -154,6 +156,8 @@ function normalizeAuthRole(value) {
   if (role === APP_ROLES.ADMIN || role === 'administrador') return APP_ROLES.ADMIN;
   if (role === APP_ROLES.PRODUCCION || role === 'empaquetado' || role === 'produccion' || role === 'producción') return APP_ROLES.PRODUCCION;
   if (role === APP_ROLES.ALMACEN || role === 'almacen') return APP_ROLES.ALMACEN;
+  if (role === APP_ROLES.FACTURACION || role === 'facturacion' || role === 'facturación') return APP_ROLES.FACTURACION;
+  if (role === APP_ROLES.VENTAS || role === 'ventas' || role === 'venta') return APP_ROLES.VENTAS;
   return '';
 }
 
@@ -161,7 +165,7 @@ function normalizeAuthUsername(value) {
   return String(value || '')
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
-    .slice(0, 10);
+    .slice(0, 20);
 }
 
 function hashPassword(password) {
@@ -307,14 +311,19 @@ async function ensureAuthTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS auth_users (
       id_user SERIAL PRIMARY KEY,
-      username VARCHAR(10) NOT NULL UNIQUE,
-      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'almacen')),
+      username VARCHAR(20) NOT NULL UNIQUE,
+      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas')),
       password_hash TEXT NOT NULL,
       activo BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
+  await pool.query(`
+    ALTER TABLE auth_users
+    ALTER COLUMN username TYPE VARCHAR(20)
+  `).catch(() => {});
 
   await pool.query(`
     ALTER TABLE auth_users
@@ -331,7 +340,7 @@ async function ensureAuthTables() {
   await pool.query(`
     ALTER TABLE auth_users
     ADD CONSTRAINT auth_users_role_check
-    CHECK (role IN ('administrador', 'produccion', 'almacen')) NOT VALID
+    CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas')) NOT VALID
   `);
 
   // Normalize common role variants (case, whitespace, old names, accents)
@@ -353,11 +362,23 @@ async function ensureAuthTables() {
      WHERE lower(trim(role)) IN ('administrador', 'admin')
   `).catch(() => {});
 
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'facturacion'
+     WHERE lower(trim(role)) IN ('facturacion', 'facturaciÃ³n')
+  `).catch(() => {});
+
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'ventas'
+     WHERE lower(trim(role)) IN ('ventas', 'venta')
+  `).catch(() => {});
+
   // Set any remaining unknown/empty roles to 'almacen' as a safe default
   await pool.query(`
     UPDATE auth_users
        SET role = 'almacen'
-     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','almacen')
+     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','almacen','facturacion','ventas')
   `).catch(() => {});
 
   // Now validate the constraint (should succeed after normalization)
@@ -543,7 +564,9 @@ async function listRegisteredUsers(_auth, res) {
          CASE role
            WHEN 'administrador' THEN 0
            WHEN 'almacen' THEN 1
-           WHEN 'produccion' THEN 2
+           WHEN 'facturacion' THEN 2
+           WHEN 'ventas' THEN 3
+           WHEN 'produccion' THEN 4
            ELSE 9
          END,
          username ASC`
@@ -1671,7 +1694,10 @@ app.get('/motivos-merma', async (_req, res) => {
   }
 });
 
-app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
+app.get('/api/almacen09/cambios/clientes', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS]);
+  if (!auth) return;
+
   try {
     const rawQuery = normalizeSalidasText(_req.query?.q, 160);
     const limit = Math.min(Math.max(Number(_req.query?.limit || 50), 1), 50);
@@ -1720,7 +1746,7 @@ app.get('/api/almacen09/cambios/clientes', async (_req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
@@ -1751,7 +1777,7 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
 });
 
 app.get('/api/almacen09/vendedores', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const rawQuery = normalizeSalidasText(req.query?.q, 200);
@@ -1782,7 +1808,10 @@ app.get('/api/almacen09/vendedores', async (req, res) => {
   }
 });
 
-app.get('/api/almacen09/cambios/razones', async (_req, res) => {
+app.get('/api/almacen09/cambios/razones', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS]);
+  if (!auth) return;
+
   try {
     const result = await pool.query(
       `SELECT id_razon, razon_texto
@@ -1796,7 +1825,7 @@ app.get('/api/almacen09/cambios/razones', async (_req, res) => {
 });
 
 app.post('/api/almacen09/cambios', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 180);
@@ -1877,7 +1906,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
 });
 
 app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 180);
@@ -3869,7 +3898,10 @@ app.post('/api/almacen09/errores-conteo/delete', async (req, res) => {
   }
 });
 
-app.get('/api/almacen09/salidas-facturas/next-control', async (_req, res) => {
+app.get('/api/almacen09/salidas-facturas/next-control', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
   try {
     const siguiente = await getNextSalidasControlNumber(pool);
     return res.json({ ok: true, numero_control: siguiente });
@@ -3879,7 +3911,7 @@ app.get('/api/almacen09/salidas-facturas/next-control', async (_req, res) => {
 });
 
 app.post('/api/almacen09/salidas-facturas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.ALMACEN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const numeroFacturaRaw = String(req.body?.numero_factura || '').trim();
