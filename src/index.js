@@ -1701,8 +1701,8 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
   if (!auth) return;
 
   try {
-    const rawQuery = normalizeSalidasText(_req.query?.q, 160);
-    const limit = Math.min(Math.max(Number(_req.query?.limit || 50), 1), 50);
+    const rawQuery = normalizeSalidasText(req.query?.q, 160);
+    const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 50);
     const params = [];
     const whereParts = ["TRIM(COALESCE(descripcion, '')) <> ''"];
 
