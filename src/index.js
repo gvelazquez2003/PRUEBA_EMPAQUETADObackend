@@ -1146,6 +1146,45 @@ async function ensureSalidas09Tables() {
     CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_id_cambio
     ON almacen09_salidas_detalle (id_cambio)
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS hojas_ruta_exportadas (
+      id_hoja BIGSERIAL PRIMARY KEY,
+      ruta_nombre VARCHAR(120) NOT NULL,
+      fecha_entrega DATE NOT NULL,
+      fecha_busqueda_desde DATE,
+      fecha_busqueda_hasta DATE,
+      conductor VARCHAR(180),
+      numero_camion VARCHAR(80),
+      total_despachos INT NOT NULL DEFAULT 0,
+      total_cestas INT NOT NULL DEFAULT 0,
+      usuario VARCHAR(80),
+      facturas JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS ruta_nombre VARCHAR(120)');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS fecha_entrega DATE');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS fecha_busqueda_desde DATE');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS fecha_busqueda_hasta DATE');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS conductor VARCHAR(180)');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS numero_camion VARCHAR(80)');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS total_despachos INT NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS total_cestas INT NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS usuario VARCHAR(80)');
+  await pool.query(`ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS facturas JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()');
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_hojas_ruta_exportadas_created_at
+    ON hojas_ruta_exportadas (created_at DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_hojas_ruta_exportadas_ruta
+    ON hojas_ruta_exportadas (LOWER(TRIM(ruta_nombre)))
+  `);
 }
 
 async function ensureMermaTables() {
@@ -2687,6 +2726,96 @@ app.get('/api/registros', async (req, res) => {
   const hasRuta = ruta.length > 0 && ruta.length <= 120;
 
   try {
+    if (tipo === 'hojas-ruta') {
+      const fetchLimit = limit + 1;
+      const whereParts = [];
+      const params = [];
+      const hojaTsVzExpr = `(hr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
+
+      if (hasDesde) {
+        params.push(desde);
+        whereParts.push(`DATE(${hojaTsVzExpr}) >= $${params.length}`);
+      }
+      if (hasHasta) {
+        params.push(hasta);
+        whereParts.push(`DATE(${hojaTsVzExpr}) <= $${params.length}`);
+      }
+      if (hasSemana) {
+        params.push(semana);
+        whereParts.push(`TO_CHAR(${hojaTsVzExpr}, 'IYYY-"W"IW') = $${params.length}`);
+      }
+      if (hasFecha) {
+        params.push(fecha);
+        whereParts.push(`DATE(${hojaTsVzExpr}) = $${params.length}`);
+      }
+      if (hasMes) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(${hojaTsVzExpr}, 'YYYY-MM') = $${params.length}`);
+      }
+      if (hasMesNumero) {
+        params.push(mes);
+        whereParts.push(`TO_CHAR(${hojaTsVzExpr}, 'MM') = $${params.length}`);
+      }
+      if (hasAnio) {
+        params.push(anio);
+        whereParts.push(`TO_CHAR(${hojaTsVzExpr}, 'YYYY') = $${params.length}`);
+      }
+      if (hasRuta) {
+        params.push(`%${ruta}%`);
+        whereParts.push(`COALESCE(hr.ruta_nombre, '') ILIKE $${params.length}`);
+      }
+
+      params.push(fetchLimit);
+      params.push(offset);
+      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      const result = await pool.query(
+        `SELECT
+          hr.id_hoja AS "__ROW_ID",
+          'hojas_ruta_exportadas'::text AS "__ROW_SOURCE",
+          TO_CHAR(${hojaTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
+          TO_CHAR(${hojaTsVzExpr}, 'DD/MM/YYYY HH24:MI') AS "Fecha de exportacion",
+          TO_CHAR(hr.fecha_entrega, 'DD/MM/YYYY') AS "Fecha de entrega",
+          hr.ruta_nombre AS "Ruta",
+          CASE
+            WHEN hr.fecha_busqueda_desde IS NULL AND hr.fecha_busqueda_hasta IS NULL THEN ''
+            WHEN hr.fecha_busqueda_desde = hr.fecha_busqueda_hasta THEN TO_CHAR(hr.fecha_busqueda_desde, 'DD/MM/YYYY')
+            ELSE CONCAT(
+              COALESCE(TO_CHAR(hr.fecha_busqueda_desde, 'DD/MM/YYYY'), ''),
+              ' - ',
+              COALESCE(TO_CHAR(hr.fecha_busqueda_hasta, 'DD/MM/YYYY'), '')
+            )
+          END AS "Rango de busqueda",
+          COALESCE(hr.conductor, '') AS "Conductor",
+          COALESCE(hr.numero_camion, '') AS "Numero de camion",
+          hr.total_despachos AS "Despachos",
+          hr.total_cestas AS "Cestas",
+          COALESCE(hr.usuario, '') AS "Usuario"
+        FROM hojas_ruta_exportadas hr
+        ${whereClause}
+        ORDER BY hr.created_at DESC, hr.id_hoja DESC
+        LIMIT $${params.length - 1}
+        OFFSET $${params.length}`,
+        params
+      );
+
+      const hasMore = result.rows.length > limit;
+      const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+      const headers = rows.length
+        ? Object.keys(rows[0])
+        : ['Fecha de exportacion', 'Fecha de entrega', 'Ruta', 'Rango de busqueda', 'Conductor', 'Numero de camion', 'Despachos', 'Cestas', 'Usuario'];
+      return res.json({
+        ok: true,
+        sheet: 'Hojas de Ruta',
+        headers,
+        rows,
+        total: rows.length,
+        hasMore,
+        offset,
+        limit,
+      });
+    }
+
     if (tipo === 'cambios') {
       const fetchLimit = limit + 1;
       const whereParts = [];
@@ -3390,7 +3519,7 @@ app.post('/api/registros/delete', async (req, res) => {
     }))
     .filter((row) => {
       if (!/^\d+$/.test(row.id) || row.id === '0') return false;
-      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle' || row.source === 'control_inventario_guardia' || row.source === 'cambios_registros';
+      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle' || row.source === 'control_inventario_guardia' || row.source === 'cambios_registros' || row.source === 'hojas_ruta_exportadas';
     });
 
   const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
@@ -3403,6 +3532,7 @@ app.post('/api/registros/delete', async (req, res) => {
   const mermaDetalleIdsSet = new Set();
   const controlInventarioIdsSet = new Set();
   const cambiosIdsSet = new Set();
+  const hojasRutaIdsSet = new Set();
 
   rows.forEach((row) => {
     if (row.source === 'empaquetados_detalle') {
@@ -3421,6 +3551,10 @@ app.post('/api/registros/delete', async (req, res) => {
       cambiosIdsSet.add(Number(row.id));
       return;
     }
+    if (row.source === 'hojas_ruta_exportadas') {
+      hojasRutaIdsSet.add(Number(row.id));
+      return;
+    }
     historicoIdsSet.add(row.id);
   });
 
@@ -3429,8 +3563,9 @@ app.post('/api/registros/delete', async (req, res) => {
   const mermaDetalleIds = Array.from(mermaDetalleIdsSet).filter((id) => Number.isInteger(id) && id > 0);
   const controlInventarioIds = Array.from(controlInventarioIdsSet).filter((id) => Number.isInteger(id) && id > 0);
   const cambiosIds = Array.from(cambiosIdsSet).filter((id) => Number.isInteger(id) && id > 0);
+  const hojasRutaIds = Array.from(hojasRutaIdsSet).filter((id) => Number.isInteger(id) && id > 0);
 
-  if (!detalleIds.length && !historicoIds.length && !mermaDetalleIds.length && !controlInventarioIds.length && !cambiosIds.length) {
+  if (!detalleIds.length && !historicoIds.length && !mermaDetalleIds.length && !controlInventarioIds.length && !cambiosIds.length && !hojasRutaIds.length) {
     return res.status(400).json({ ok: false, error: 'rows o ids es obligatorio y debe contener valores válidos' });
   }
 
@@ -3446,6 +3581,7 @@ app.post('/api/registros/delete', async (req, res) => {
     let deletedMermaCabecerasCount = 0;
     let deletedControlInventarioCount = 0;
     let deletedCambiosCount = 0;
+    let deletedHojasRutaCount = 0;
 
     if (detalleIds.length) {
       const deleted = await client.query(
@@ -3531,6 +3667,16 @@ app.post('/api/registros/delete', async (req, res) => {
       deletedTotal += deletedCambiosCount;
     }
 
+    if (hojasRutaIds.length) {
+      const deletedHojasRuta = await client.query(
+        `DELETE FROM hojas_ruta_exportadas
+         WHERE id_hoja = ANY($1::bigint[])`,
+        [hojasRutaIds]
+      );
+      deletedHojasRutaCount = deletedHojasRuta.rowCount || 0;
+      deletedTotal += deletedHojasRutaCount;
+    }
+
     await client.query('COMMIT');
     return res.json({
       ok: true,
@@ -3542,6 +3688,7 @@ app.post('/api/registros/delete', async (req, res) => {
       deleted_merma_cabeceras: deletedMermaCabecerasCount,
       deleted_control_inventario: deletedControlInventarioCount,
       deleted_cambios: deletedCambiosCount,
+      deleted_hojas_ruta: deletedHojasRutaCount,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -4309,6 +4456,67 @@ app.get('/api/hoja-ruta/rutas', async (req, res) => {
        ORDER BY TRIM(COALESCE(ruta_nombre, '')) ASC`
     );
     return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const ruta = normalizeSalidasText(req.body?.ruta, 120);
+  const fechaEntregaRaw = String(req.body?.fecha_entrega || '').trim();
+  const fechaDesdeRaw = String(req.body?.fecha_busqueda_desde || '').trim();
+  const fechaHastaRaw = String(req.body?.fecha_busqueda_hasta || '').trim();
+  const conductor = normalizeSalidasText(req.body?.conductor, 180);
+  const numeroCamion = normalizeSalidasText(req.body?.numero_camion, 80);
+  const totalDespachos = Math.max(0, Math.floor(Number(req.body?.total_despachos) || 0));
+  const totalCestas = Math.max(0, Math.floor(Number(req.body?.total_cestas) || 0));
+  const facturas = Array.isArray(req.body?.facturas) ? req.body.facturas.slice(0, 500) : [];
+  const usuario = normalizeAuthUsername(req.body?.usuario) || normalizeAuthUsername(auth?.username) || 'sistema';
+
+  const isIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim());
+  if (!ruta) {
+    return res.status(400).json({ ok: false, error: 'ruta es obligatoria' });
+  }
+  if (!isIsoDate(fechaEntregaRaw)) {
+    return res.status(400).json({ ok: false, error: 'fecha_entrega debe tener formato YYYY-MM-DD' });
+  }
+  if ((fechaDesdeRaw && !isIsoDate(fechaDesdeRaw)) || (fechaHastaRaw && !isIsoDate(fechaHastaRaw))) {
+    return res.status(400).json({ ok: false, error: 'Las fechas de busqueda deben tener formato YYYY-MM-DD' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO hojas_ruta_exportadas (
+         ruta_nombre,
+         fecha_entrega,
+         fecha_busqueda_desde,
+         fecha_busqueda_hasta,
+         conductor,
+         numero_camion,
+         total_despachos,
+         total_cestas,
+         usuario,
+         facturas
+       )
+       VALUES ($1, $2::date, NULLIF($3, '')::date, NULLIF($4, '')::date, $5, $6, $7, $8, $9, $10::jsonb)
+       RETURNING id_hoja, created_at`,
+      [
+        ruta,
+        fechaEntregaRaw,
+        fechaDesdeRaw,
+        fechaHastaRaw,
+        conductor || null,
+        numeroCamion || null,
+        totalDespachos,
+        totalCestas,
+        usuario,
+        JSON.stringify(facturas),
+      ]
+    );
+    return res.status(201).json({ ok: true, row: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
