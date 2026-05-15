@@ -4293,6 +4293,121 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
   }
 });
 
+app.get('/api/hoja-ruta/rutas', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         TRIM(COALESCE(ruta_nombre, '')) AS ruta,
+         TO_CHAR(MAX(fecha_emision)::date, 'YYYY-MM-DD') AS fecha,
+         COUNT(DISTINCT id_factura)::int AS facturas
+       FROM salidas_facturas
+       WHERE TRIM(COALESCE(ruta_nombre, '')) <> ''
+       GROUP BY TRIM(COALESCE(ruta_nombre, ''))
+       ORDER BY TRIM(COALESCE(ruta_nombre, '')) ASC`
+    );
+    return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/hoja-ruta', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const ruta = normalizeSalidasText(req.query?.ruta, 120);
+  if (!ruta) {
+    return res.status(400).json({ ok: false, error: 'ruta es obligatoria' });
+  }
+
+  try {
+    const dateResult = await pool.query(
+      `SELECT TO_CHAR(MAX(sf.fecha_emision)::date, 'YYYY-MM-DD') AS fecha
+       FROM salidas_facturas sf
+       WHERE LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`,
+      [ruta]
+    );
+    const fecha = dateResult.rows?.[0]?.fecha || null;
+    if (!fecha) {
+      return res.json({ ok: true, ruta, fecha_entrega: null, facturas: [] });
+    }
+
+    const result = await pool.query(
+      `SELECT
+         sf.id_factura,
+         sf.numero_control,
+         sf.numero_factura,
+         TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+         sf.cliente_nombre,
+         sf.vendedor_nombre,
+         sf.zona_nombre,
+         sf.ruta_nombre,
+         sf.transporte_nombre,
+         sf.direccion_texto,
+         sd.id_detalle,
+         sd.id_cambio,
+         sd.codigo_producto,
+         sd.producto,
+         sd.numero_lote,
+         sd.cantidad,
+         COALESCE(NULLIF(p.paquetes, 0), 10) AS paquetes_por_cesta,
+         COALESCE(p.sobre_piso, 0) AS sobre_piso
+       FROM salidas_facturas sf
+       JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
+       LEFT JOIN productos p ON p.id_producto = sd.id_producto
+       WHERE LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))
+         AND sf.fecha_emision::date = $2::date
+       ORDER BY
+         LOWER(TRIM(COALESCE(sf.cliente_nombre, ''))) ASC,
+         sf.numero_control ASC,
+         sd.id_detalle ASC`,
+      [ruta, fecha]
+    );
+
+    const facturasMap = new Map();
+    result.rows.forEach((row) => {
+      const idFactura = Number(row.id_factura);
+      if (!facturasMap.has(idFactura)) {
+        facturasMap.set(idFactura, {
+          id_factura: idFactura,
+          numero_control: row.numero_control,
+          numero_factura: row.numero_factura,
+          fecha_emision: row.fecha_emision,
+          cliente_nombre: row.cliente_nombre,
+          vendedor_nombre: row.vendedor_nombre,
+          zona_nombre: row.zona_nombre,
+          ruta_nombre: row.ruta_nombre,
+          transporte_nombre: row.transporte_nombre,
+          direccion_texto: row.direccion_texto,
+          detalle: [],
+        });
+      }
+      facturasMap.get(idFactura).detalle.push({
+        id_detalle: row.id_detalle,
+        id_cambio: row.id_cambio,
+        codigo_producto: row.codigo_producto,
+        producto: row.producto,
+        numero_lote: row.numero_lote,
+        cantidad: row.cantidad,
+        paquetes_por_cesta: row.paquetes_por_cesta,
+        sobre_piso: row.sobre_piso,
+      });
+    });
+
+    return res.json({
+      ok: true,
+      ruta,
+      fecha_entrega: fecha,
+      facturas: Array.from(facturasMap.values()),
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
   if (!auth) return;
