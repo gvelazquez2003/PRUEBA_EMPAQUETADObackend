@@ -4319,20 +4319,44 @@ app.get('/api/hoja-ruta', async (req, res) => {
   if (!auth) return;
 
   const ruta = normalizeSalidasText(req.query?.ruta, 120);
+  const fechaDesdeRaw = String(req.query?.fecha_desde || '').trim();
+  const fechaHastaRaw = String(req.query?.fecha_hasta || '').trim();
+  const hasFechaDesde = /^\d{4}-\d{2}-\d{2}$/.test(fechaDesdeRaw);
+  const hasFechaHasta = /^\d{4}-\d{2}-\d{2}$/.test(fechaHastaRaw);
   if (!ruta) {
     return res.status(400).json({ ok: false, error: 'ruta es obligatoria' });
   }
+  if ((fechaDesdeRaw && !hasFechaDesde) || (fechaHastaRaw && !hasFechaHasta)) {
+    return res.status(400).json({ ok: false, error: 'Las fechas deben tener formato YYYY-MM-DD' });
+  }
 
   try {
-    const dateResult = await pool.query(
-      `SELECT TO_CHAR(MAX(sf.fecha_emision)::date, 'YYYY-MM-DD') AS fecha
-       FROM salidas_facturas sf
-       WHERE LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`,
-      [ruta]
-    );
-    const fecha = dateResult.rows?.[0]?.fecha || null;
-    if (!fecha) {
-      return res.json({ ok: true, ruta, fecha_entrega: null, facturas: [] });
+    let fechaDesde = hasFechaDesde ? fechaDesdeRaw : '';
+    let fechaHasta = hasFechaHasta ? fechaHastaRaw : '';
+
+    if (!fechaDesde && !fechaHasta) {
+      const dateResult = await pool.query(
+        `SELECT TO_CHAR(MAX(sf.fecha_emision)::date, 'YYYY-MM-DD') AS fecha
+         FROM salidas_facturas sf
+         WHERE LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`,
+        [ruta]
+      );
+      const fecha = dateResult.rows?.[0]?.fecha || null;
+      if (!fecha) {
+        return res.json({ ok: true, ruta, fecha_entrega: null, fecha_desde: null, fecha_hasta: null, facturas: [] });
+      }
+      fechaDesde = fecha;
+      fechaHasta = fecha;
+    } else if (fechaDesde && !fechaHasta) {
+      fechaHasta = fechaDesde;
+    } else if (!fechaDesde && fechaHasta) {
+      fechaDesde = fechaHasta;
+    }
+
+    if (fechaDesde > fechaHasta) {
+      const tmp = fechaDesde;
+      fechaDesde = fechaHasta;
+      fechaHasta = tmp;
     }
 
     const result = await pool.query(
@@ -4359,12 +4383,13 @@ app.get('/api/hoja-ruta', async (req, res) => {
        JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
        LEFT JOIN productos p ON p.id_producto = sd.id_producto
        WHERE LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))
-         AND sf.fecha_emision::date = $2::date
+         AND sf.fecha_emision::date BETWEEN $2::date AND $3::date
        ORDER BY
+         sf.fecha_emision::date ASC,
          LOWER(TRIM(COALESCE(sf.cliente_nombre, ''))) ASC,
          sf.numero_control ASC,
          sd.id_detalle ASC`,
-      [ruta, fecha]
+      [ruta, fechaDesde, fechaHasta]
     );
 
     const facturasMap = new Map();
@@ -4400,7 +4425,9 @@ app.get('/api/hoja-ruta', async (req, res) => {
     return res.json({
       ok: true,
       ruta,
-      fecha_entrega: fecha,
+      fecha_entrega: fechaDesde === fechaHasta ? fechaDesde : `${fechaDesde} - ${fechaHasta}`,
+      fecha_desde: fechaDesde,
+      fecha_hasta: fechaHasta,
       facturas: Array.from(facturasMap.values()),
     });
   } catch (error) {
