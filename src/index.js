@@ -829,6 +829,7 @@ async function ensureCambiosProductosTables() {
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS ruta_nombre VARCHAR(120)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS responsable VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS producto JSONB`);
   await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => {});
@@ -843,6 +844,7 @@ async function ensureCambiosProductosTables() {
 
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto ON cambios_razones(razon_texto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_created_at ON cambios_registros(created_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_ruta ON cambios_registros(ruta_nombre)');
 
   const razonesEjemplo = [
     'Vencimiento cercano',
@@ -1858,6 +1860,20 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     const direccionCatalog = direccionRaw
       ? await upsertSalidasCatalogValue(client, 'direccion', direccionRaw)
       : { id: null, value: '' };
+    let rutaCambio = '';
+    if (clienteRaw && direccionRaw) {
+      const rutaResult = await client.query(
+        `SELECT TRIM(COALESCE(ruta, '')) AS ruta
+         FROM public.clientes
+         WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
+           AND LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($2))
+           AND TRIM(COALESCE(ruta, '')) <> ''
+         ORDER BY TRIM(COALESCE(ruta, '')) ASC
+         LIMIT 1`,
+        [clienteRaw, direccionRaw]
+      ).catch(() => ({ rows: [] }));
+      rutaCambio = normalizeSalidasText(rutaResult.rows?.[0]?.ruta, 120);
+    }
     const razonesDistinct = [...new Set(detalle.map((item) => String(item.razon || '').trim()).filter(Boolean))];
     for (const razon of razonesDistinct) {
       await client.query(
@@ -1874,16 +1890,18 @@ app.post('/api/almacen09/cambios', async (req, res) => {
          nombre_cliente,
          direccion_id,
          direccion_texto,
+         ruta_nombre,
          responsable,
          producto
        )
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
        RETURNING id_cambio, created_at`,
       [
         clienteCatalog.id,
         clienteCatalog.value || clienteRaw,
         direccionCatalog.id,
         direccionCatalog.value || direccionRaw || null,
+        rutaCambio || null,
         responsableRaw,
         JSON.stringify(detalle),
       ]
@@ -2655,6 +2673,7 @@ app.get('/api/registros', async (req, res) => {
   const fecha = String(req.query.fecha || '').trim();
   const mes = String(req.query.mes || '').trim();
   const anio = String(req.query.anio || '').trim();
+  const ruta = String(req.query.ruta || '').trim();
   const almacenTsVzExpr = `(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
   const almacenCabCodigoExpr = `UPPER(TRIM(split_part(alp.codigo_lote, '::', 1)))`;
 
@@ -2665,6 +2684,7 @@ app.get('/api/registros', async (req, res) => {
   const hasMes = /^\d{4}-\d{2}$/.test(mes);
   const hasMesNumero = /^(0[1-9]|1[0-2])$/.test(mes);
   const hasAnio = /^\d{4}$/.test(anio);
+  const hasRuta = ruta.length > 0 && ruta.length <= 120;
 
   try {
     if (tipo === 'cambios') {
@@ -2672,6 +2692,7 @@ app.get('/api/registros', async (req, res) => {
       const whereParts = [];
       const params = [];
       const cambioTsVzExpr = `(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
+      const cambioRutaExpr = `COALESCE(NULLIF(TRIM(cr.ruta_nombre), ''), NULLIF(TRIM(ruta_meta.ruta), ''), '')`;
 
       if (hasDesde) {
         params.push(desde);
@@ -2701,6 +2722,10 @@ app.get('/api/registros', async (req, res) => {
         params.push(anio);
         whereParts.push(`TO_CHAR(${cambioTsVzExpr}, 'YYYY') = $${params.length}`);
       }
+      if (hasRuta) {
+        params.push(`%${ruta}%`);
+        whereParts.push(`${cambioRutaExpr} ILIKE $${params.length}`);
+      }
 
       params.push(fetchLimit);
       params.push(offset);
@@ -2713,6 +2738,7 @@ app.get('/api/registros', async (req, res) => {
           TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
           TO_CHAR(${cambioTsVzExpr}, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
           cr.nombre_cliente AS "Nombre del cliente",
+          ${cambioRutaExpr} AS "Ruta",
           COALESCE(productos.productos_cambiados, '') AS "Producto(s) cambiados",
           COALESCE(productos.cantidades, '') AS "Cantidad de cada uno",
           COALESCE(productos.razones, '') AS "Razon del cambio",
@@ -2735,11 +2761,7 @@ app.get('/api/registros', async (req, res) => {
               ORDER BY ord
             ) AS productos_cambiados,
             STRING_AGG(
-              CONCAT(
-                COALESCE(NULLIF(TRIM(elem.value->>'producto'), ''), NULLIF(TRIM(elem.value->>'codigo'), ''), 'Producto'),
-                ': ',
-                COALESCE(NULLIF(TRIM(elem.value->>'cantidad'), ''), '0')
-              ),
+              COALESCE(NULLIF(TRIM(elem.value->>'cantidad'), ''), '0'),
               ' | '
               ORDER BY ord
             ) AS cantidades,
@@ -2752,6 +2774,23 @@ app.get('/api/registros', async (req, res) => {
             END
           ) WITH ORDINALITY AS elem(value, ord)
         ) productos ON true
+        LEFT JOIN LATERAL (
+          SELECT TRIM(COALESCE(c.ruta, '')) AS ruta
+          FROM public.clientes c
+          WHERE LOWER(TRIM(COALESCE(c.descripcion, ''))) = LOWER(TRIM(cr.nombre_cliente))
+            AND (
+              TRIM(COALESCE(cr.direccion_texto, '')) = ''
+              OR LOWER(TRIM(COALESCE(c.direccion, ''))) = LOWER(TRIM(cr.direccion_texto))
+            )
+            AND TRIM(COALESCE(c.ruta, '')) <> ''
+          ORDER BY
+            CASE
+              WHEN LOWER(TRIM(COALESCE(c.direccion, ''))) = LOWER(TRIM(COALESCE(cr.direccion_texto, ''))) THEN 0
+              ELSE 1
+            END,
+            TRIM(COALESCE(c.ruta, '')) ASC
+          LIMIT 1
+        ) ruta_meta ON true
         ${whereClause}
         ORDER BY cr.created_at DESC, cr.id_cambio DESC
         LIMIT $${params.length - 1}
@@ -2763,7 +2802,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha de registro', 'Nombre del cliente', 'Producto(s) cambiados', 'Cantidad de cada uno', 'Razon del cambio', 'Responsable del registro'];
+        : ['Fecha de registro', 'Nombre del cliente', 'Ruta', 'Producto(s) cambiados', 'Cantidad de cada uno', 'Razon del cambio', 'Responsable del registro'];
       return res.json({
         ok: true,
         sheet: 'Cambios',
