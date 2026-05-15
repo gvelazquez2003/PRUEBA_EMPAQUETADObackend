@@ -1160,6 +1160,8 @@ async function ensureSalidas09Tables() {
       total_cestas INT NOT NULL DEFAULT 0,
       usuario VARCHAR(80),
       facturas JSONB NOT NULL DEFAULT '[]'::jsonb,
+      hoja_html TEXT,
+      nombre_archivo VARCHAR(180),
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
@@ -1174,6 +1176,8 @@ async function ensureSalidas09Tables() {
   await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS total_cestas INT NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS usuario VARCHAR(80)');
   await pool.query(`ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS facturas JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS hoja_html TEXT');
+  await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS nombre_archivo VARCHAR(180)');
   await pool.query('ALTER TABLE hojas_ruta_exportadas ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()');
 
   await pool.query(`
@@ -2790,7 +2794,8 @@ app.get('/api/registros', async (req, res) => {
           COALESCE(hr.numero_camion, '') AS "Numero de camion",
           hr.total_despachos AS "Despachos",
           hr.total_cestas AS "Cestas",
-          COALESCE(hr.usuario, '') AS "Usuario"
+          COALESCE(hr.usuario, '') AS "Usuario",
+          COALESCE(hr.nombre_archivo, '') AS "Archivo"
         FROM hojas_ruta_exportadas hr
         ${whereClause}
         ORDER BY hr.created_at DESC, hr.id_hoja DESC
@@ -2803,7 +2808,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha de exportacion', 'Fecha de entrega', 'Ruta', 'Rango de busqueda', 'Conductor', 'Numero de camion', 'Despachos', 'Cestas', 'Usuario'];
+        : ['Fecha de exportacion', 'Fecha de entrega', 'Ruta', 'Rango de busqueda', 'Conductor', 'Numero de camion', 'Despachos', 'Cestas', 'Usuario', 'Archivo'];
       return res.json({
         ok: true,
         sheet: 'Hojas de Ruta',
@@ -4475,6 +4480,8 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   const totalCestas = Math.max(0, Math.floor(Number(req.body?.total_cestas) || 0));
   const facturas = Array.isArray(req.body?.facturas) ? req.body.facturas.slice(0, 500) : [];
   const usuario = normalizeAuthUsername(req.body?.usuario) || normalizeAuthUsername(auth?.username) || 'sistema';
+  const hojaHtml = String(req.body?.hoja_html || '').slice(0, 2000000);
+  const nombreArchivo = normalizeSalidasText(req.body?.nombre_archivo, 180);
 
   const isIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim());
   if (!ruta) {
@@ -4499,9 +4506,11 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
          total_despachos,
          total_cestas,
          usuario,
-         facturas
+         facturas,
+         hoja_html,
+         nombre_archivo
        )
-       VALUES ($1, $2::date, NULLIF($3, '')::date, NULLIF($4, '')::date, $5, $6, $7, $8, $9, $10::jsonb)
+       VALUES ($1, $2::date, NULLIF($3, '')::date, NULLIF($4, '')::date, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
        RETURNING id_hoja, created_at`,
       [
         ruta,
@@ -4514,9 +4523,51 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
         totalCestas,
         usuario,
         JSON.stringify(facturas),
+        hojaHtml || null,
+        nombreArchivo || null,
       ]
     );
     return res.status(201).json({ ok: true, row: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const id = Number(req.params?.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ ok: false, error: 'id invalido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         id_hoja,
+         ruta_nombre,
+         TO_CHAR(fecha_entrega, 'YYYY-MM-DD') AS fecha_entrega,
+         TO_CHAR(fecha_busqueda_desde, 'YYYY-MM-DD') AS fecha_busqueda_desde,
+         TO_CHAR(fecha_busqueda_hasta, 'YYYY-MM-DD') AS fecha_busqueda_hasta,
+         COALESCE(conductor, '') AS conductor,
+         COALESCE(numero_camion, '') AS numero_camion,
+         total_despachos,
+         total_cestas,
+         COALESCE(usuario, '') AS usuario,
+         COALESCE(facturas, '[]'::jsonb) AS facturas,
+         COALESCE(hoja_html, '') AS hoja_html,
+         COALESCE(nombre_archivo, '') AS nombre_archivo,
+         created_at
+       FROM hojas_ruta_exportadas
+       WHERE id_hoja = $1`,
+      [id]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: 'Hoja de ruta no encontrada' });
+    }
+    return res.json({ ok: true, row: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
