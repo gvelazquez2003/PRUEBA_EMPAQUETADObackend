@@ -3742,10 +3742,11 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
          FROM empaquetados_detalle ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
-         WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
-           AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-         GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote)), ed.id_producto
-       ),
+          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
+            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
+            AND ec.fecha_hora::date = (NOW() AT TIME ZONE 'America/Caracas')::date
+          GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote)), ed.id_producto
+        ),
        pendientes AS (
          SELECT da.*
          FROM detalle_agregado da
