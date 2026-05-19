@@ -167,8 +167,7 @@ function normalizeAuthRole(value) {
 
 function normalizeAuthUsername(value) {
   return String(value || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
+    .replace(/[^A-Za-z0-9]/g, '')
     .slice(0, 20);
 }
 
