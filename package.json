@@ -14,6 +14,8 @@
     "import:vendedores": "node scripts/import-vendedores.js",
     "cleanup:almacen09-old-pending": "node scripts/cleanup-almacen09-old-pending.js",
     "cleanup:auth-lowercase-users": "node scripts/delete-lowercase-auth-users.js",
+    "cleanup:auth-numeric-users": "node scripts/delete-numeric-auth-users.js",
+    "restore:auth-test-users": "node scripts/restore-auth-test-users.js",
     "sync:auth-roles": "node scripts/sync-auth-roles.js"
   },
   "dependencies": {

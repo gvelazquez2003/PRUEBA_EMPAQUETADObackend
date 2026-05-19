@@ -172,6 +172,11 @@ function normalizeAuthUsername(value) {
     .slice(0, 20);
 }
 
+function isValidAuthUsername(username) {
+  const clean = String(username || '');
+  return /^[A-Z0-9]{2,20}$/.test(clean) && /[A-Z]/.test(clean);
+}
+
 function hashPassword(password) {
   const clean = String(password || '');
   const salt = crypto.randomBytes(16).toString('hex');
@@ -410,6 +415,16 @@ async function ensureAuthTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_users_role ON auth_users(role)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(id_user)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_sessions_revoked ON auth_sessions(revoked_at)');
+
+  await pool.query('ALTER TABLE auth_users DROP CONSTRAINT IF EXISTS auth_users_username_format_check');
+  await pool.query(`
+    ALTER TABLE auth_users
+    ADD CONSTRAINT auth_users_username_format_check
+    CHECK (username ~ '^[A-Z0-9]{2,20}$' AND username ~ '[A-Z]') NOT VALID
+  `);
+  await pool.query('ALTER TABLE auth_users VALIDATE CONSTRAINT auth_users_username_format_check').catch((err) => {
+    console.error('Failed to validate auth_users_username_format_check:', err && err.message ? err.message : err);
+  });
 }
 
 async function ensureInitialAdminUsers() {
@@ -439,7 +454,7 @@ app.post('/auth/register', async (req, res) => {
   const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
 
-  if (!username || username.length < 2) {
+  if (!isValidAuthUsername(username)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
   }
   if (!role) {
@@ -480,7 +495,7 @@ app.post('/auth/login', async (req, res) => {
   const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
 
-  if (!username || !role || password.length < 4) {
+  if (!isValidAuthUsername(username) || !role || password.length < 4) {
     return res.status(400).json({ ok: false, error: 'Credenciales inválidas' });
   }
 
@@ -651,7 +666,7 @@ app.delete('/auth/users/:username', async (req, res) => {
   if (!auth) return;
 
   const targetUser = normalizeAuthUsername(req.params?.username);
-  if (!targetUser) {
+  if (!isValidAuthUsername(targetUser)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
   }
 
@@ -667,7 +682,7 @@ app.post('/auth/users/delete', async (req, res) => {
   if (!auth) return;
 
   const targetUser = normalizeAuthUsername(req.body?.username);
-  if (!targetUser) {
+  if (!isValidAuthUsername(targetUser)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
   }
 
