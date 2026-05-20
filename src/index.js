@@ -20,6 +20,10 @@ const APP_ROLES = {
   VENTAS: 'ventas',
   VENDEDOR: 'vendedor',
 };
+const SALIDAS_DOCUMENT_TYPES = {
+  FACTURA: 'factura',
+  NOTA_ENTREGA: 'nota_entrega',
+};
 const INITIAL_ADMIN_USERNAMES = ['ATovar', 'EValerio', 'LGil'];
 const INITIAL_ADMIN_PASSWORD = String(process.env.INITIAL_ADMIN_PASSWORD || 'Admin12345');
 const MERMA_MOTIVOS = [
@@ -192,6 +196,11 @@ function appendVendedorAccessFilter(whereParts, params, auth, columnSql = 'vende
     LOWER(TRIM(COALESCE(${columnSql}, ''))) = LOWER(TRIM($${rawIndex}))
     OR ${vendedorSqlLookupExpression(columnSql)} = $${lookupIndex}
   )`);
+}
+
+function isValidAuthUsername(username) {
+  const clean = String(username || '');
+  return /^[A-Z0-9]{2,20}$/.test(clean) && /[A-Z]/.test(clean);
 }
 
 function hashPassword(password) {
@@ -438,6 +447,16 @@ async function ensureAuthTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_users_role ON auth_users(role)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(id_user)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_auth_sessions_revoked ON auth_sessions(revoked_at)');
+
+  await pool.query('ALTER TABLE auth_users DROP CONSTRAINT IF EXISTS auth_users_username_format_check');
+  await pool.query(`
+    ALTER TABLE auth_users
+    ADD CONSTRAINT auth_users_username_format_check
+    CHECK (username ~ '^[A-Z0-9]{2,20}$' AND username ~ '[A-Z]') NOT VALID
+  `);
+  await pool.query('ALTER TABLE auth_users VALIDATE CONSTRAINT auth_users_username_format_check').catch((err) => {
+    console.error('Failed to validate auth_users_username_format_check:', err && err.message ? err.message : err);
+  });
 }
 
 async function ensureInitialAdminUsers() {
@@ -467,7 +486,7 @@ app.post('/auth/register', async (req, res) => {
   const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
 
-  if (!username || username.length < 2) {
+  if (!isValidAuthUsername(username)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
   }
   if (!role) {
@@ -508,7 +527,7 @@ app.post('/auth/login', async (req, res) => {
   const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
 
-  if (!username || !role || password.length < 4) {
+  if (!isValidAuthUsername(username) || !role || password.length < 4) {
     return res.status(400).json({ ok: false, error: 'Credenciales inválidas' });
   }
 
@@ -801,7 +820,7 @@ app.delete('/auth/users/:username', async (req, res) => {
   if (!auth) return;
 
   const targetUser = normalizeAuthUsername(req.params?.username);
-  if (!targetUser) {
+  if (!isValidAuthUsername(targetUser)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
   }
 
@@ -817,7 +836,7 @@ app.post('/auth/users/delete', async (req, res) => {
   if (!auth) return;
 
   const targetUser = normalizeAuthUsername(req.body?.username);
-  if (!targetUser) {
+  if (!isValidAuthUsername(targetUser)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
   }
 
@@ -1188,7 +1207,8 @@ async function ensureSalidas09Tables() {
     CREATE TABLE IF NOT EXISTS salidas_facturas (
       id_factura BIGSERIAL PRIMARY KEY,
       numero_control BIGINT,
-      numero_factura VARCHAR(80) NOT NULL UNIQUE,
+      documento VARCHAR(30) NOT NULL DEFAULT 'factura',
+      numero_factura VARCHAR(80) NOT NULL,
       fecha_emision TIMESTAMP NOT NULL,
       cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       cliente_nombre VARCHAR(160),
@@ -1224,6 +1244,7 @@ async function ensureSalidas09Tables() {
   `);
 
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS numero_control BIGINT');
+  await pool.query(`ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS documento VARCHAR(30) NOT NULL DEFAULT 'factura'`);
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_nombre VARCHAR(160)');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL');
@@ -1263,8 +1284,13 @@ async function ensureSalidas09Tables() {
     UPDATE salidas_facturas
        SET numero_control = COALESCE(numero_control, id_factura)
      WHERE numero_control IS NULL
+       AND COALESCE(documento, 'factura') = 'factura'
   `);
-  await pool.query('ALTER TABLE salidas_facturas ALTER COLUMN numero_control SET NOT NULL');
+  await pool.query(`UPDATE salidas_facturas SET documento = 'factura' WHERE TRIM(COALESCE(documento, '')) = ''`);
+  await pool.query(`ALTER TABLE salidas_facturas ALTER COLUMN documento SET DEFAULT 'factura'`);
+  await pool.query('ALTER TABLE salidas_facturas ALTER COLUMN documento SET NOT NULL');
+  await pool.query('ALTER TABLE salidas_facturas ALTER COLUMN numero_control DROP NOT NULL').catch(() => {});
+  await pool.query('ALTER TABLE salidas_facturas DROP CONSTRAINT IF EXISTS salidas_facturas_numero_factura_key').catch(() => {});
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS almacen09_salidas_detalle (
@@ -1288,6 +1314,8 @@ async function ensureSalidas09Tables() {
   `);
 
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_numero_control ON salidas_facturas(numero_control)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_documento_numero ON salidas_facturas(documento, numero_factura)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_documento ON salidas_facturas(documento)');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas_cliente_sucursal_key ON salidas_cliente_sucursales(cliente_key, sucursal_key)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas_cliente_sucursal_updated ON salidas_cliente_sucursales(updated_at DESC)');
 
@@ -1440,6 +1468,18 @@ function normalizeSalidasText(value, maxLength) {
   const clean = String(value || '').trim().replace(/\s+/g, ' ');
   if (!clean) return '';
   return typeof maxLength === 'number' && maxLength > 0 ? clean.slice(0, maxLength) : clean;
+}
+
+function normalizeSalidasDocumento(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  const normalized = raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s-]+/g, '_');
+  if (normalized === SALIDAS_DOCUMENT_TYPES.NOTA_ENTREGA || normalized === 'nota_de_entrega') {
+    return SALIDAS_DOCUMENT_TYPES.NOTA_ENTREGA;
+  }
+  return SALIDAS_DOCUMENT_TYPES.FACTURA;
 }
 
 const SALIDAS_CATALOGS = {
@@ -3934,10 +3974,11 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
          FROM empaquetados_detalle ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
-         WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
-           AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-         GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote)), ed.id_producto
-       ),
+          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
+            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
+            AND ec.fecha_hora::date = (NOW() AT TIME ZONE 'America/Caracas')::date
+          GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote)), ed.id_producto
+        ),
        pendientes AS (
          SELECT da.*
          FROM detalle_agregado da
@@ -4324,6 +4365,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 
   const numeroFacturaRaw = String(req.body?.numero_factura || '').trim();
   const numeroControlRaw = String(req.body?.numero_control || '').trim();
+  const documento = normalizeSalidasDocumento(req.body?.documento);
+  const isFacturaDocumento = documento === SALIDAS_DOCUMENT_TYPES.FACTURA;
   const fechaEmisionRaw = String(req.body?.fecha_emision || '').trim();
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 160);
@@ -4339,7 +4382,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     ? `${fechaEmisionRaw} 00:00:00`
     : fechaEmisionRaw;
   const numeroControlProvided = Number.parseInt(numeroControlRaw, 10);
-  const numeroControlManual = Number.isFinite(numeroControlProvided) && numeroControlProvided > 0
+  const numeroControlManual = isFacturaDocumento && Number.isFinite(numeroControlProvided) && numeroControlProvided > 0
     ? Math.floor(numeroControlProvided)
     : null;
 
@@ -4374,24 +4417,28 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     await client.query('BEGIN');
     await client.query('LOCK TABLE salidas_facturas IN EXCLUSIVE MODE');
 
-    const numeroControl = numeroControlManual || await getNextSalidasControlNumber(client);
+    const numeroControl = isFacturaDocumento
+      ? (numeroControlManual || await getNextSalidasControlNumber(client))
+      : null;
 
-    const duplicatedControl = await client.query(
-      'SELECT 1 FROM salidas_facturas WHERE numero_control = $1 LIMIT 1',
-      [numeroControl]
-    );
-    if (duplicatedControl.rowCount) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ ok: false, error: 'El número de control ya existe' });
+    if (isFacturaDocumento) {
+      const duplicatedControl = await client.query(
+        'SELECT 1 FROM salidas_facturas WHERE numero_control = $1 LIMIT 1',
+        [numeroControl]
+      );
+      if (duplicatedControl.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ ok: false, error: 'El número de control ya existe' });
+      }
     }
 
     const duplicated = await client.query(
-      'SELECT 1 FROM salidas_facturas WHERE numero_factura = $1 LIMIT 1',
-      [numeroFactura]
+      'SELECT 1 FROM salidas_facturas WHERE numero_factura = $1 AND documento = $2 LIMIT 1',
+      [numeroFactura, documento]
     );
     if (duplicated.rowCount) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ ok: false, error: 'El serial de factura ya existe' });
+      return res.status(409).json({ ok: false, error: 'El serial del documento ya existe' });
     }
 
     const productsResult = await client.query(
@@ -4510,6 +4557,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     const facturaInsert = await client.query(
       `INSERT INTO salidas_facturas (
          numero_control,
+         documento,
          numero_factura,
          fecha_emision,
          cliente_id,
@@ -4526,10 +4574,11 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
          direccion_texto,
          estado
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, NULL, $12, $13, 'emitida')
-       RETURNING id_factura, numero_control, numero_factura, fecha_emision`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, 'emitida')
+       RETURNING id_factura, numero_control, documento, numero_factura, fecha_emision`,
       [
         numeroControl,
+        documento,
         numeroFactura,
         fechaEmision,
         cliente.id,
@@ -4576,7 +4625,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       ok: true,
       factura: {
         id_factura: idFactura,
-        numero_control: Number(facturaInsert.rows[0].numero_control),
+        numero_control: facturaInsert.rows[0].numero_control === null ? null : Number(facturaInsert.rows[0].numero_control),
+        documento: facturaInsert.rows[0].documento,
         numero_factura: facturaInsert.rows[0].numero_factura,
         fecha_emision: facturaInsert.rows[0].fecha_emision,
         lineas: detalle.length,
@@ -4602,6 +4652,8 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
   const offset = Math.max(Number(req.query?.offset || 0), 0);
   const mes = String(req.query?.mes || '').trim();
   const anio = String(req.query?.anio || '').trim();
+  const documento = normalizeSalidasDocumento(req.query?.documento);
+  const hasDocumento = String(req.query?.documento || '').trim() !== '';
   const hasMes = /^\d{4}-\d{2}$/.test(mes);
   const hasAnio = /^\d{4}$/.test(anio);
   try {
@@ -4616,11 +4668,16 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
       params.push(anio);
       whereParts.push(`TO_CHAR(sf.fecha_emision, 'YYYY') = $${params.length}`);
     }
+    if (hasDocumento) {
+      params.push(documento);
+      whereParts.push(`sf.documento = $${params.length}`);
+    }
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const result = await pool.query(
       `SELECT
          sf.id_factura,
          sf.numero_control,
+         sf.documento,
          sf.numero_factura,
          TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD HH24:MI:SS') AS fecha_emision,
          sf.cliente_id,

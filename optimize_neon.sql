@@ -131,8 +131,9 @@ CREATE TABLE IF NOT EXISTS almacen09_direcciones (
 
 CREATE TABLE IF NOT EXISTS salidas_facturas (
   id_factura BIGSERIAL PRIMARY KEY,
-  numero_control BIGINT NOT NULL UNIQUE,
-  numero_factura VARCHAR(80) NOT NULL UNIQUE,
+  numero_control BIGINT UNIQUE,
+  documento VARCHAR(30) NOT NULL DEFAULT 'factura',
+  numero_factura VARCHAR(80) NOT NULL,
   fecha_emision TIMESTAMP NOT NULL,
   cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
   cliente_nombre VARCHAR(160),
@@ -185,6 +186,8 @@ CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_created_at ON control_
 CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC);
 
 CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_fecha ON salidas_facturas(fecha_emision DESC);
+CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_documento ON salidas_facturas(documento);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_documento_numero ON salidas_facturas(documento, numero_factura);
 CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_codigo_lote ON almacen09_salidas_detalle(codigo_producto, numero_lote);
 CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura);
 
