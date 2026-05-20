@@ -18,6 +18,7 @@ const APP_ROLES = {
   ALMACEN: 'almacen',
   FACTURACION: 'facturacion',
   VENTAS: 'ventas',
+  VENDEDOR: 'vendedor',
 };
 const INITIAL_ADMIN_USERNAMES = ['ATovar', 'EValerio', 'LGil'];
 const INITIAL_ADMIN_PASSWORD = String(process.env.INITIAL_ADMIN_PASSWORD || 'Admin12345');
@@ -158,6 +159,7 @@ function normalizeAuthRole(value) {
   if (role === APP_ROLES.ALMACEN || role === 'almacen') return APP_ROLES.ALMACEN;
   if (role === APP_ROLES.FACTURACION || role === 'facturacion' || role === 'facturación') return APP_ROLES.FACTURACION;
   if (role === APP_ROLES.VENTAS || role === 'ventas' || role === 'venta') return APP_ROLES.VENTAS;
+  if (role === APP_ROLES.VENDEDOR || role === 'vendedor' || role === 'seller') return APP_ROLES.VENDEDOR;
   return '';
 }
 
@@ -166,6 +168,30 @@ function normalizeAuthUsername(value) {
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
     .slice(0, 20);
+}
+
+function normalizeAuthLookupText(value) {
+  return stripDiacritics(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 80);
+}
+
+function vendedorSqlLookupExpression(columnSql) {
+  return `REGEXP_REPLACE(UPPER(TRANSLATE(TRIM(COALESCE(${columnSql}, '')), 'ÁÉÍÓÚÜÑáéíóúüñ', 'AEIOUUNaeiouun')), '[^A-Z0-9]', '', 'g')`;
+}
+
+function appendVendedorAccessFilter(whereParts, params, auth, columnSql = 'vendedor') {
+  if (normalizeAuthRole(auth?.role) !== APP_ROLES.VENDEDOR) return;
+  const username = normalizeAuthUsername(auth?.username);
+  const lookup = normalizeAuthLookupText(auth?.username);
+  params.push(String(auth?.username || '').trim(), username || lookup);
+  const rawIndex = params.length - 1;
+  const lookupIndex = params.length;
+  whereParts.push(`(
+    LOWER(TRIM(COALESCE(${columnSql}, ''))) = LOWER(TRIM($${rawIndex}))
+    OR ${vendedorSqlLookupExpression(columnSql)} = $${lookupIndex}
+  )`);
 }
 
 function hashPassword(password) {
@@ -312,7 +338,7 @@ async function ensureAuthTables() {
     CREATE TABLE IF NOT EXISTS auth_users (
       id_user SERIAL PRIMARY KEY,
       username VARCHAR(20) NOT NULL UNIQUE,
-      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas')),
+      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas', 'vendedor')),
       password_hash TEXT NOT NULL,
       activo BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -340,7 +366,7 @@ async function ensureAuthTables() {
   await pool.query(`
     ALTER TABLE auth_users
     ADD CONSTRAINT auth_users_role_check
-    CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas')) NOT VALID
+    CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas', 'vendedor')) NOT VALID
   `);
 
   // Normalize common role variants (case, whitespace, old names, accents)
@@ -374,11 +400,17 @@ async function ensureAuthTables() {
      WHERE lower(trim(role)) IN ('ventas', 'venta')
   `).catch(() => {});
 
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'vendedor'
+     WHERE lower(trim(role)) IN ('vendedor', 'seller')
+  `).catch(() => {});
+
   // Set any remaining unknown/empty roles to 'almacen' as a safe default
   await pool.query(`
     UPDATE auth_users
        SET role = 'almacen'
-     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','almacen','facturacion','ventas')
+     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','almacen','facturacion','ventas','vendedor')
   `).catch(() => {});
 
   // Now validate the constraint (should succeed after normalization)
@@ -566,7 +598,8 @@ async function listRegisteredUsers(_auth, res) {
            WHEN 'almacen' THEN 1
            WHEN 'facturacion' THEN 2
            WHEN 'ventas' THEN 3
-           WHEN 'produccion' THEN 4
+           WHEN 'vendedor' THEN 4
+           WHEN 'produccion' THEN 5
            ELSE 9
          END,
          username ASC`
@@ -641,6 +674,127 @@ async function deleteAuthUserWithAdmin(auth, targetUser) {
     client.release();
   }
 }
+
+async function updateAuthUserWithAdmin(auth, targetUser, payload) {
+  const username = normalizeAuthUsername(payload?.username);
+  const role = normalizeAuthRole(payload?.role);
+  const password = String(payload?.password || '');
+
+  if (!username || username.length < 2) {
+    return { ok: false, status: 400, error: 'username invÃ¡lido' };
+  }
+  if (!role) {
+    return { ok: false, status: 400, error: 'role invÃ¡lido' };
+  }
+  if (password && password.length < 4) {
+    return { ok: false, status: 400, error: 'password invÃ¡lido' };
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const targetResult = await client.query(
+      `SELECT id_user, username, role
+       FROM auth_users
+       WHERE username = $1
+         AND activo = TRUE
+       LIMIT 1`,
+      [targetUser]
+    );
+
+    if (!targetResult.rowCount) {
+      await client.query('ROLLBACK');
+      return { ok: false, status: 404, error: 'Usuario no encontrado' };
+    }
+
+    const target = targetResult.rows[0];
+    const oldRole = normalizeAuthRole(target.role);
+    if (oldRole === APP_ROLES.ADMIN && role !== APP_ROLES.ADMIN) {
+      const adminsResult = await client.query(
+        `SELECT COUNT(*)::int AS total
+         FROM auth_users
+         WHERE activo = TRUE
+           AND role = 'administrador'`
+      );
+      const adminsTotal = Number(adminsResult.rows[0]?.total || 0);
+      if (adminsTotal <= 1) {
+        await client.query('ROLLBACK');
+        return { ok: false, status: 400, error: 'Debe existir al menos un Administrador activo' };
+      }
+    }
+
+    const fields = ['username = $1', 'role = $2', 'updated_at = NOW()'];
+    const params = [username, role];
+    if (password) {
+      params.push(hashPassword(password));
+      fields.push(`password_hash = $${params.length}`);
+    }
+    params.push(Number(target.id_user));
+
+    const updated = await client.query(
+      `UPDATE auth_users
+          SET ${fields.join(', ')}
+        WHERE id_user = $${params.length}
+        RETURNING id_user, username, role`,
+      params
+    );
+
+    await client.query('COMMIT');
+    const user = updated.rows[0];
+    return {
+      ok: true,
+      payload: {
+        ok: true,
+        user: {
+          username: String(user.username || '').trim(),
+          role: normalizeAuthRole(user.role),
+        },
+        currentUserUpdated: Number(auth.userId) === Number(user.id_user),
+      },
+    };
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    if (error && error.code === '23505') {
+      return { ok: false, status: 409, error: 'Ese usuario ya existe' };
+    }
+    return { ok: false, status: 500, error: error.message };
+  } finally {
+    client.release();
+  }
+}
+
+app.patch('/auth/users/:username', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const targetUser = normalizeAuthUsername(req.params?.username);
+  if (!targetUser) {
+    return res.status(400).json({ ok: false, error: 'username invÃ¡lido' });
+  }
+
+  const result = await updateAuthUserWithAdmin(auth, targetUser, req.body || {});
+  if (!result.ok) {
+    return res.status(result.status).json({ ok: false, error: result.error });
+  }
+  return res.json(result.payload);
+});
+
+app.post('/auth/users/update', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const targetUser = normalizeAuthUsername(req.body?.targetUsername || req.body?.oldUsername || req.body?.username);
+  if (!targetUser) {
+    return res.status(400).json({ ok: false, error: 'username invÃ¡lido' });
+  }
+
+  const result = await updateAuthUserWithAdmin(auth, targetUser, req.body || {});
+  if (!result.ok) {
+    return res.status(result.status).json({ ok: false, error: result.error });
+  }
+  return res.json(result.payload);
+});
 
 app.delete('/auth/users/:username', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
@@ -1358,17 +1512,22 @@ function normalizeSalidasLookupKey(value, maxLength) {
   return normalizeSalidasText(value, maxLength).toLowerCase();
 }
 
-async function listDireccionesByCliente(client, clienteRaw) {
+async function listDireccionesByCliente(client, clienteRaw, auth) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   if (!cliente) return [];
+  const params = [cliente];
+  const whereParts = [
+    `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+    `TRIM(COALESCE(direccion, '')) <> ''`,
+  ];
+  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT TRIM(COALESCE(direccion, '')) AS direccion
      FROM public.clientes
-     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
-       AND TRIM(COALESCE(direccion, '')) <> ''
+     WHERE ${whereParts.join(' AND ')}
      GROUP BY TRIM(COALESCE(direccion, ''))
      ORDER BY TRIM(COALESCE(direccion, '')) ASC`,
-    [cliente]
+    params
   );
   return result.rows
     .map((row) => normalizeSalidasText(row?.direccion, 240))
@@ -1393,20 +1552,25 @@ function normalizeClienteDireccionMeta(row) {
   };
 }
 
-async function listZonasByCliente(client, clienteRaw) {
+async function listZonasByCliente(client, clienteRaw, auth) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   if (!cliente) return [];
+  const params = [cliente];
+  const whereParts = [
+    `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+    `TRIM(COALESCE(zona, '')) <> ''`,
+  ];
+  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(zona, '')) AS zona,
        TRIM(COALESCE(ruta, '')) AS ruta,
        COUNT(*)::int AS total
      FROM public.clientes
-     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
-       AND TRIM(COALESCE(zona, '')) <> ''
+     WHERE ${whereParts.join(' AND ')}
      GROUP BY TRIM(COALESCE(zona, '')), TRIM(COALESCE(ruta, ''))
      ORDER BY TRIM(COALESCE(zona, '')) ASC`,
-    [cliente]
+    params
   );
   const dedupe = new Map();
   result.rows.map(normalizeClienteZonaRow).forEach((row) => {
@@ -1420,10 +1584,17 @@ async function listZonasByCliente(client, clienteRaw) {
   return Array.from(dedupe.values()).sort((a, b) => a.zona.localeCompare(b.zona, 'es', { sensitivity: 'base' }));
 }
 
-async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw) {
+async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   const zona = normalizeSalidasText(zonaRaw, 120);
   if (!cliente || !zona) return [];
+  const params = [cliente, zona];
+  const whereParts = [
+    `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+    `LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))`,
+    `TRIM(COALESCE(direccion, '')) <> ''`,
+  ];
+  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(direccion, '')) AS direccion,
@@ -1432,9 +1603,7 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw) {
        TRIM(COALESCE(transporte, '')) AS transporte,
        TRIM(COALESCE(vendedor, '')) AS vendedor
      FROM public.clientes
-     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
-       AND LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))
-       AND TRIM(COALESCE(direccion, '')) <> ''
+     WHERE ${whereParts.join(' AND ')}
      GROUP BY
        TRIM(COALESCE(direccion, '')),
        TRIM(COALESCE(zona, '')),
@@ -1442,16 +1611,23 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw) {
        TRIM(COALESCE(transporte, '')),
        TRIM(COALESCE(vendedor, ''))
      ORDER BY TRIM(COALESCE(direccion, '')) ASC`,
-    [cliente, zona]
+    params
   );
   return result.rows.map(normalizeClienteDireccionMeta).filter((row) => row.direccion);
 }
 
-async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direccionRaw) {
+async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direccionRaw, auth) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   const zona = normalizeSalidasText(zonaRaw, 120);
   const direccion = normalizeSalidasText(direccionRaw, 240);
   if (!cliente || !zona || !direccion) return null;
+  const params = [cliente, zona, direccion];
+  const whereParts = [
+    `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+    `LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))`,
+    `LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($3))`,
+  ];
+  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(direccion, '')) AS direccion,
@@ -1460,12 +1636,10 @@ async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direcci
        TRIM(COALESCE(transporte, '')) AS transporte,
        TRIM(COALESCE(vendedor, '')) AS vendedor
      FROM public.clientes
-     WHERE LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))
-       AND LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))
-       AND LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($3))
+     WHERE ${whereParts.join(' AND ')}
      ORDER BY TRIM(COALESCE(direccion, '')) ASC
      LIMIT 1`,
-    [cliente, zona, direccion]
+    params
   );
   if (!result.rowCount) return null;
   return normalizeClienteDireccionMeta(result.rows[0]);
@@ -1740,11 +1914,12 @@ app.get('/motivos-merma', async (_req, res) => {
 });
 
 app.get('/api/almacen09/cambios/clientes', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   try {
     const rawQuery = normalizeSalidasText(req.query?.q, 160);
+    const rawRif = normalizeSalidasText(req.query?.rif || req.query?.id_cliente, 40);
     const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 50);
     const params = [];
     const whereParts = ["TRIM(COALESCE(descripcion, '')) <> ''"];
@@ -1753,12 +1928,23 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
       params.push(`%${rawQuery}%`);
       whereParts.push(`descripcion ILIKE $${params.length}`);
     }
+    if (rawRif) {
+      params.push(`%${rawRif}%`);
+      whereParts.push(`CAST(id_cliente AS TEXT) ILIKE $${params.length}`);
+    }
+
+    appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
 
     params.push(limit);
 
     const result = await pool.query(
       `SELECT
          nombre,
+         MIN(id_cliente_text) AS id_cliente,
+         COALESCE(
+           JSON_AGG(DISTINCT id_cliente_text ORDER BY id_cliente_text) FILTER (WHERE id_cliente_text <> ''),
+           '[]'::json
+         ) AS ids_cliente,
          COALESCE(
            JSON_AGG(DISTINCT direccion ORDER BY direccion) FILTER (WHERE direccion <> ''),
            '[]'::json
@@ -1769,12 +1955,14 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
          ) AS zonas
        FROM (
          SELECT
+           TRIM(CAST(id_cliente AS TEXT)) AS id_cliente_text,
            TRIM(descripcion) AS nombre,
            TRIM(COALESCE(direccion, '')) AS direccion,
            TRIM(COALESCE(zona, '')) AS zona
          FROM public.clientes
          WHERE ${whereParts.join(' AND ')}
          GROUP BY
+           TRIM(CAST(id_cliente AS TEXT)),
            TRIM(descripcion),
            TRIM(COALESCE(direccion, '')),
            TRIM(COALESCE(zona, ''))
@@ -1791,7 +1979,7 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
@@ -1802,10 +1990,10 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
   }
 
   try {
-    const zonas = await listZonasByCliente(pool, clienteRaw);
-    const direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw) : [];
+    const zonas = await listZonasByCliente(pool, clienteRaw, auth);
+    const direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw, auth) : [];
     const autofill = direccionRaw
-      ? await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw)
+      ? await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw, auth)
       : null;
     return res.json({
       ok: true,
@@ -1822,7 +2010,7 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
 });
 
 app.get('/api/almacen09/vendedores', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const rawQuery = normalizeSalidasText(req.query?.q, 200);
@@ -1834,6 +2022,7 @@ app.get('/api/almacen09/vendedores', async (req, res) => {
       params.push(`%${rawQuery}%`);
       whereParts.push(`descripcion ILIKE $${params.length}`);
     }
+    appendVendedorAccessFilter(whereParts, params, auth, 'descripcion');
     params.push(limit);
 
     const result = await pool.query(
@@ -1854,7 +2043,7 @@ app.get('/api/almacen09/vendedores', async (req, res) => {
 });
 
 app.get('/api/almacen09/cambios/razones', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   try {
@@ -1870,7 +2059,7 @@ app.get('/api/almacen09/cambios/razones', async (req, res) => {
 });
 
 app.post('/api/almacen09/cambios', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 180);
@@ -1903,6 +2092,23 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     const direccionCatalog = direccionRaw
       ? await upsertSalidasCatalogValue(client, 'direccion', direccionRaw)
       : { id: null, value: '' };
+    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
+      const params = [clienteRaw];
+      const whereParts = [`LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`];
+      if (direccionRaw) {
+        params.push(direccionRaw);
+        whereParts.push(`LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($${params.length}))`);
+      }
+      appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+      const assigned = await client.query(
+        `SELECT 1 FROM public.clientes WHERE ${whereParts.join(' AND ')} LIMIT 1`,
+        params
+      );
+      if (!assigned.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ ok: false, error: 'Cliente no asignado a este vendedor' });
+      }
+    }
     let rutaCambio = '';
     if (clienteRaw && direccionRaw) {
       const rutaResult = await client.query(
@@ -1967,7 +2173,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
 });
 
 app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 180);
@@ -1977,6 +2183,16 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
 
   try {
     const cambioTsVzExpr = `(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
+    const params = [clienteRaw];
+    const vendedorWhereParts = [`LOWER(TRIM(COALESCE(c.descripcion, ''))) = LOWER(TRIM(cr.nombre_cliente))`];
+    appendVendedorAccessFilter(vendedorWhereParts, params, auth, 'c.vendedor');
+    const vendedorGuardSql = normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR
+      ? `AND EXISTS (
+           SELECT 1
+           FROM public.clientes c
+           WHERE ${vendedorWhereParts.join(' AND ')}
+         )`
+      : '';
     const result = await pool.query(
       `SELECT
          cr.id_cambio,
@@ -1997,6 +2213,7 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
          END
        ) WITH ORDINALITY AS item(value, ord)
        WHERE LOWER(TRIM(cr.nombre_cliente)) = LOWER(TRIM($1))
+         ${vendedorGuardSql}
          AND NULLIF(TRIM(item.value->>'codigo'), '') IS NOT NULL
          AND NULLIF(TRIM(item.value->>'producto'), '') IS NOT NULL
          AND COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int > 0
@@ -2007,7 +2224,7 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
              AND UPPER(TRIM(sd.codigo_producto)) = UPPER(TRIM(item.value->>'codigo'))
          )
        ORDER BY cr.created_at DESC, cr.id_cambio DESC, item.ord ASC`,
-      [clienteRaw]
+      params
     );
 
     return res.json({ ok: true, rows: result.rows, total: result.rows.length });
@@ -4090,7 +4307,7 @@ app.post('/api/almacen09/errores-conteo/delete', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas/next-control', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   try {
@@ -4102,7 +4319,7 @@ app.get('/api/almacen09/salidas-facturas/next-control', async (req, res) => {
 });
 
 app.post('/api/almacen09/salidas-facturas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const numeroFacturaRaw = String(req.body?.numero_factura || '').trim();
@@ -4249,7 +4466,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       }
     }
 
-    const direccionMeta = await getExactClienteDireccionMeta(client, clienteRaw, zonaInputRaw, direccionInputRaw);
+    const direccionMeta = await getExactClienteDireccionMeta(client, clienteRaw, zonaInputRaw, direccionInputRaw, auth);
     if (!direccionMeta || !direccionMeta.zona || !direccionMeta.direccion) {
       await client.query('ROLLBACK');
       return res.status(400).json({
@@ -4445,20 +4662,79 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
   }
 });
 
+app.patch('/auth/profile', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  const username = normalizeAuthUsername(req.body?.username);
+  const password = String(req.body?.password || '');
+
+  if (!username || username.length < 2) {
+    return res.status(400).json({ ok: false, error: 'username invÃ¡lido' });
+  }
+  if (password && password.length < 4) {
+    return res.status(400).json({ ok: false, error: 'password invÃ¡lido' });
+  }
+
+  try {
+    const fields = ['username = $1', 'updated_at = NOW()'];
+    const params = [username];
+    if (password) {
+      params.push(hashPassword(password));
+      fields.unshift(`password_hash = $${params.length}`);
+    }
+    params.push(Number(auth.userId));
+
+    const result = await pool.query(
+      `UPDATE auth_users
+          SET ${fields.join(', ')}
+        WHERE id_user = $${params.length}
+          AND activo = TRUE
+        RETURNING id_user, username, role`,
+      params
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: 'Usuario no encontrado' });
+    }
+
+    const row = result.rows[0];
+    return res.json({
+      ok: true,
+      session: buildAuthSessionResponse({
+        token: auth.token,
+        username: row.username,
+        role: row.role,
+        logged_at: auth.loggedAt,
+        expires_at: auth.expiresAt,
+      }),
+    });
+  } catch (error) {
+    if (error && error.code === '23505') {
+      return res.status(409).json({ ok: false, error: 'Ese usuario ya existe' });
+    }
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/api/hoja-ruta/rutas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   try {
+    const params = [];
+    const whereParts = [`TRIM(COALESCE(ruta_nombre, '')) <> ''`];
+    appendVendedorAccessFilter(whereParts, params, auth, 'vendedor_nombre');
     const result = await pool.query(
       `SELECT
          TRIM(COALESCE(ruta_nombre, '')) AS ruta,
          TO_CHAR(MAX(fecha_emision)::date, 'YYYY-MM-DD') AS fecha,
          COUNT(DISTINCT id_factura)::int AS facturas
        FROM salidas_facturas
-       WHERE TRIM(COALESCE(ruta_nombre, '')) <> ''
+       WHERE ${whereParts.join(' AND ')}
        GROUP BY TRIM(COALESCE(ruta_nombre, ''))
-       ORDER BY TRIM(COALESCE(ruta_nombre, '')) ASC`
+       ORDER BY TRIM(COALESCE(ruta_nombre, '')) ASC`,
+      params
     );
     return res.json({ ok: true, rows: result.rows });
   } catch (error) {
@@ -4467,7 +4743,7 @@ app.get('/api/hoja-ruta/rutas', async (req, res) => {
 });
 
 app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const ruta = normalizeSalidasText(req.body?.ruta, 120);
@@ -4495,6 +4771,18 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   }
 
   try {
+    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
+      const routeParams = [ruta];
+      const routeWhereParts = [`LOWER(TRIM(COALESCE(ruta_nombre, ''))) = LOWER(TRIM($1))`];
+      appendVendedorAccessFilter(routeWhereParts, routeParams, auth, 'vendedor_nombre');
+      const assignedRoute = await pool.query(
+        `SELECT 1 FROM salidas_facturas WHERE ${routeWhereParts.join(' AND ')} LIMIT 1`,
+        routeParams
+      );
+      if (!assignedRoute.rowCount) {
+        return res.status(403).json({ ok: false, error: 'Ruta no asignada a este vendedor' });
+      }
+    }
     const result = await pool.query(
       `INSERT INTO hojas_ruta_exportadas (
          ruta_nombre,
@@ -4534,7 +4822,7 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
 });
 
 app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const id = Number(req.params?.id);
@@ -4543,6 +4831,12 @@ app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
   }
 
   try {
+    const params = [id];
+    const whereParts = ['id_hoja = $1'];
+    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
+      params.push(normalizeAuthUsername(auth.username));
+      whereParts.push(`REGEXP_REPLACE(UPPER(TRIM(COALESCE(usuario, ''))), '[^A-Z0-9]', '', 'g') = $${params.length}`);
+    }
     const result = await pool.query(
       `SELECT
          id_hoja,
@@ -4560,8 +4854,8 @@ app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
          COALESCE(nombre_archivo, '') AS nombre_archivo,
          created_at
        FROM hojas_ruta_exportadas
-       WHERE id_hoja = $1`,
-      [id]
+       WHERE ${whereParts.join(' AND ')}`,
+      params
     );
 
     if (!result.rowCount) {
@@ -4574,7 +4868,7 @@ app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
 });
 
 app.get('/api/hoja-ruta', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const ruta = normalizeSalidasText(req.query?.ruta, 120);
@@ -4594,11 +4888,14 @@ app.get('/api/hoja-ruta', async (req, res) => {
     let fechaHasta = hasFechaHasta ? fechaHastaRaw : '';
 
     if (!fechaDesde && !fechaHasta) {
+      const dateParams = [ruta];
+      const dateWhereParts = [`LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`];
+      appendVendedorAccessFilter(dateWhereParts, dateParams, auth, 'sf.vendedor_nombre');
       const dateResult = await pool.query(
         `SELECT TO_CHAR(MAX(sf.fecha_emision)::date, 'YYYY-MM-DD') AS fecha
          FROM salidas_facturas sf
-         WHERE LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`,
-        [ruta]
+         WHERE ${dateWhereParts.join(' AND ')}`,
+        dateParams
       );
       const fecha = dateResult.rows?.[0]?.fecha || null;
       if (!fecha) {
@@ -4618,6 +4915,12 @@ app.get('/api/hoja-ruta', async (req, res) => {
       fechaHasta = tmp;
     }
 
+    const sheetParams = [ruta, fechaDesde, fechaHasta];
+    const sheetWhereParts = [
+      `LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`,
+      `sf.fecha_emision::date BETWEEN $2::date AND $3::date`,
+    ];
+    appendVendedorAccessFilter(sheetWhereParts, sheetParams, auth, 'sf.vendedor_nombre');
     const result = await pool.query(
       `SELECT
          sf.id_factura,
@@ -4641,14 +4944,13 @@ app.get('/api/hoja-ruta', async (req, res) => {
        FROM salidas_facturas sf
        JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
        LEFT JOIN productos p ON p.id_producto = sd.id_producto
-       WHERE LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))
-         AND sf.fecha_emision::date BETWEEN $2::date AND $3::date
+       WHERE ${sheetWhereParts.join(' AND ')}
        ORDER BY
          sf.fecha_emision::date ASC,
          LOWER(TRIM(COALESCE(sf.cliente_nombre, ''))) ASC,
          sf.numero_control ASC,
          sd.id_detalle ASC`,
-      [ruta, fechaDesde, fechaHasta]
+      sheetParams
     );
 
     const facturasMap = new Map();

@@ -45,21 +45,27 @@ async function main() {
   `);
   await pool.query(`
     UPDATE auth_users
+       SET role = 'vendedor'
+     WHERE lower(trim(role)) IN ('vendedor', 'seller')
+  `);
+  await pool.query(`
+    UPDATE auth_users
        SET role = 'almacen'
      WHERE role IS NULL
         OR trim(role) = ''
-        OR lower(trim(role)) NOT IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas')
+        OR lower(trim(role)) NOT IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas', 'vendedor')
   `);
 
   await pool.query(`
     ALTER TABLE auth_users
     ADD CONSTRAINT auth_users_role_check
-    CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas'))
+    CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas', 'vendedor'))
   `);
 
   const users = [
     ['FACTURACION', 'facturacion'],
     ['VENTAS', 'ventas'],
+    ['VENDEDOR', 'vendedor'],
   ];
   for (const [username, role] of users) {
     await pool.query(
@@ -76,8 +82,8 @@ async function main() {
   const result = await pool.query(`
     SELECT username, role, activo
       FROM auth_users
-     WHERE username IN ('ALMACEN', 'FACTURACION', 'VENTAS')
-        OR lower(role) IN ('almacen', 'facturacion', 'ventas')
+     WHERE username IN ('ALMACEN', 'FACTURACION', 'VENTAS', 'VENDEDOR')
+        OR lower(role) IN ('almacen', 'facturacion', 'ventas', 'vendedor')
      ORDER BY username
   `);
 
