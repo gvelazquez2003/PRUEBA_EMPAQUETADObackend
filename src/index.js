@@ -1393,6 +1393,10 @@ async function ensureMermaTables() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_motivos_merma_nombre_unique
+    ON motivos_merma (nombre)
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mermas_cabecera (
