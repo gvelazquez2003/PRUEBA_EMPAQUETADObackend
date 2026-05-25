@@ -469,6 +469,11 @@ async function ensureAuthTables() {
   await pool.query('ALTER TABLE auth_users VALIDATE CONSTRAINT auth_users_username_format_check').catch((err) => {
     console.error('Failed to validate auth_users_username_format_check:', err && err.message ? err.message : err);
   });
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_username_unique
+    ON auth_users (username)
+  `);
 }
 
 async function ensureInitialAdminUsers() {
