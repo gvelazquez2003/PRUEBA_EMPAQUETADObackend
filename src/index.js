@@ -145,6 +145,7 @@ if (!databaseUrl) {
 const pool = new Pool({
   connectionString: databaseUrl,
   ssl: databaseUsesSsl ? { rejectUnauthorized: false } : false,
+  max: Number(process.env.DB_POOL_MAX || 5),
   connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
 });
 
@@ -5228,25 +5229,25 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
   }
 });
 
-Promise.all([
-  ensureAuthTables(),
-  ensureAlmacen09Tables(),
-  ensureCambiosProductosTables(),
-  ensureProductosSoftDelete(),
-  ensureHistoricoResultadosTable(),
-  ensureControlInventarioTable(),
-  ensureMermaTables(),
-  ensureSalidas09Tables(),
-  ensurePerformanceIndexes(),
-  dropLegacyUnusedTables(),
-])
-  .then(async () => {
-    await ensureInitialAdminUsers();
-    app.listen(port, () => {
-      console.log(`Servidor escuchando en puerto ${port}`);
-    });
-  })
-  .catch((error) => {
+async function startServer() {
+  await ensureAuthTables();
+  await ensureAlmacen09Tables();
+  await ensureCambiosProductosTables();
+  await ensureProductosSoftDelete();
+  await ensureHistoricoResultadosTable();
+  await ensureControlInventarioTable();
+  await ensureMermaTables();
+  await ensureSalidas09Tables();
+  await ensurePerformanceIndexes();
+  await dropLegacyUnusedTables();
+  await ensureInitialAdminUsers();
+
+  app.listen(port, () => {
+    console.log(`Servidor escuchando en puerto ${port}`);
+  });
+}
+
+startServer().catch((error) => {
     console.error('No se pudieron preparar las tablas base:', error);
     process.exit(1);
-  });
+});

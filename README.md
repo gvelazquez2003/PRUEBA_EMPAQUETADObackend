@@ -7,6 +7,7 @@ Copia `.env.example` a `.env` y completa:
 - `DATABASE_URL`: cadena PostgreSQL de la base asignada en SPanel.
 - `DB_SSL`: `false` si PostgreSQL de SPanel no tiene TLS configurado; `true` si SPanel habilita SSL.
 - `DB_CONNECT_TIMEOUT_MS`: timeout de conexión al servidor PostgreSQL (ejemplo `10000`).
+- `DB_POOL_MAX`: conexiones simultáneas máximas del backend a PostgreSQL (recomendado `5` en hosting compartido).
 - `PORT`: puerto local (ejemplo `3001`).
 - `NODE_ENV`: `development` o `production`.
 - `ADMIN_KEY`: clave para crear/eliminar productos.
@@ -100,7 +101,7 @@ Notas:
 - Root Directory: dejar vacío (este repo ya es solo backend).
 - Build Command: `npm install`
 - Start Command: `npm start`
-- Variables: `DATABASE_URL`, `DB_SSL`, `DB_CONNECT_TIMEOUT_MS`, `NODE_ENV=production`, `ADMIN_KEY`, `CORS_ORIGIN`
+- Variables: `DATABASE_URL`, `DB_SSL`, `DB_CONNECT_TIMEOUT_MS`, `DB_POOL_MAX`, `NODE_ENV=production`, `ADMIN_KEY`, `CORS_ORIGIN`
 
 Para SPanel sin SSL, usa una URL sin `sslmode` y define `DB_SSL=false`:
 
@@ -108,6 +109,7 @@ Para SPanel sin SSL, usa una URL sin `sslmode` y define `DB_SSL=false`:
 DATABASE_URL=postgresql://admin01_pasante:CAMBIAR_CLAVE@174.136.57.19:5432/admin01_neondbfinal
 DB_SSL=false
 DB_CONNECT_TIMEOUT_MS=10000
+DB_POOL_MAX=5
 NODE_ENV=production
 ADMIN_KEY=CAMBIAR_CLAVE_ADMIN
 CORS_ORIGIN=https://prueba-empaquetad-ofrontend-theta.vercel.app
