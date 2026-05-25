@@ -1325,8 +1325,20 @@ async function ensureSalidas09Tables() {
     ON salidas_facturas (fecha_emision DESC)
   `);
 
-  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_numero_control ON salidas_facturas(numero_control)');
-  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_documento_numero ON salidas_facturas(documento, numero_factura)');
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_numero_control ON salidas_facturas(numero_control)'
+  ).catch(async (error) => {
+    if (error?.code !== '23505') throw error;
+    console.log('[startup] Hay numeros de control historicos duplicados; se conservaran y se bloquearan duplicados nuevos desde la API.');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_numero_control_lookup ON salidas_facturas(numero_control)');
+  });
+  await pool.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas09_facturas_documento_numero ON salidas_facturas(documento, numero_factura)'
+  ).catch(async (error) => {
+    if (error?.code !== '23505') throw error;
+    console.log('[startup] Hay seriales de documento historicos duplicados; se conservaran y se bloquearan duplicados nuevos desde la API.');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_documento_numero_lookup ON salidas_facturas(documento, numero_factura)');
+  });
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_documento ON salidas_facturas(documento)');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_salidas_cliente_sucursal_key ON salidas_cliente_sucursales(cliente_key, sucursal_key)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas_cliente_sucursal_updated ON salidas_cliente_sucursales(updated_at DESC)');
