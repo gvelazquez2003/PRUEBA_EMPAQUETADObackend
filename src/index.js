@@ -132,9 +132,20 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
+const databaseUrl = String(process.env.DATABASE_URL || '').trim();
+const dbSslValue = String(process.env.DB_SSL || '').trim().toLowerCase();
+const databaseUsesSsl = dbSslValue
+  ? ['true', '1', 'yes', 'require'].includes(dbSslValue)
+  : process.env.NODE_ENV === 'production';
+
+if (!databaseUrl) {
+  throw new Error('Falta DATABASE_URL en las variables de entorno.');
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  connectionString: databaseUrl,
+  ssl: databaseUsesSsl ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
 });
 
 function combineFechaHora(fecha, hora) {

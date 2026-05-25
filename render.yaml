@@ -9,6 +9,10 @@ services:
         value: production
       - key: DATABASE_URL
         sync: false
+      - key: DB_SSL
+        value: "false"
+      - key: DB_CONNECT_TIMEOUT_MS
+        value: "10000"
       - key: ADMIN_KEY
         sync: false
       - key: CORS_ORIGIN

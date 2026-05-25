@@ -1,10 +1,12 @@
-# Backend Node + Neon (Render)
+# Backend Node + PostgreSQL SPanel (Render)
 
 ## 1) Variables de entorno
 
 Copia `.env.example` a `.env` y completa:
 
-- `DATABASE_URL`: string de conexión de Neon.
+- `DATABASE_URL`: cadena PostgreSQL de la base asignada en SPanel.
+- `DB_SSL`: `false` si PostgreSQL de SPanel no tiene TLS configurado; `true` si SPanel habilita SSL.
+- `DB_CONNECT_TIMEOUT_MS`: timeout de conexión al servidor PostgreSQL (ejemplo `10000`).
 - `PORT`: puerto local (ejemplo `3001`).
 - `NODE_ENV`: `development` o `production`.
 - `ADMIN_KEY`: clave para crear/eliminar productos.
@@ -17,9 +19,9 @@ npm install
 npm run dev
 ```
 
-## 3) Inicializar DB en Neon
+## 3) Inicializar DB en PostgreSQL
 
-Ejecuta el archivo `schema.sql` en tu proyecto de Neon.
+Ejecuta el archivo `schema.sql` en tu base PostgreSQL.
 
 Si ya tienes una base en producción y solo quieres optimizar sin reset total, ejecuta `optimize_neon.sql`.
 
@@ -61,7 +63,7 @@ Si tu tabla está en otra ruta o esquema, puedes pasar la ruta del CSV, el esque
 - `GET /auth/users`
 - `DELETE /auth/users/:username`
 
-## 5) Estructura Neon optimizada
+## 5) Estructura PostgreSQL optimizada
 
 Tablas activas por dominio:
 
@@ -98,4 +100,18 @@ Notas:
 - Root Directory: dejar vacío (este repo ya es solo backend).
 - Build Command: `npm install`
 - Start Command: `npm start`
-- Variables: `DATABASE_URL`, `NODE_ENV=production`, `ADMIN_KEY`, `CORS_ORIGIN`
+- Variables: `DATABASE_URL`, `DB_SSL`, `DB_CONNECT_TIMEOUT_MS`, `NODE_ENV=production`, `ADMIN_KEY`, `CORS_ORIGIN`
+
+Para SPanel sin SSL, usa una URL sin `sslmode` y define `DB_SSL=false`:
+
+```env
+DATABASE_URL=postgresql://admin01_pasante:CAMBIAR_CLAVE@174.136.57.19:5432/admin01_neondbfinal
+DB_SSL=false
+DB_CONNECT_TIMEOUT_MS=10000
+NODE_ENV=production
+ADMIN_KEY=CAMBIAR_CLAVE_ADMIN
+CORS_ORIGIN=https://prueba-empaquetad-ofrontend-theta.vercel.app
+```
+
+El usuario PostgreSQL debe estar asignado a `admin01_neondbfinal` y SPanel debe permitir conexiones desde los rangos IP de salida del servicio Render.
+En Render no agregues `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` ni `DB_PORT`: el backend usa `DATABASE_URL`. Tampoco es necesario fijar `PORT`; Render lo proporciona al servicio.
