@@ -5234,17 +5234,30 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
 });
 
 async function startServer() {
-  await ensureAuthTables();
-  await ensureAlmacen09Tables();
-  await ensureCambiosProductosTables();
-  await ensureProductosSoftDelete();
-  await ensureHistoricoResultadosTable();
-  await ensureControlInventarioTable();
-  await ensureMermaTables();
-  await ensureSalidas09Tables();
-  await ensurePerformanceIndexes();
-  await dropLegacyUnusedTables();
-  await ensureInitialAdminUsers();
+  const startupSteps = [
+    ['ensureAuthTables', ensureAuthTables],
+    ['ensureAlmacen09Tables', ensureAlmacen09Tables],
+    ['ensureCambiosProductosTables', ensureCambiosProductosTables],
+    ['ensureProductosSoftDelete', ensureProductosSoftDelete],
+    ['ensureHistoricoResultadosTable', ensureHistoricoResultadosTable],
+    ['ensureControlInventarioTable', ensureControlInventarioTable],
+    ['ensureMermaTables', ensureMermaTables],
+    ['ensureSalidas09Tables', ensureSalidas09Tables],
+    ['ensurePerformanceIndexes', ensurePerformanceIndexes],
+    ['dropLegacyUnusedTables', dropLegacyUnusedTables],
+    ['ensureInitialAdminUsers', ensureInitialAdminUsers],
+  ];
+
+  for (const [stepName, step] of startupSteps) {
+    console.log(`[startup] Ejecutando ${stepName}`);
+    try {
+      await step();
+      console.log(`[startup] Completado ${stepName}`);
+    } catch (error) {
+      error.startupStep = stepName;
+      throw error;
+    }
+  }
 
   app.listen(port, () => {
     console.log(`Servidor escuchando en puerto ${port}`);
@@ -5252,6 +5265,9 @@ async function startServer() {
 }
 
 startServer().catch((error) => {
-    console.error('No se pudieron preparar las tablas base:', error);
-    process.exit(1);
+  const step = error?.startupStep || 'desconocido';
+  const message = error?.message || String(error);
+  console.log(`[startup] Fallo en ${step}: ${message}`);
+  console.error('No se pudieron preparar las tablas base:', error);
+  process.exit(1);
 });
