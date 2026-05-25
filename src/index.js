@@ -1188,7 +1188,7 @@ async function ensureSalidas09Tables() {
   await pool.query(`UPDATE almacen09_vendedores SET descripcion = COALESCE(NULLIF(TRIM(descripcion), ''), NULLIF(TRIM(nombre), '')) WHERE COALESCE(TRIM(descripcion), '') = ''`).catch(() => {});
   await pool.query(`UPDATE almacen09_vendedores SET nombre = COALESCE(NULLIF(TRIM(nombre), ''), NULLIF(TRIM(descripcion), '')) WHERE COALESCE(TRIM(nombre), '') = ''`).catch(() => {});
   await pool.query(`ALTER TABLE almacen09_vendedores ALTER COLUMN descripcion SET NOT NULL`).catch(() => {});
-  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_almacen09_vendedores_codigo ON almacen09_vendedores(codigo_ven)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_almacen09_vendedores_codigo ON almacen09_vendedores(codigo_ven)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_almacen09_vendedores_descripcion ON almacen09_vendedores(LOWER(TRIM(descripcion)))`);
 
   await pool.query(`
