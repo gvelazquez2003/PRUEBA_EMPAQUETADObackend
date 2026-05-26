@@ -2042,7 +2042,15 @@ app.get('/health', async (_req, res) => {
 
 app.get('/destinos', async (_req, res) => {
   try {
-    const result = await pool.query('SELECT id_destino, nombre FROM destinos ORDER BY nombre');
+    const result = await pool.query(
+      `SELECT id_destino, nombre
+       FROM (
+         SELECT DISTINCT ON (id_destino) *
+         FROM destinos
+         ORDER BY id_destino
+       ) destinos_unicos
+       ORDER BY nombre`
+    );
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -2053,7 +2061,11 @@ app.get('/sedes', async (_req, res) => {
   try {
     const result = await pool.query(
       `SELECT id_sede, nombre
-       FROM sedes
+       FROM (
+         SELECT DISTINCT ON (id_sede) *
+         FROM sedes
+         ORDER BY id_sede
+       ) sedes_unicas
        WHERE UPPER(TRIM(COALESCE(nombre, ''))) <> 'SEDE PRINCIPAL'
        ORDER BY nombre`
     );
@@ -2067,7 +2079,11 @@ app.get('/responsables', async (_req, res) => {
   try {
     const result = await pool.query(
       `SELECT id_responsable, nombre_completo
-       FROM responsables
+       FROM (
+         SELECT DISTINCT ON (id_responsable) *
+         FROM responsables
+         ORDER BY id_responsable
+       ) responsables_unicos
        WHERE UPPER(TRIM(COALESCE(nombre_completo, ''))) <> 'USUARIO PRUEBA MASIVA'
        ORDER BY nombre_completo`
     );
@@ -2081,7 +2097,11 @@ app.get('/motivos-merma', async (_req, res) => {
   try {
     const result = await pool.query(
       `SELECT id_motivo, nombre
-       FROM motivos_merma
+       FROM (
+         SELECT DISTINCT ON (id_motivo) *
+         FROM motivos_merma
+         ORDER BY id_motivo
+       ) motivos_unicos
        ORDER BY nombre ASC`
     );
     res.json(result.rows);
@@ -2422,7 +2442,11 @@ async function resolveResponsableIdFromAuth(client, auth) {
 
   const existing = await client.query(
     `SELECT id_responsable
-     FROM responsables
+     FROM (
+       SELECT DISTINCT ON (id_responsable) *
+       FROM responsables
+       ORDER BY id_responsable
+     ) responsables_unicos
      WHERE LOWER(TRIM(nombre_completo)) = LOWER(TRIM($1))
      LIMIT 1`,
     [username]
@@ -2486,7 +2510,11 @@ app.post('/api/mermas', async (req, res) => {
 
     const sedeResult = await client.query(
       `SELECT id_sede
-       FROM sedes
+       FROM (
+         SELECT DISTINCT ON (id_sede) *
+         FROM sedes
+         ORDER BY id_sede
+       ) sedes_unicas
        WHERE id_sede = $1
        LIMIT 1`,
       [idSede]
@@ -2498,7 +2526,11 @@ app.post('/api/mermas', async (req, res) => {
 
     const productResult = await client.query(
       `SELECT id_producto, codigo_producto, descripcion
-       FROM productos
+       FROM (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) productos_unicos
        WHERE COALESCE(activo, TRUE) = TRUE
          AND id_producto = ANY($1::int[])`,
       [productIds]
@@ -2512,7 +2544,11 @@ app.post('/api/mermas', async (req, res) => {
 
     const motivoResult = await client.query(
       `SELECT id_motivo, nombre
-       FROM motivos_merma
+       FROM (
+         SELECT DISTINCT ON (id_motivo) *
+         FROM motivos_merma
+         ORDER BY id_motivo
+       ) motivos_unicos
        WHERE LOWER(TRIM(nombre)) = ANY($1::text[])
        ORDER BY nombre ASC`,
       [motivos.map((motivo) => motivo.toLowerCase())]
@@ -2605,7 +2641,11 @@ app.get('/productos', async (req, res) => {
         unidad_primaria,
         paquetes AS paquetes_por_cesta,
         sobre_piso
-      FROM productos
+      FROM (
+        SELECT DISTINCT ON (id_producto) *
+        FROM productos
+        ORDER BY id_producto
+      ) productos_unicos
       ${whereSql}
       ORDER BY codigo_producto ASC
     `;
@@ -2622,7 +2662,13 @@ app.get('/productos', async (req, res) => {
       );
 
       const countResult = await pool.query(
-        `SELECT COUNT(*)::INT AS total FROM productos ${whereSql}`,
+        `SELECT COUNT(*)::INT AS total
+         FROM (
+           SELECT DISTINCT ON (id_producto) *
+           FROM productos
+           ORDER BY id_producto
+         ) productos_unicos
+         ${whereSql}`,
         params
       );
       const total = Number(countResult.rows?.[0]?.total || 0);
@@ -2656,7 +2702,11 @@ app.get('/api/control-inventario/producto-barcode', async (req, res) => {
          codigo_producto,
          descripcion,
          codigo_barras
-       FROM productos
+       FROM (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) productos_unicos
        WHERE COALESCE(activo, TRUE) = TRUE
          AND (
            UPPER(TRIM(COALESCE(codigo_barras, ''))) = UPPER(TRIM($1))
@@ -2963,7 +3013,11 @@ app.get('/api/control-inventario/lotes', async (req, res) => {
          FROM validaciones_unicas alp
          JOIN empaquetados_cabecera ec
            ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
-         JOIN destinos d ON d.id_destino = ec.id_destino
+         JOIN (
+           SELECT DISTINCT ON (id_destino) *
+           FROM destinos
+           ORDER BY id_destino
+         ) d ON d.id_destino = ec.id_destino
          JOIN (
            SELECT DISTINCT ON (id_detalle) *
            FROM empaquetados_detalle
@@ -3059,7 +3113,11 @@ app.post('/api/control-inventario', async (req, res) => {
 
     const productResult = await client.query(
       `SELECT id_producto
-       FROM productos
+       FROM (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) productos_unicos
        WHERE COALESCE(activo, TRUE) = TRUE
          AND id_producto = ANY($1::int[])`,
       [productIds]
@@ -3423,7 +3481,11 @@ app.get('/api/registros', async (req, res) => {
           ORDER BY id_detalle
         ) md
         JOIN mermas_cabecera mc ON mc.id_merma = md.id_merma
-        JOIN responsables r ON r.id_responsable = mc.id_responsable
+        JOIN (
+          SELECT DISTINCT ON (id_responsable) *
+          FROM responsables
+          ORDER BY id_responsable
+        ) r ON r.id_responsable = mc.id_responsable
         ${whereClause}
         ORDER BY mc.fecha_hora DESC, md.id_detalle DESC
         LIMIT $${params.length - 1}
@@ -3506,7 +3568,11 @@ app.get('/api/registros', async (req, res) => {
            FROM control_inventario_guardia
            ORDER BY id_control
          ) cg
-         JOIN productos p ON p.id_producto = cg.id_producto
+         JOIN (
+           SELECT DISTINCT ON (id_producto) *
+           FROM productos
+           ORDER BY id_producto
+         ) p ON p.id_producto = cg.id_producto
          ${whereClause}
          ORDER BY cg.created_at DESC, cg.id_control DESC
          LIMIT $${params.length - 1}
@@ -3603,10 +3669,26 @@ app.get('/api/registros', async (req, res) => {
             ORDER BY id_detalle
           ) ed
           JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-          JOIN productos p ON p.id_producto = ed.id_producto
-          JOIN destinos d ON d.id_destino = ec.id_destino
-          JOIN responsables r ON r.id_responsable = ec.id_responsable
-          JOIN sedes s ON s.id_sede = ec.id_sede
+          JOIN (
+            SELECT DISTINCT ON (id_producto) *
+            FROM productos
+            ORDER BY id_producto
+          ) p ON p.id_producto = ed.id_producto
+          JOIN (
+            SELECT DISTINCT ON (id_destino) *
+            FROM destinos
+            ORDER BY id_destino
+          ) d ON d.id_destino = ec.id_destino
+          JOIN (
+            SELECT DISTINCT ON (id_responsable) *
+            FROM responsables
+            ORDER BY id_responsable
+          ) r ON r.id_responsable = ec.id_responsable
+          JOIN (
+            SELECT DISTINCT ON (id_sede) *
+            FROM sedes
+            ORDER BY id_sede
+          ) s ON s.id_sede = ec.id_sede
           LEFT JOIN LATERAL (
             SELECT alp_latest.estado, alp_latest.processed_at
             FROM almacen_lotes_procesados alp_latest
@@ -3647,6 +3729,11 @@ app.get('/api/registros', async (req, res) => {
           SELECT * FROM actual
           UNION ALL
           SELECT * FROM historico
+        ),
+        filas_unicas AS (
+          SELECT DISTINCT ON ("__ROW_SOURCE", "__ROW_ID") *
+          FROM unificado
+          ORDER BY "__ROW_SOURCE", "__ROW_ID", "__ORDER_TS" DESC NULLS LAST
         )
         SELECT
           "__ROW_ID",
@@ -3662,7 +3749,7 @@ app.get('/api/registros', async (req, res) => {
           "RESPONSABLE",
           "SEDE",
           "NUMERO DE LOTE"
-        FROM unificado
+        FROM filas_unicas
         ORDER BY "__ORDER_TS" DESC NULLS LAST
         LIMIT $${params.length - 1}
         OFFSET $${params.length}`,
@@ -3742,8 +3829,16 @@ app.get('/api/registros', async (req, res) => {
              ORDER BY id_detalle
            ) ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-           JOIN destinos d ON d.id_destino = ec.id_destino
-           JOIN productos p ON p.id_producto = ed.id_producto
+           JOIN (
+             SELECT DISTINCT ON (id_destino) *
+             FROM destinos
+             ORDER BY id_destino
+           ) d ON d.id_destino = ec.id_destino
+           JOIN (
+             SELECT DISTINCT ON (id_producto) *
+             FROM productos
+             ORDER BY id_producto
+           ) p ON p.id_producto = ed.id_producto
            WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
              AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
            GROUP BY ec.id_cabecera, ec.numero_registro
@@ -3852,8 +3947,16 @@ app.get('/api/registros', async (req, res) => {
              ORDER BY id_detalle
            ) ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-            JOIN destinos d ON d.id_destino = ec.id_destino
-           JOIN productos p ON p.id_producto = ed.id_producto
+            JOIN (
+              SELECT DISTINCT ON (id_destino) *
+              FROM destinos
+              ORDER BY id_destino
+            ) d ON d.id_destino = ec.id_destino
+           JOIN (
+             SELECT DISTINCT ON (id_producto) *
+             FROM productos
+             ORDER BY id_producto
+           ) p ON p.id_producto = ed.id_producto
             ${([`UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'`, ...whereEmpa]).length ? `WHERE ${[`UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'`, ...whereEmpa].join(' AND ')}` : ''}
          ),
            empa_reg AS (
@@ -3870,8 +3973,16 @@ app.get('/api/registros', async (req, res) => {
              ORDER BY id_detalle
            ) ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-             JOIN destinos d ON d.id_destino = ec.id_destino
-           JOIN productos p ON p.id_producto = ed.id_producto
+             JOIN (
+               SELECT DISTINCT ON (id_destino) *
+               FROM destinos
+               ORDER BY id_destino
+             ) d ON d.id_destino = ec.id_destino
+           JOIN (
+             SELECT DISTINCT ON (id_producto) *
+             FROM productos
+             ORDER BY id_producto
+           ) p ON p.id_producto = ed.id_producto
            WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
                AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
              GROUP BY ec.id_cabecera, ec.numero_registro
@@ -3967,10 +4078,26 @@ app.get('/api/registros', async (req, res) => {
         ORDER BY id_detalle
       ) ed
       JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-      JOIN productos p ON p.id_producto = ed.id_producto
-      JOIN destinos d ON d.id_destino = ec.id_destino
-      JOIN responsables r ON r.id_responsable = ec.id_responsable
-      JOIN sedes s ON s.id_sede = ec.id_sede
+      JOIN (
+        SELECT DISTINCT ON (id_producto) *
+        FROM productos
+        ORDER BY id_producto
+      ) p ON p.id_producto = ed.id_producto
+      JOIN (
+        SELECT DISTINCT ON (id_destino) *
+        FROM destinos
+        ORDER BY id_destino
+      ) d ON d.id_destino = ec.id_destino
+      JOIN (
+        SELECT DISTINCT ON (id_responsable) *
+        FROM responsables
+        ORDER BY id_responsable
+      ) r ON r.id_responsable = ec.id_responsable
+      JOIN (
+        SELECT DISTINCT ON (id_sede) *
+        FROM sedes
+        ORDER BY id_sede
+      ) s ON s.id_sede = ec.id_sede
       ${whereClause}
       ORDER BY ec.fecha_hora DESC, ed.id_detalle DESC
       LIMIT $${params.length}`,
@@ -4193,7 +4320,11 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
            ORDER BY id_detalle
          ) ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-         JOIN destinos d ON d.id_destino = ec.id_destino
+         JOIN (
+           SELECT DISTINCT ON (id_destino) *
+           FROM destinos
+           ORDER BY id_destino
+         ) d ON d.id_destino = ec.id_destino
           WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
             AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
             AND ec.fecha_hora::date = (NOW() AT TIME ZONE 'America/Caracas')::date
@@ -4229,7 +4360,11 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
            ORDER BY p.lote_referencia, pr.codigo_producto
          ) AS productos
        FROM pendientes p
-       JOIN productos pr ON pr.id_producto = p.id_producto
+       JOIN (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) pr ON pr.id_producto = p.id_producto
        GROUP BY p.codigo_lote
        ORDER BY MAX(p.fecha_hora) ASC`
     );
@@ -4281,8 +4416,16 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
          ORDER BY id_detalle
        ) ed
        JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-       JOIN destinos d ON d.id_destino = ec.id_destino
-       JOIN productos p ON p.id_producto = ed.id_producto
+       JOIN (
+         SELECT DISTINCT ON (id_destino) *
+         FROM destinos
+         ORDER BY id_destino
+       ) d ON d.id_destino = ec.id_destino
+       JOIN (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) p ON p.id_producto = ed.id_producto
        WHERE ec.id_cabecera = $1
          AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
          AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
@@ -4412,7 +4555,11 @@ app.post('/api/almacen09/borrar-lotes', async (req, res) => {
            ORDER BY id_detalle
          ) ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
-         JOIN destinos d ON d.id_destino = ec.id_destino
+         JOIN (
+           SELECT DISTINCT ON (id_destino) *
+           FROM destinos
+           ORDER BY id_destino
+         ) d ON d.id_destino = ec.id_destino
          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
          GROUP BY ec.id_cabecera
@@ -4529,7 +4676,11 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
            FROM empaquetados_detalle
            ORDER BY id_detalle
          ) ed ON ed.id_cabecera = ec.id_cabecera
-         JOIN destinos d ON d.id_destino = ec.id_destino
+         JOIN (
+           SELECT DISTINCT ON (id_destino) *
+           FROM destinos
+           ORDER BY id_destino
+         ) d ON d.id_destino = ec.id_destino
          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
          GROUP BY ec.id_cabecera
@@ -4681,7 +4832,11 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 
     const productsResult = await client.query(
       `SELECT id_producto, UPPER(TRIM(codigo_producto)) AS codigo_producto, descripcion
-       FROM productos
+       FROM (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) productos_unicos
        WHERE UPPER(TRIM(codigo_producto)) = ANY($1::text[])`,
       [distinctCodigos]
     );
@@ -5266,7 +5421,11 @@ app.get('/api/hoja-ruta', async (req, res) => {
          FROM almacen09_salidas_detalle
          ORDER BY id_detalle
        ) sd ON sd.id_factura = sf.id_factura
-       LEFT JOIN productos p ON p.id_producto = sd.id_producto
+       LEFT JOIN (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) p ON p.id_producto = sd.id_producto
        WHERE ${sheetWhereParts.join(' AND ')}
        ORDER BY
          sf.fecha_emision::date ASC,
@@ -5431,13 +5590,21 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
          FROM validaciones_unicas alp
          JOIN empaquetados_cabecera ec
            ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
-         JOIN destinos d ON d.id_destino = ec.id_destino
+         JOIN (
+           SELECT DISTINCT ON (id_destino) *
+           FROM destinos
+           ORDER BY id_destino
+         ) d ON d.id_destino = ec.id_destino
          JOIN (
            SELECT DISTINCT ON (id_detalle) *
            FROM empaquetados_detalle
            ORDER BY id_detalle
          ) ed ON ed.id_cabecera = ec.id_cabecera
-         JOIN productos p ON p.id_producto = ed.id_producto
+         JOIN (
+           SELECT DISTINCT ON (id_producto) *
+           FROM productos
+           ORDER BY id_producto
+         ) p ON p.id_producto = ed.id_producto
          WHERE DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
            AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'

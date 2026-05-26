@@ -5,6 +5,72 @@ CREATE TEMP TABLE duplicate_cleanup_report (
   deleted_rows BIGINT NOT NULL
 ) ON COMMIT DROP;
 
+-- Catalogos restaurados con IDs repetidos multiplican los resultados al hacer JOIN.
+WITH ranked AS (
+  SELECT ctid, ROW_NUMBER() OVER (PARTITION BY id_producto ORDER BY ctid) AS duplicate_number
+  FROM productos
+),
+deleted AS (
+  DELETE FROM productos t
+  USING ranked d
+  WHERE t.ctid = d.ctid AND d.duplicate_number > 1
+  RETURNING t.id_producto
+)
+INSERT INTO duplicate_cleanup_report
+SELECT 'Catalogo - productos por ID', COUNT(*) FROM deleted;
+
+WITH ranked AS (
+  SELECT ctid, ROW_NUMBER() OVER (PARTITION BY id_destino ORDER BY ctid) AS duplicate_number
+  FROM destinos
+),
+deleted AS (
+  DELETE FROM destinos t
+  USING ranked d
+  WHERE t.ctid = d.ctid AND d.duplicate_number > 1
+  RETURNING t.id_destino
+)
+INSERT INTO duplicate_cleanup_report
+SELECT 'Catalogo - destinos por ID', COUNT(*) FROM deleted;
+
+WITH ranked AS (
+  SELECT ctid, ROW_NUMBER() OVER (PARTITION BY id_responsable ORDER BY ctid) AS duplicate_number
+  FROM responsables
+),
+deleted AS (
+  DELETE FROM responsables t
+  USING ranked d
+  WHERE t.ctid = d.ctid AND d.duplicate_number > 1
+  RETURNING t.id_responsable
+)
+INSERT INTO duplicate_cleanup_report
+SELECT 'Catalogo - responsables por ID', COUNT(*) FROM deleted;
+
+WITH ranked AS (
+  SELECT ctid, ROW_NUMBER() OVER (PARTITION BY id_sede ORDER BY ctid) AS duplicate_number
+  FROM sedes
+),
+deleted AS (
+  DELETE FROM sedes t
+  USING ranked d
+  WHERE t.ctid = d.ctid AND d.duplicate_number > 1
+  RETURNING t.id_sede
+)
+INSERT INTO duplicate_cleanup_report
+SELECT 'Catalogo - sedes por ID', COUNT(*) FROM deleted;
+
+WITH ranked AS (
+  SELECT ctid, ROW_NUMBER() OVER (PARTITION BY id_motivo ORDER BY ctid) AS duplicate_number
+  FROM motivos_merma
+),
+deleted AS (
+  DELETE FROM motivos_merma t
+  USING ranked d
+  WHERE t.ctid = d.ctid AND d.duplicate_number > 1
+  RETURNING t.id_motivo
+)
+INSERT INTO duplicate_cleanup_report
+SELECT 'Catalogo - motivos por ID', COUNT(*) FROM deleted;
+
 -- Una restauracion sin claves primarias puede copiar la misma fila con el mismo ID.
 WITH ranked AS (
   SELECT ctid, ROW_NUMBER() OVER (PARTITION BY id_detalle ORDER BY ctid) AS duplicate_number
@@ -400,6 +466,11 @@ SELECT 'Errores de Conteo', COUNT(*) FROM deleted;
 
 CREATE UNIQUE INDEX IF NOT EXISTS repair_empaquetados_cabecera_id_unique ON empaquetados_cabecera (id_cabecera);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_empaquetados_detalle_id_unique ON empaquetados_detalle (id_detalle);
+CREATE UNIQUE INDEX IF NOT EXISTS repair_productos_id_unique ON productos (id_producto);
+CREATE UNIQUE INDEX IF NOT EXISTS repair_destinos_id_unique ON destinos (id_destino);
+CREATE UNIQUE INDEX IF NOT EXISTS repair_responsables_id_unique ON responsables (id_responsable);
+CREATE UNIQUE INDEX IF NOT EXISTS repair_sedes_id_unique ON sedes (id_sede);
+CREATE UNIQUE INDEX IF NOT EXISTS repair_motivos_id_unique ON motivos_merma (id_motivo);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_mermas_cabecera_id_unique ON mermas_cabecera (id_merma);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_mermas_detalle_id_unique ON mermas_detalle (id_detalle);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_control_inventario_id_unique ON control_inventario_guardia (id_control);
@@ -412,6 +483,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS repair_almacen_lotes_codigo_unique ON almacen_
 
 SELECT setval(pg_get_serial_sequence('empaquetados_cabecera', 'id_cabecera'), COALESCE(MAX(id_cabecera), 1), COUNT(*) > 0) FROM empaquetados_cabecera;
 SELECT setval(pg_get_serial_sequence('empaquetados_detalle', 'id_detalle'), COALESCE(MAX(id_detalle), 1), COUNT(*) > 0) FROM empaquetados_detalle;
+SELECT setval(pg_get_serial_sequence('productos', 'id_producto'), COALESCE(MAX(id_producto), 1), COUNT(*) > 0) FROM productos;
+SELECT setval(pg_get_serial_sequence('destinos', 'id_destino'), COALESCE(MAX(id_destino), 1), COUNT(*) > 0) FROM destinos;
+SELECT setval(pg_get_serial_sequence('responsables', 'id_responsable'), COALESCE(MAX(id_responsable), 1), COUNT(*) > 0) FROM responsables;
+SELECT setval(pg_get_serial_sequence('sedes', 'id_sede'), COALESCE(MAX(id_sede), 1), COUNT(*) > 0) FROM sedes;
+SELECT setval(pg_get_serial_sequence('motivos_merma', 'id_motivo'), COALESCE(MAX(id_motivo), 1), COUNT(*) > 0) FROM motivos_merma;
 SELECT setval(pg_get_serial_sequence('mermas_cabecera', 'id_merma'), COALESCE(MAX(id_merma), 1), COUNT(*) > 0) FROM mermas_cabecera;
 SELECT setval(pg_get_serial_sequence('mermas_detalle', 'id_detalle'), COALESCE(MAX(id_detalle), 1), COUNT(*) > 0) FROM mermas_detalle;
 SELECT setval(pg_get_serial_sequence('control_inventario_guardia', 'id_control'), COALESCE(MAX(id_control), 1), COUNT(*) > 0) FROM control_inventario_guardia;
