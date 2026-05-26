@@ -2433,14 +2433,11 @@ async function getAlmacen09StockActualRows(db, options = {}) {
     ? [...new Set(options.codigos.map((value) => String(value || '').trim().toUpperCase()).filter(Boolean))]
     : [];
   const loteFiltro = String(options.loteFiltro || '').trim().toLowerCase();
-  const incluirCambio = Number.isInteger(Number(options.incluirCambio)) && Number(options.incluirCambio) > 0
-    ? Number(options.incluirCambio)
-    : 0;
   const rawLimit = Number(options.limit);
   const hasLimit = Number.isFinite(rawLimit) && rawLimit > 0;
   const limit = hasLimit ? Math.min(Math.max(Math.floor(rawLimit), 1), 4000) : 0;
 
-  const params = [desde, incluirCambio];
+  const params = [desde];
   let dynamicWhere = '';
 
   if (codigo) {
@@ -2505,7 +2502,7 @@ async function getAlmacen09StockActualRows(db, options = {}) {
          AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
        GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
      ),
-     salidas_directas AS (
+     salidas AS (
        SELECT
          UPPER(TRIM(sd.codigo_producto)) AS codigo_producto,
          UPPER(TRIM(sd.numero_lote)) AS numero_lote,
@@ -2521,50 +2518,7 @@ async function getAlmacen09StockActualRows(db, options = {}) {
          ORDER BY id_factura
        ) sf ON sf.id_factura = sd.id_factura
        WHERE DATE(sf.fecha_emision) >= $1
-         AND (
-           sd.id_cambio IS NULL
-           OR NOT EXISTS (
-             SELECT 1
-             FROM cambios_registros cr
-             WHERE cr.id_cambio = sd.id_cambio
-               AND DATE(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
-           )
-         )
        GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
-     ),
-     cambios_facturados AS (
-       SELECT
-         UPPER(TRIM(sd.codigo_producto)) AS codigo_producto,
-         UPPER(TRIM(sd.numero_lote)) AS numero_lote,
-         SUM(sd.cantidad)::int AS cantidad_cambio
-       FROM almacen09_salidas_detalle sd
-       JOIN cambios_registros cr ON cr.id_cambio = sd.id_cambio
-       WHERE DATE(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
-       GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
-     ),
-     cambios_pendientes AS (
-       SELECT
-         UPPER(TRIM(item.value->>'codigo')) AS codigo_producto,
-         SUM(COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int)::int AS cantidad_cambio
-       FROM cambios_registros cr
-       CROSS JOIN LATERAL jsonb_array_elements(
-         CASE
-           WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
-           WHEN jsonb_typeof(cr.producto) = 'object' THEN jsonb_build_array(cr.producto)
-           ELSE '[]'::jsonb
-         END
-       ) AS item(value)
-       WHERE DATE(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
-         AND ($2::bigint = 0 OR cr.id_cambio <> $2::bigint)
-         AND NULLIF(TRIM(item.value->>'codigo'), '') IS NOT NULL
-         AND COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int > 0
-         AND NOT EXISTS (
-           SELECT 1
-           FROM almacen09_salidas_detalle sd
-           WHERE sd.id_cambio = cr.id_cambio
-             AND UPPER(TRIM(sd.codigo_producto)) = UPPER(TRIM(item.value->>'codigo'))
-         )
-       GROUP BY UPPER(TRIM(item.value->>'codigo'))
      ),
      base AS (
        SELECT
@@ -2572,43 +2526,22 @@ async function getAlmacen09StockActualRows(db, options = {}) {
          sv.producto,
          sv.numero_lote,
          sv.fecha_empaquetado,
-         GREATEST(0, sv.cantidad - COALESCE(sd.cantidad_salida, 0) - COALESCE(cf.cantidad_cambio, 0))::int AS cantidad
+         GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0))::int AS cantidad
        FROM stock_validado sv
-       LEFT JOIN salidas_directas sd
-         ON sd.codigo_producto = sv.codigo_producto
-        AND sd.numero_lote = sv.numero_lote
-       LEFT JOIN cambios_facturados cf
-         ON cf.codigo_producto = sv.codigo_producto
-        AND cf.numero_lote = sv.numero_lote
-       WHERE GREATEST(0, sv.cantidad - COALESCE(sd.cantidad_salida, 0) - COALESCE(cf.cantidad_cambio, 0)) > 0
-     ),
-     distribuido AS (
-       SELECT
-         base.*,
-         COALESCE(c.cantidad_cambio, 0)::int AS cantidad_cambio,
-         COALESCE(
-           SUM(base.cantidad) OVER (
-             PARTITION BY base.codigo_producto
-             ORDER BY base.fecha_empaquetado, base.numero_lote
-             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-           ),
-           0
-         )::int AS cantidad_anterior
-       FROM base
-       LEFT JOIN cambios_pendientes c ON c.codigo_producto = base.codigo_producto
+       LEFT JOIN salidas sa
+         ON sa.codigo_producto = sv.codigo_producto
+        AND sa.numero_lote = sv.numero_lote
+       WHERE GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0)) > 0
      ),
      stock_actual AS (
        SELECT
-         distribuido.codigo_producto,
-         distribuido.producto,
-         distribuido.numero_lote,
-         distribuido.fecha_empaquetado,
-         GREATEST(
-           0,
-           distribuido.cantidad - GREATEST(0, distribuido.cantidad_cambio - distribuido.cantidad_anterior)
-         )::int AS cantidad,
-         (DATE(NOW() AT TIME ZONE 'America/Caracas') - distribuido.fecha_empaquetado)::int AS age_days
-       FROM distribuido
+         base.codigo_producto,
+         base.producto,
+         base.numero_lote,
+         base.fecha_empaquetado,
+         base.cantidad,
+         (DATE(NOW() AT TIME ZONE 'America/Caracas') - base.fecha_empaquetado)::int AS age_days
+       FROM base
      )
      SELECT
        sa.codigo_producto,
@@ -2634,7 +2567,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   const responsableRaw = normalizeSalidasText(req.body?.responsable, 180);
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
 
-  const detalleIngresado = detalleRaw
+  const detalle = detalleRaw
     .map((item) => ({
       codigo: String(item?.codigo || '').trim().toUpperCase(),
       producto: normalizeSalidasText(item?.producto, 180),
@@ -2643,18 +2576,6 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     }))
     .filter((item) => item.codigo && item.producto && item.razon && Number.isFinite(item.cantidad) && item.cantidad > 0)
     .map((item) => ({ ...item, cantidad: Math.floor(item.cantidad) }));
-  const detallePorCodigo = new Map();
-  detalleIngresado.forEach((item) => {
-    if (!detallePorCodigo.has(item.codigo)) {
-      detallePorCodigo.set(item.codigo, { ...item });
-      return;
-    }
-    const actual = detallePorCodigo.get(item.codigo);
-    actual.cantidad += item.cantidad;
-    const razones = new Set(String(actual.razon || '').split(' / ').concat(item.razon).filter(Boolean));
-    actual.razon = Array.from(razones).join(' / ');
-  });
-  const detalle = Array.from(detallePorCodigo.values());
 
   if (!clienteRaw || !responsableRaw) {
     return res.status(400).json({ ok: false, error: 'cliente y responsable son obligatorios' });
@@ -2666,30 +2587,6 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(`SELECT pg_advisory_xact_lock(hashtext('almacen09-stock-disponible'))`);
-
-    const solicitadoPorCodigo = new Map();
-    detalle.forEach((item) => {
-      solicitadoPorCodigo.set(item.codigo, (solicitadoPorCodigo.get(item.codigo) || 0) + item.cantidad);
-    });
-    const stockRows = await getAlmacen09StockActualRows(client, {
-      codigos: Array.from(solicitadoPorCodigo.keys()),
-    });
-    const disponiblePorCodigo = new Map();
-    stockRows.rows.forEach((row) => {
-      const code = String(row.codigo_producto || '').trim().toUpperCase();
-      disponiblePorCodigo.set(code, (disponiblePorCodigo.get(code) || 0) + Number(row.cantidad || 0));
-    });
-    for (const [code, solicitado] of solicitadoPorCodigo.entries()) {
-      const disponible = disponiblePorCodigo.get(code) || 0;
-      if (solicitado > disponible) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          ok: false,
-          error: `Stock insuficiente para ${code}. Disponible: ${disponible}; solicitado: ${solicitado}.`,
-        });
-      }
-    }
 
     const clienteCatalog = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
     const direccionCatalog = direccionRaw
@@ -5315,50 +5212,28 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
         await client.query('ROLLBACK');
         return res.status(409).json({ ok: false, error: 'Uno de los cambios seleccionados ya fue agregado a una factura' });
       }
-
-      for (const linea of cambioLineas) {
-        const stockConReserva = await getAlmacen09StockActualRows(client, {
-          codigo: linea.codigo,
-          incluirCambio: linea.id_cambio,
-        });
-        const disponibleLote = stockConReserva.rows
-          .filter((row) => String(row.numero_lote || '').trim().toUpperCase() === linea.lote)
-          .reduce((total, row) => total + Number(row.cantidad || 0), 0);
-        if (Math.floor(linea.cantidad) > disponibleLote) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({
-            ok: false,
-            error: `El lote ${linea.lote} ya no tiene disponibilidad suficiente para el cambio ${linea.id_cambio}.`,
-          });
-        }
-      }
     }
 
-    const lineasDirectas = detalle.filter((linea) => !(Number.isInteger(linea.id_cambio) && linea.id_cambio > 0));
-    if (lineasDirectas.length) {
-      const solicitadoPorLote = new Map();
-      lineasDirectas.forEach((linea) => {
-        const key = `${linea.codigo}::${linea.lote}`;
-        solicitadoPorLote.set(key, (solicitadoPorLote.get(key) || 0) + Math.floor(linea.cantidad));
-      });
-      const stockRows = await getAlmacen09StockActualRows(client, {
-        codigos: [...new Set(lineasDirectas.map((linea) => linea.codigo))],
-      });
-      const disponiblePorLote = new Map();
-      stockRows.rows.forEach((row) => {
-        const key = `${String(row.codigo_producto || '').trim().toUpperCase()}::${String(row.numero_lote || '').trim().toUpperCase()}`;
-        disponiblePorLote.set(key, (disponiblePorLote.get(key) || 0) + Number(row.cantidad || 0));
-      });
-      for (const [key, solicitado] of solicitadoPorLote.entries()) {
-        const disponible = disponiblePorLote.get(key) || 0;
-        if (solicitado > disponible) {
-          await client.query('ROLLBACK');
-          const [code, lote] = key.split('::');
-          return res.status(409).json({
-            ok: false,
-            error: `Stock insuficiente para ${code}, lote ${lote}. Disponible: ${disponible}; solicitado: ${solicitado}.`,
-          });
-        }
+    const solicitadoPorLote = new Map();
+    detalle.forEach((linea) => {
+      const key = `${linea.codigo}::${linea.lote}`;
+      solicitadoPorLote.set(key, (solicitadoPorLote.get(key) || 0) + Math.floor(linea.cantidad));
+    });
+    const stockRows = await getAlmacen09StockActualRows(client, { codigos: distinctCodigos });
+    const disponiblePorLote = new Map();
+    stockRows.rows.forEach((row) => {
+      const key = `${String(row.codigo_producto || '').trim().toUpperCase()}::${String(row.numero_lote || '').trim().toUpperCase()}`;
+      disponiblePorLote.set(key, (disponiblePorLote.get(key) || 0) + Number(row.cantidad || 0));
+    });
+    for (const [key, solicitado] of solicitadoPorLote.entries()) {
+      const disponible = disponiblePorLote.get(key) || 0;
+      if (solicitado > disponible) {
+        await client.query('ROLLBACK');
+        const [code, lote] = key.split('::');
+        return res.status(409).json({
+          ok: false,
+          error: `Stock insuficiente para ${code}, lote ${lote}. La suma de salidas y cambios es ${solicitado}; disponible: ${disponible}.`,
+        });
       }
     }
 
@@ -5997,7 +5872,6 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
       codigo: req.query?.codigo,
       loteFiltro: req.query?.loteFiltro,
       limit: req.query?.limit,
-      incluirCambio: req.query?.incluirCambio,
     });
     return res.json({ ok: true, desde: result.desde, rows: result.rows, total: result.rows.length });
   } catch (error) {
