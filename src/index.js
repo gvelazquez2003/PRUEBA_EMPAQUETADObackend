@@ -2344,6 +2344,41 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
   }
 });
 
+app.get('/api/almacen09/cambios/ruta', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  const clienteRaw = normalizeSalidasText(req.query?.cliente, 180);
+  const direccionRaw = normalizeSalidasText(req.query?.direccion, 240);
+  if (!clienteRaw || !direccionRaw) {
+    return res.json({ ok: true, ruta: '' });
+  }
+
+  try {
+    const params = [clienteRaw, direccionRaw];
+    const whereParts = [
+      `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+      `LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($2))`,
+      `TRIM(COALESCE(ruta, '')) <> ''`
+    ];
+    appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+
+    const result = await pool.query(
+      `SELECT TRIM(COALESCE(ruta, '')) AS ruta
+       FROM public.clientes
+       WHERE ${whereParts.join(' AND ')}
+       ORDER BY TRIM(COALESCE(ruta, '')) ASC
+       LIMIT 1`,
+      params
+    );
+
+    const ruta = normalizeSalidasText(result.rows?.[0]?.ruta, 120);
+    return res.json({ ok: true, ruta });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
