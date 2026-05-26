@@ -1114,6 +1114,12 @@ async function ensureCambiosProductosTables() {
   await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS activo`).catch(() => {});
   await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS created_at`).catch(() => {});
 
+  await pool.query(`
+    DELETE FROM cambios_razones duplicated
+    USING cambios_razones retained
+    WHERE duplicated.ctid > retained.ctid
+      AND duplicated.razon_texto = retained.razon_texto
+  `);
   await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN id_razon SET NOT NULL`).catch(() => {});
   await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN razon_texto SET NOT NULL`).catch(() => {});
   await pool.query('ALTER TABLE cambios_razones DROP CONSTRAINT IF EXISTS cambios_razones_pkey').catch(() => {});
@@ -1136,7 +1142,8 @@ async function ensureCambiosProductosTables() {
   await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS detalle_productos`).catch(() => {});
   await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS usuario`).catch(() => {});
 
-  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto ON cambios_razones(razon_texto)');
+  // Use a new name: a restored database may already have a non-unique legacy index with the old name.
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto_unique ON cambios_razones(razon_texto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_created_at ON cambios_registros(created_at DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_ruta ON cambios_registros(ruta_nombre)');
 
@@ -1428,6 +1435,167 @@ async function ensureSalidas09Tables() {
   `);
 
   await pool.query('ALTER TABLE almacen09_salidas_detalle ADD COLUMN IF NOT EXISTS id_cambio BIGINT');
+
+  // Restore natural-key uniqueness required by the catalog upserts after SQL imports.
+  await pool.query(`
+    WITH canonical AS (
+      SELECT nombre, MIN(id_cliente) AS retained_id
+      FROM almacen09_clientes
+      GROUP BY nombre
+      HAVING COUNT(*) > 1
+    )
+    UPDATE cambios_registros cr
+       SET id_cliente = c.retained_id
+      FROM canonical c, almacen09_clientes duplicate
+     WHERE duplicate.nombre = c.nombre
+       AND duplicate.id_cliente <> c.retained_id
+       AND cr.id_cliente = duplicate.id_cliente
+  `);
+  await pool.query(`
+    WITH canonical AS (
+      SELECT nombre, MIN(id_cliente) AS retained_id
+      FROM almacen09_clientes
+      GROUP BY nombre
+      HAVING COUNT(*) > 1
+    )
+    UPDATE salidas_facturas sf
+       SET cliente_id = c.retained_id
+      FROM canonical c, almacen09_clientes duplicate
+     WHERE duplicate.nombre = c.nombre
+       AND duplicate.id_cliente <> c.retained_id
+       AND sf.cliente_id = duplicate.id_cliente
+  `);
+  await pool.query(`
+    WITH canonical AS (
+      SELECT nombre, MIN(id_cliente) AS retained_id
+      FROM almacen09_clientes
+      GROUP BY nombre
+      HAVING COUNT(*) > 1
+    )
+    UPDATE salidas_cliente_sucursales scs
+       SET cliente_id = c.retained_id
+      FROM canonical c, almacen09_clientes duplicate
+     WHERE duplicate.nombre = c.nombre
+       AND duplicate.id_cliente <> c.retained_id
+       AND scs.cliente_id = duplicate.id_cliente
+  `);
+  await pool.query(`
+    WITH ranked AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY nombre ORDER BY id_cliente, ctid) AS duplicate_number
+      FROM almacen09_clientes
+    )
+    DELETE FROM almacen09_clientes target
+    USING ranked duplicate
+    WHERE target.ctid = duplicate.ctid
+      AND duplicate.duplicate_number > 1
+  `);
+
+  await pool.query(`
+    WITH canonical AS (
+      SELECT direccion, MIN(id_direccion) AS retained_id
+      FROM almacen09_direcciones
+      GROUP BY direccion
+      HAVING COUNT(*) > 1
+    )
+    UPDATE cambios_registros cr
+       SET direccion_id = c.retained_id
+      FROM canonical c, almacen09_direcciones duplicate
+     WHERE duplicate.direccion = c.direccion
+       AND duplicate.id_direccion <> c.retained_id
+       AND cr.direccion_id = duplicate.id_direccion
+  `);
+  await pool.query(`
+    WITH canonical AS (
+      SELECT direccion, MIN(id_direccion) AS retained_id
+      FROM almacen09_direcciones
+      GROUP BY direccion
+      HAVING COUNT(*) > 1
+    )
+    UPDATE salidas_facturas sf
+       SET direccion_id = c.retained_id
+      FROM canonical c, almacen09_direcciones duplicate
+     WHERE duplicate.direccion = c.direccion
+       AND duplicate.id_direccion <> c.retained_id
+       AND sf.direccion_id = duplicate.id_direccion
+  `);
+  await pool.query(`
+    WITH canonical AS (
+      SELECT direccion, MIN(id_direccion) AS retained_id
+      FROM almacen09_direcciones
+      GROUP BY direccion
+      HAVING COUNT(*) > 1
+    )
+    UPDATE salidas_cliente_sucursales scs
+       SET direccion_id = c.retained_id
+      FROM canonical c, almacen09_direcciones duplicate
+     WHERE duplicate.direccion = c.direccion
+       AND duplicate.id_direccion <> c.retained_id
+       AND scs.direccion_id = duplicate.id_direccion
+  `);
+  await pool.query(`
+    WITH ranked AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY direccion ORDER BY id_direccion, ctid) AS duplicate_number
+      FROM almacen09_direcciones
+    )
+    DELETE FROM almacen09_direcciones target
+    USING ranked duplicate
+    WHERE target.ctid = duplicate.ctid
+      AND duplicate.duplicate_number > 1
+  `);
+
+  await pool.query(`
+    WITH canonical AS (
+      SELECT nombre, MIN(id_zona) AS retained_id
+      FROM almacen09_zonas
+      GROUP BY nombre
+      HAVING COUNT(*) > 1
+    )
+    UPDATE salidas_facturas sf
+       SET zona_id = c.retained_id
+      FROM canonical c, almacen09_zonas duplicate
+     WHERE duplicate.nombre = c.nombre
+       AND duplicate.id_zona <> c.retained_id
+       AND sf.zona_id = duplicate.id_zona
+  `);
+  await pool.query(`
+    WITH ranked AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY nombre ORDER BY id_zona, ctid) AS duplicate_number
+      FROM almacen09_zonas
+    )
+    DELETE FROM almacen09_zonas target
+    USING ranked duplicate
+    WHERE target.ctid = duplicate.ctid
+      AND duplicate.duplicate_number > 1
+  `);
+  await pool.query(`
+    WITH canonical AS (
+      SELECT nombre, MIN(id_sucursal) AS retained_id
+      FROM almacen09_sucursales
+      GROUP BY nombre
+      HAVING COUNT(*) > 1
+    )
+    UPDATE salidas_facturas sf
+       SET sucursal_id = c.retained_id
+      FROM canonical c, almacen09_sucursales duplicate
+     WHERE duplicate.nombre = c.nombre
+       AND duplicate.id_sucursal <> c.retained_id
+       AND sf.sucursal_id = duplicate.id_sucursal
+  `);
+  await pool.query(`
+    WITH ranked AS (
+      SELECT ctid, ROW_NUMBER() OVER (PARTITION BY nombre ORDER BY id_sucursal, ctid) AS duplicate_number
+      FROM almacen09_sucursales
+    )
+    DELETE FROM almacen09_sucursales target
+    USING ranked duplicate
+    WHERE target.ctid = duplicate.ctid
+      AND duplicate.duplicate_number > 1
+  `);
+
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_almacen09_clientes_nombre_unique ON almacen09_clientes(nombre)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_almacen09_direcciones_direccion_unique ON almacen09_direcciones(direccion)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_almacen09_zonas_nombre_unique ON almacen09_zonas(nombre)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_almacen09_sucursales_nombre_unique ON almacen09_sucursales(nombre)');
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_salidas09_facturas_fecha

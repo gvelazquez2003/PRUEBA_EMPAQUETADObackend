@@ -71,6 +71,16 @@ deleted AS (
 INSERT INTO duplicate_cleanup_report
 SELECT 'Catalogo - motivos por ID', COUNT(*) FROM deleted;
 
+WITH deleted AS (
+  DELETE FROM cambios_razones duplicated
+  USING cambios_razones retained
+  WHERE duplicated.ctid > retained.ctid
+    AND duplicated.razon_texto = retained.razon_texto
+  RETURNING duplicated.id_razon
+)
+INSERT INTO duplicate_cleanup_report
+SELECT 'Catalogo - razones de cambio repetidas', COUNT(*) FROM deleted;
+
 -- Una restauracion sin claves primarias puede copiar la misma fila con el mismo ID.
 WITH ranked AS (
   SELECT ctid, ROW_NUMBER() OVER (PARTITION BY id_detalle ORDER BY ctid) AS duplicate_number
@@ -471,6 +481,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS repair_destinos_id_unique ON destinos (id_dest
 CREATE UNIQUE INDEX IF NOT EXISTS repair_responsables_id_unique ON responsables (id_responsable);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_sedes_id_unique ON sedes (id_sede);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_motivos_id_unique ON motivos_merma (id_motivo);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto_unique ON cambios_razones (razon_texto);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_mermas_cabecera_id_unique ON mermas_cabecera (id_merma);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_mermas_detalle_id_unique ON mermas_detalle (id_detalle);
 CREATE UNIQUE INDEX IF NOT EXISTS repair_control_inventario_id_unique ON control_inventario_guardia (id_control);
@@ -488,6 +499,7 @@ SELECT setval(pg_get_serial_sequence('destinos', 'id_destino'), COALESCE(MAX(id_
 SELECT setval(pg_get_serial_sequence('responsables', 'id_responsable'), COALESCE(MAX(id_responsable), 1), COUNT(*) > 0) FROM responsables;
 SELECT setval(pg_get_serial_sequence('sedes', 'id_sede'), COALESCE(MAX(id_sede), 1), COUNT(*) > 0) FROM sedes;
 SELECT setval(pg_get_serial_sequence('motivos_merma', 'id_motivo'), COALESCE(MAX(id_motivo), 1), COUNT(*) > 0) FROM motivos_merma;
+SELECT setval(pg_get_serial_sequence('cambios_razones', 'id_razon'), COALESCE(MAX(id_razon), 1), COUNT(*) > 0) FROM cambios_razones;
 SELECT setval(pg_get_serial_sequence('mermas_cabecera', 'id_merma'), COALESCE(MAX(id_merma), 1), COUNT(*) > 0) FROM mermas_cabecera;
 SELECT setval(pg_get_serial_sequence('mermas_detalle', 'id_detalle'), COALESCE(MAX(id_detalle), 1), COUNT(*) > 0) FROM mermas_detalle;
 SELECT setval(pg_get_serial_sequence('control_inventario_guardia', 'id_control'), COALESCE(MAX(id_control), 1), COUNT(*) > 0) FROM control_inventario_guardia;
