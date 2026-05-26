@@ -2291,7 +2291,7 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
 
     if (rawQuery) {
       params.push(`%${rawQuery}%`);
-      whereParts.push(`descripcion ILIKE $${params.length}`);
+      whereParts.push(`(descripcion ILIKE $${params.length} OR id_cliente ILIKE $${params.length})`);
     }
     if (rawRif) {
       params.push(`%${rawRif}%`);
@@ -2306,6 +2306,7 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
       `SELECT
          nombre,
          MIN(id_cliente_text) AS id_cliente,
+         MIN(id_cliente_text) AS rif,
          COALESCE(
            JSON_AGG(DISTINCT id_cliente_text ORDER BY id_cliente_text) FILTER (WHERE id_cliente_text <> ''),
            '[]'::json
@@ -2423,6 +2424,207 @@ app.get('/api/almacen09/cambios/razones', async (req, res) => {
   }
 });
 
+async function getAlmacen09StockActualRows(db, options = {}) {
+  const desdeRaw = String(options.desde || STOCK_RESET_DATE).trim();
+  const desde = /^\d{4}-\d{2}-\d{2}$/.test(desdeRaw) ? desdeRaw : STOCK_RESET_DATE;
+  const q = String(options.q || '').trim();
+  const codigo = String(options.codigo || '').trim().toUpperCase();
+  const codigos = Array.isArray(options.codigos)
+    ? [...new Set(options.codigos.map((value) => String(value || '').trim().toUpperCase()).filter(Boolean))]
+    : [];
+  const loteFiltro = String(options.loteFiltro || '').trim().toLowerCase();
+  const incluirCambio = Number.isInteger(Number(options.incluirCambio)) && Number(options.incluirCambio) > 0
+    ? Number(options.incluirCambio)
+    : 0;
+  const rawLimit = Number(options.limit);
+  const hasLimit = Number.isFinite(rawLimit) && rawLimit > 0;
+  const limit = hasLimit ? Math.min(Math.max(Math.floor(rawLimit), 1), 4000) : 0;
+
+  const params = [desde, incluirCambio];
+  let dynamicWhere = '';
+
+  if (codigo) {
+    params.push(codigo);
+    dynamicWhere += ` AND sa.codigo_producto = $${params.length}`;
+  } else if (codigos.length) {
+    params.push(codigos);
+    dynamicWhere += ` AND sa.codigo_producto = ANY($${params.length}::text[])`;
+  } else if (q) {
+    params.push(`%${q}%`);
+    dynamicWhere += ` AND (sa.codigo_producto ILIKE $${params.length} OR sa.producto ILIKE $${params.length})`;
+  }
+
+  if (loteFiltro === 'dia2a5') {
+    dynamicWhere += ' AND sa.age_days BETWEEN 2 AND 5';
+  } else if (loteFiltro === 'primeros2') {
+    dynamicWhere += ' AND sa.age_days BETWEEN 0 AND 1';
+  }
+
+  let limitSql = '';
+  if (hasLimit) {
+    params.push(limit);
+    limitSql = ` LIMIT $${params.length}`;
+  }
+
+  const result = await db.query(
+    `WITH validaciones_unicas AS (
+       SELECT DISTINCT ON (UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))))
+         alp.codigo_lote,
+         alp.processed_at
+       FROM almacen_lotes_procesados alp
+       WHERE alp.estado = 'validado'
+       ORDER BY UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))), alp.processed_at DESC, alp.codigo_lote DESC
+     ),
+     stock_validado AS (
+       SELECT
+         UPPER(TRIM(p.codigo_producto)) AS codigo_producto,
+         p.descripcion AS producto,
+         UPPER(TRIM(ed.numero_lote)) AS numero_lote,
+         DATE(ec.fecha_hora) AS fecha_empaquetado,
+         SUM(ed.cantidad)::int AS cantidad
+       FROM validaciones_unicas alp
+       JOIN empaquetados_cabecera ec
+         ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
+       JOIN (
+         SELECT DISTINCT ON (id_destino) *
+         FROM destinos
+         ORDER BY id_destino
+       ) d ON d.id_destino = ec.id_destino
+       JOIN (
+         SELECT DISTINCT ON (id_detalle) *
+         FROM empaquetados_detalle
+         ORDER BY id_detalle
+       ) ed ON ed.id_cabecera = ec.id_cabecera
+       JOIN (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) p ON p.id_producto = ed.id_producto
+       WHERE DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+         AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
+         AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
+       GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
+     ),
+     salidas_directas AS (
+       SELECT
+         UPPER(TRIM(sd.codigo_producto)) AS codigo_producto,
+         UPPER(TRIM(sd.numero_lote)) AS numero_lote,
+         SUM(sd.cantidad)::int AS cantidad_salida
+       FROM (
+         SELECT DISTINCT ON (id_detalle) *
+         FROM almacen09_salidas_detalle
+         ORDER BY id_detalle
+       ) sd
+       JOIN (
+         SELECT DISTINCT ON (id_factura) *
+         FROM salidas_facturas
+         ORDER BY id_factura
+       ) sf ON sf.id_factura = sd.id_factura
+       WHERE DATE(sf.fecha_emision) >= $1
+         AND (
+           sd.id_cambio IS NULL
+           OR NOT EXISTS (
+             SELECT 1
+             FROM cambios_registros cr
+             WHERE cr.id_cambio = sd.id_cambio
+               AND DATE(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+           )
+         )
+       GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
+     ),
+     cambios_facturados AS (
+       SELECT
+         UPPER(TRIM(sd.codigo_producto)) AS codigo_producto,
+         UPPER(TRIM(sd.numero_lote)) AS numero_lote,
+         SUM(sd.cantidad)::int AS cantidad_cambio
+       FROM almacen09_salidas_detalle sd
+       JOIN cambios_registros cr ON cr.id_cambio = sd.id_cambio
+       WHERE DATE(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+       GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
+     ),
+     cambios_pendientes AS (
+       SELECT
+         UPPER(TRIM(item.value->>'codigo')) AS codigo_producto,
+         SUM(COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int)::int AS cantidad_cambio
+       FROM cambios_registros cr
+       CROSS JOIN LATERAL jsonb_array_elements(
+         CASE
+           WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
+           WHEN jsonb_typeof(cr.producto) = 'object' THEN jsonb_build_array(cr.producto)
+           ELSE '[]'::jsonb
+         END
+       ) AS item(value)
+       WHERE DATE(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+         AND ($2::bigint = 0 OR cr.id_cambio <> $2::bigint)
+         AND NULLIF(TRIM(item.value->>'codigo'), '') IS NOT NULL
+         AND COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int > 0
+         AND NOT EXISTS (
+           SELECT 1
+           FROM almacen09_salidas_detalle sd
+           WHERE sd.id_cambio = cr.id_cambio
+             AND UPPER(TRIM(sd.codigo_producto)) = UPPER(TRIM(item.value->>'codigo'))
+         )
+       GROUP BY UPPER(TRIM(item.value->>'codigo'))
+     ),
+     base AS (
+       SELECT
+         sv.codigo_producto,
+         sv.producto,
+         sv.numero_lote,
+         sv.fecha_empaquetado,
+         GREATEST(0, sv.cantidad - COALESCE(sd.cantidad_salida, 0) - COALESCE(cf.cantidad_cambio, 0))::int AS cantidad
+       FROM stock_validado sv
+       LEFT JOIN salidas_directas sd
+         ON sd.codigo_producto = sv.codigo_producto
+        AND sd.numero_lote = sv.numero_lote
+       LEFT JOIN cambios_facturados cf
+         ON cf.codigo_producto = sv.codigo_producto
+        AND cf.numero_lote = sv.numero_lote
+       WHERE GREATEST(0, sv.cantidad - COALESCE(sd.cantidad_salida, 0) - COALESCE(cf.cantidad_cambio, 0)) > 0
+     ),
+     distribuido AS (
+       SELECT
+         base.*,
+         COALESCE(c.cantidad_cambio, 0)::int AS cantidad_cambio,
+         COALESCE(
+           SUM(base.cantidad) OVER (
+             PARTITION BY base.codigo_producto
+             ORDER BY base.fecha_empaquetado, base.numero_lote
+             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+           ),
+           0
+         )::int AS cantidad_anterior
+       FROM base
+       LEFT JOIN cambios_pendientes c ON c.codigo_producto = base.codigo_producto
+     ),
+     stock_actual AS (
+       SELECT
+         distribuido.codigo_producto,
+         distribuido.producto,
+         distribuido.numero_lote,
+         distribuido.fecha_empaquetado,
+         GREATEST(
+           0,
+           distribuido.cantidad - GREATEST(0, distribuido.cantidad_cambio - distribuido.cantidad_anterior)
+         )::int AS cantidad,
+         (DATE(NOW() AT TIME ZONE 'America/Caracas') - distribuido.fecha_empaquetado)::int AS age_days
+       FROM distribuido
+     )
+     SELECT
+       sa.codigo_producto,
+       sa.producto,
+       sa.numero_lote,
+       TO_CHAR(sa.fecha_empaquetado, 'YYYY-MM-DD') AS fecha_empaquetado,
+       sa.cantidad
+     FROM stock_actual sa
+     WHERE sa.cantidad > 0 ${dynamicWhere}
+     ORDER BY sa.codigo_producto, sa.fecha_empaquetado, sa.numero_lote${limitSql}`,
+    params
+  );
+
+  return { desde, rows: result.rows };
+}
+
 app.post('/api/almacen09/cambios', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
@@ -2432,7 +2634,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   const responsableRaw = normalizeSalidasText(req.body?.responsable, 180);
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
 
-  const detalle = detalleRaw
+  const detalleIngresado = detalleRaw
     .map((item) => ({
       codigo: String(item?.codigo || '').trim().toUpperCase(),
       producto: normalizeSalidasText(item?.producto, 180),
@@ -2441,6 +2643,18 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     }))
     .filter((item) => item.codigo && item.producto && item.razon && Number.isFinite(item.cantidad) && item.cantidad > 0)
     .map((item) => ({ ...item, cantidad: Math.floor(item.cantidad) }));
+  const detallePorCodigo = new Map();
+  detalleIngresado.forEach((item) => {
+    if (!detallePorCodigo.has(item.codigo)) {
+      detallePorCodigo.set(item.codigo, { ...item });
+      return;
+    }
+    const actual = detallePorCodigo.get(item.codigo);
+    actual.cantidad += item.cantidad;
+    const razones = new Set(String(actual.razon || '').split(' / ').concat(item.razon).filter(Boolean));
+    actual.razon = Array.from(razones).join(' / ');
+  });
+  const detalle = Array.from(detallePorCodigo.values());
 
   if (!clienteRaw || !responsableRaw) {
     return res.status(400).json({ ok: false, error: 'cliente y responsable son obligatorios' });
@@ -2452,6 +2666,30 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('almacen09-stock-disponible'))`);
+
+    const solicitadoPorCodigo = new Map();
+    detalle.forEach((item) => {
+      solicitadoPorCodigo.set(item.codigo, (solicitadoPorCodigo.get(item.codigo) || 0) + item.cantidad);
+    });
+    const stockRows = await getAlmacen09StockActualRows(client, {
+      codigos: Array.from(solicitadoPorCodigo.keys()),
+    });
+    const disponiblePorCodigo = new Map();
+    stockRows.rows.forEach((row) => {
+      const code = String(row.codigo_producto || '').trim().toUpperCase();
+      disponiblePorCodigo.set(code, (disponiblePorCodigo.get(code) || 0) + Number(row.cantidad || 0));
+    });
+    for (const [code, solicitado] of solicitadoPorCodigo.entries()) {
+      const disponible = disponiblePorCodigo.get(code) || 0;
+      if (solicitado > disponible) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          ok: false,
+          error: `Stock insuficiente para ${code}. Disponible: ${disponible}; solicitado: ${solicitado}.`,
+        });
+      }
+    }
 
     const clienteCatalog = await upsertSalidasCatalogValue(client, 'cliente', clienteRaw);
     const direccionCatalog = direccionRaw
@@ -4972,6 +5210,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('almacen09-stock-disponible'))`);
     await client.query('LOCK TABLE salidas_facturas IN EXCLUSIVE MODE');
 
     const numeroControl = isFacturaDocumento
@@ -5075,6 +5314,51 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       if (usedCambio.rowCount) {
         await client.query('ROLLBACK');
         return res.status(409).json({ ok: false, error: 'Uno de los cambios seleccionados ya fue agregado a una factura' });
+      }
+
+      for (const linea of cambioLineas) {
+        const stockConReserva = await getAlmacen09StockActualRows(client, {
+          codigo: linea.codigo,
+          incluirCambio: linea.id_cambio,
+        });
+        const disponibleLote = stockConReserva.rows
+          .filter((row) => String(row.numero_lote || '').trim().toUpperCase() === linea.lote)
+          .reduce((total, row) => total + Number(row.cantidad || 0), 0);
+        if (Math.floor(linea.cantidad) > disponibleLote) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            ok: false,
+            error: `El lote ${linea.lote} ya no tiene disponibilidad suficiente para el cambio ${linea.id_cambio}.`,
+          });
+        }
+      }
+    }
+
+    const lineasDirectas = detalle.filter((linea) => !(Number.isInteger(linea.id_cambio) && linea.id_cambio > 0));
+    if (lineasDirectas.length) {
+      const solicitadoPorLote = new Map();
+      lineasDirectas.forEach((linea) => {
+        const key = `${linea.codigo}::${linea.lote}`;
+        solicitadoPorLote.set(key, (solicitadoPorLote.get(key) || 0) + Math.floor(linea.cantidad));
+      });
+      const stockRows = await getAlmacen09StockActualRows(client, {
+        codigos: [...new Set(lineasDirectas.map((linea) => linea.codigo))],
+      });
+      const disponiblePorLote = new Map();
+      stockRows.rows.forEach((row) => {
+        const key = `${String(row.codigo_producto || '').trim().toUpperCase()}::${String(row.numero_lote || '').trim().toUpperCase()}`;
+        disponiblePorLote.set(key, (disponiblePorLote.get(key) || 0) + Number(row.cantidad || 0));
+      });
+      for (const [key, solicitado] of solicitadoPorLote.entries()) {
+        const disponible = disponiblePorLote.get(key) || 0;
+        if (solicitado > disponible) {
+          await client.query('ROLLBACK');
+          const [code, lote] = key.split('::');
+          return res.status(409).json({
+            ok: false,
+            error: `Stock insuficiente para ${code}, lote ${lote}. Disponible: ${disponible}; solicitado: ${solicitado}.`,
+          });
+        }
       }
     }
 
@@ -5706,132 +5990,16 @@ app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
 });
 
 app.get('/api/almacen09/stock-actual', async (req, res) => {
-  const desdeRaw = String(req.query?.desde || STOCK_RESET_DATE).trim();
-  const desde = /^\d{4}-\d{2}-\d{2}$/.test(desdeRaw) ? desdeRaw : STOCK_RESET_DATE;
-  const q = String(req.query?.q || '').trim();
-  const codigo = String(req.query?.codigo || '').trim().toUpperCase();
-  const loteFiltro = String(req.query?.loteFiltro || '').trim().toLowerCase();
-  const rawLimit = Number(req.query?.limit);
-  const hasLimit = Number.isFinite(rawLimit) && rawLimit > 0;
-  const limit = hasLimit ? Math.min(Math.max(Math.floor(rawLimit), 1), 4000) : 0;
-
   try {
-    const params = [desde];
-    let dynamicWhere = '';
-
-    if (codigo) {
-      params.push(codigo);
-      dynamicWhere += ` AND sa.codigo_producto = $${params.length}`;
-    } else if (q) {
-      params.push(`%${q}%`);
-      dynamicWhere += ` AND (sa.codigo_producto ILIKE $${params.length} OR sa.producto ILIKE $${params.length})`;
-    }
-
-    if (loteFiltro === 'dia2a5') {
-      dynamicWhere += ' AND sa.age_days BETWEEN 2 AND 5';
-    } else if (loteFiltro === 'primeros2') {
-      dynamicWhere += ' AND sa.age_days BETWEEN 0 AND 1';
-    }
-
-    let limitSql = '';
-    if (hasLimit) {
-      params.push(limit);
-      limitSql = ` LIMIT $${params.length}`;
-    }
-
-    const result = await pool.query(
-      `WITH validaciones_unicas AS (
-         SELECT DISTINCT ON (UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))))
-           alp.codigo_lote,
-           alp.processed_at
-         FROM almacen_lotes_procesados alp
-         WHERE alp.estado = 'validado'
-         ORDER BY UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))), alp.processed_at DESC, alp.codigo_lote DESC
-       ),
-       stock_validado AS (
-         SELECT
-           UPPER(TRIM(p.codigo_producto)) AS codigo_producto,
-           p.descripcion AS producto,
-           UPPER(TRIM(ed.numero_lote)) AS numero_lote,
-           DATE(ec.fecha_hora) AS fecha_empaquetado,
-           SUM(ed.cantidad)::int AS cantidad
-         FROM validaciones_unicas alp
-         JOIN empaquetados_cabecera ec
-           ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
-         JOIN (
-           SELECT DISTINCT ON (id_destino) *
-           FROM destinos
-           ORDER BY id_destino
-         ) d ON d.id_destino = ec.id_destino
-         JOIN (
-           SELECT DISTINCT ON (id_detalle) *
-           FROM empaquetados_detalle
-           ORDER BY id_detalle
-         ) ed ON ed.id_cabecera = ec.id_cabecera
-         JOIN (
-           SELECT DISTINCT ON (id_producto) *
-           FROM productos
-           ORDER BY id_producto
-         ) p ON p.id_producto = ed.id_producto
-         WHERE DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
-           AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
-           AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-         GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
-       ),
-       salidas AS (
-         SELECT
-           UPPER(TRIM(sd.codigo_producto)) AS codigo_producto,
-           UPPER(TRIM(sd.numero_lote)) AS numero_lote,
-           SUM(sd.cantidad)::int AS cantidad_salida
-         FROM (
-           SELECT DISTINCT ON (id_detalle) *
-           FROM almacen09_salidas_detalle
-           ORDER BY id_detalle
-         ) sd
-         JOIN (
-           SELECT DISTINCT ON (id_factura) *
-           FROM salidas_facturas
-           ORDER BY id_factura
-         ) sf ON sf.id_factura = sd.id_factura
-         WHERE DATE(sf.fecha_emision) >= $1
-         GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
-       ),
-       base AS (
-         SELECT
-           sv.codigo_producto,
-           sv.producto,
-           sv.numero_lote,
-           sv.fecha_empaquetado,
-           GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0))::int AS cantidad
-         FROM stock_validado sv
-         LEFT JOIN salidas sa
-           ON sa.codigo_producto = sv.codigo_producto
-          AND sa.numero_lote = sv.numero_lote
-         WHERE GREATEST(0, sv.cantidad - COALESCE(sa.cantidad_salida, 0)) > 0
-       ),
-       stock_actual AS (
-         SELECT
-           base.codigo_producto,
-           base.producto,
-           base.numero_lote,
-           base.fecha_empaquetado,
-           base.cantidad,
-           (DATE(NOW() AT TIME ZONE 'America/Caracas') - base.fecha_empaquetado)::int AS age_days
-         FROM base
-       )
-       SELECT
-         sa.codigo_producto,
-         sa.producto,
-         sa.numero_lote,
-         TO_CHAR(sa.fecha_empaquetado, 'YYYY-MM-DD') AS fecha_empaquetado,
-         sa.cantidad
-       FROM stock_actual sa
-       WHERE 1=1 ${dynamicWhere}
-       ORDER BY sa.codigo_producto, sa.numero_lote, sa.fecha_empaquetado${limitSql}`,
-      params
-    );
-
-    return res.json({ ok: true, desde, rows: result.rows, total: result.rows.length });
+    const result = await getAlmacen09StockActualRows(pool, {
+      desde: req.query?.desde,
+      q: req.query?.q,
+      codigo: req.query?.codigo,
+      loteFiltro: req.query?.loteFiltro,
+      limit: req.query?.limit,
+      incluirCambio: req.query?.incluirCambio,
+    });
+    return res.json({ ok: true, desde: result.desde, rows: result.rows, total: result.rows.length });
   } catch (error) {
     return res.status(500).json({ ok: false, error: 'Error al calcular stock actual desde Almacén09' });
   }
