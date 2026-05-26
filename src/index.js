@@ -2971,6 +2971,9 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 180);
+  const zonaRaw = normalizeSalidasText(req.query?.zona, 120);
+  const direccionRaw = normalizeSalidasText(req.query?.direccion, 240);
+  const rutaRaw = normalizeSalidasText(req.query?.ruta, 120);
   if (clienteRaw.length < 2) {
     return res.json({ ok: true, rows: [], total: 0 });
   }
@@ -2987,6 +2990,20 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
            WHERE ${vendedorWhereParts.join(' AND ')}
          )`
       : '';
+    const extraWhereParts = [];
+    if (direccionRaw) {
+      params.push(direccionRaw);
+      extraWhereParts.push(`LOWER(TRIM(COALESCE(cr.direccion_texto, ''))) = LOWER(TRIM($${params.length}))`);
+    }
+    if (zonaRaw) {
+      params.push(zonaRaw);
+      extraWhereParts.push(`LOWER(TRIM(COALESCE(ruta_meta.zona, ''))) = LOWER(TRIM($${params.length}))`);
+    }
+    if (rutaRaw) {
+      params.push(rutaRaw);
+      extraWhereParts.push(`LOWER(TRIM(COALESCE(NULLIF(cr.ruta_nombre, ''), ruta_meta.ruta, ''))) = LOWER(TRIM($${params.length}))`);
+    }
+    const extraWhereSql = extraWhereParts.length ? ` AND ${extraWhereParts.join(' AND ')}` : '';
     const result = await pool.query(
       `SELECT
          cr.id_cambio,
@@ -3003,6 +3020,19 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
          FROM cambios_registros
          ORDER BY id_cambio
        ) cr
+       LEFT JOIN LATERAL (
+         SELECT
+           TRIM(COALESCE(c.zona, '')) AS zona,
+           TRIM(COALESCE(c.ruta, '')) AS ruta
+         FROM public.clientes c
+         WHERE LOWER(TRIM(COALESCE(c.descripcion, ''))) = LOWER(TRIM(cr.nombre_cliente))
+           AND (
+             cr.direccion_texto IS NULL
+             OR LOWER(TRIM(COALESCE(c.direccion, ''))) = LOWER(TRIM(cr.direccion_texto))
+           )
+         ORDER BY TRIM(COALESCE(c.direccion, '')) ASC
+         LIMIT 1
+       ) ruta_meta ON true
        CROSS JOIN LATERAL jsonb_array_elements(
          CASE
            WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
@@ -3012,6 +3042,7 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
        ) WITH ORDINALITY AS item(value, ord)
        WHERE LOWER(TRIM(cr.nombre_cliente)) = LOWER(TRIM($1))
          ${vendedorGuardSql}
+         ${extraWhereSql}
          AND NULLIF(TRIM(item.value->>'codigo'), '') IS NOT NULL
          AND NULLIF(TRIM(item.value->>'producto'), '') IS NOT NULL
          AND COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int > 0
