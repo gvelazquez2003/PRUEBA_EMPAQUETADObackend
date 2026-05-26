@@ -1887,6 +1887,13 @@ function normalizeClienteZonaRow(row) {
   };
 }
 
+function normalizeClienteRutaRow(row) {
+  return {
+    ruta: normalizeSalidasText(row?.ruta, 120),
+    total: Number(row?.total || 0),
+  };
+}
+
 function normalizeClienteDireccionMeta(row) {
   return {
     direccion: normalizeSalidasText(row?.direccion, 240),
@@ -1929,6 +1936,37 @@ async function listZonasByCliente(client, clienteRaw, auth) {
   return Array.from(dedupe.values()).sort((a, b) => a.zona.localeCompare(b.zona, 'es', { sensitivity: 'base' }));
 }
 
+async function listRutasByCliente(client, clienteRaw, auth) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  if (!cliente) return [];
+  const params = [cliente];
+  const whereParts = [
+    `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+    `TRIM(COALESCE(ruta, '')) <> ''`,
+  ];
+  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  const result = await client.query(
+    `SELECT
+       TRIM(COALESCE(ruta, '')) AS ruta,
+       COUNT(*)::int AS total
+     FROM public.clientes
+     WHERE ${whereParts.join(' AND ')}
+     GROUP BY TRIM(COALESCE(ruta, ''))
+     ORDER BY TRIM(COALESCE(ruta, '')) ASC`,
+    params
+  );
+  const dedupe = new Map();
+  result.rows.map(normalizeClienteRutaRow).forEach((row) => {
+    if (!row.ruta) return;
+    const key = normalizeSalidasLookupKey(row.ruta, 120);
+    const current = dedupe.get(key);
+    if (!current || row.total > current.total) {
+      dedupe.set(key, row);
+    }
+  });
+  return Array.from(dedupe.values()).sort((a, b) => a.ruta.localeCompare(b.ruta, 'es', { sensitivity: 'base' }));
+}
+
 async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   const zona = normalizeSalidasText(zonaRaw, 120);
@@ -1937,6 +1975,38 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth) {
   const whereParts = [
     `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
     `LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))`,
+    `TRIM(COALESCE(direccion, '')) <> ''`,
+  ];
+  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  const result = await client.query(
+    `SELECT
+       TRIM(COALESCE(direccion, '')) AS direccion,
+       TRIM(COALESCE(zona, '')) AS zona,
+       TRIM(COALESCE(ruta, '')) AS ruta,
+       TRIM(COALESCE(transporte, '')) AS transporte,
+       TRIM(COALESCE(vendedor, '')) AS vendedor
+     FROM public.clientes
+     WHERE ${whereParts.join(' AND ')}
+     GROUP BY
+       TRIM(COALESCE(direccion, '')),
+       TRIM(COALESCE(zona, '')),
+       TRIM(COALESCE(ruta, '')),
+       TRIM(COALESCE(transporte, '')),
+       TRIM(COALESCE(vendedor, ''))
+     ORDER BY TRIM(COALESCE(direccion, '')) ASC`,
+    params
+  );
+  return result.rows.map(normalizeClienteDireccionMeta).filter((row) => row.direccion);
+}
+
+async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  const ruta = normalizeSalidasText(rutaRaw, 120);
+  if (!cliente || !ruta) return [];
+  const params = [cliente, ruta];
+  const whereParts = [
+    `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+    `LOWER(TRIM(COALESCE(ruta, ''))) = LOWER(TRIM($2))`,
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
   appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
@@ -2339,6 +2409,32 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
       params
     );
     return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/almacen09/cambios/contexto-cliente', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
+  const rutaRaw = normalizeSalidasText(req.query?.ruta, 120);
+  if (clienteRaw.length < 2) {
+    return res.json({ ok: true, cliente: clienteRaw, rutas: [], direcciones: [], direcciones_meta: [], autofill: null });
+  }
+
+  try {
+    const rutas = await listRutasByCliente(pool, clienteRaw, auth);
+    const direccionesMeta = rutaRaw ? await listDireccionesByClienteRuta(pool, clienteRaw, rutaRaw, auth) : [];
+    return res.json({
+      ok: true,
+      cliente: clienteRaw,
+      rutas,
+      direcciones: direccionesMeta.map((row) => row.direccion).filter(Boolean),
+      direcciones_meta: direccionesMeta,
+      autofill: null,
+    });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
