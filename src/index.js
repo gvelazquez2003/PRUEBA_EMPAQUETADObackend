@@ -149,6 +149,88 @@ const pool = new Pool({
   connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
 });
 
+const IDEMPOTENT_WRITE_PATHS = new Set([
+  '/api/empaquetados',
+  '/api/mermas',
+  '/api/control-inventario',
+  '/api/almacen09/validar-conteo',
+  '/api/almacen09/cambios',
+  '/api/almacen09/salidas-facturas',
+  '/api/hoja-ruta/exportaciones',
+]);
+
+function normalizeRequestKey(value) {
+  return String(value || '').trim().replace(/[^A-Za-z0-9:_-]/g, '').slice(0, 120);
+}
+
+app.use(async (req, res, next) => {
+  if (req.method !== 'POST' || !IDEMPOTENT_WRITE_PATHS.has(req.path)) {
+    return next();
+  }
+
+  const requestKey = normalizeRequestKey(req.body?.request_key || req.headers['idempotency-key']);
+  if (!requestKey) {
+    return next();
+  }
+
+  const scope = req.path;
+  try {
+    const claim = await pool.query(
+      `INSERT INTO idempotency_requests (scope, request_key)
+       VALUES ($1, $2)
+       ON CONFLICT (scope, request_key) DO NOTHING
+       RETURNING request_key`,
+      [scope, requestKey]
+    );
+
+    if (!claim.rowCount) {
+      const existing = await pool.query(
+        `SELECT response_status, response_body
+         FROM idempotency_requests
+         WHERE scope = $1 AND request_key = $2`,
+        [scope, requestKey]
+      );
+      const previous = existing.rows[0];
+      if (previous?.response_body) {
+        return res.status(Number(previous.response_status) || 200).json({
+          ...previous.response_body,
+          deduplicated: true,
+        });
+      }
+      return res.status(409).json({ ok: false, error: 'Esta operacion ya se esta procesando.' });
+    }
+
+    const sendJson = res.json.bind(res);
+    const sendBody = res.send.bind(res);
+    let finalizing = false;
+    const finalizeResponse = (body, sender) => {
+      if (finalizing) return sender(body);
+      finalizing = true;
+      const status = Number(res.statusCode) || 200;
+      const finalize = status >= 200 && status < 300
+        ? pool.query(
+            `UPDATE idempotency_requests
+             SET response_status = $1, response_body = $2::jsonb, completed_at = NOW()
+             WHERE scope = $3 AND request_key = $4`,
+            [status, JSON.stringify(body || {}), scope, requestKey]
+          )
+        : pool.query(
+            'DELETE FROM idempotency_requests WHERE scope = $1 AND request_key = $2',
+            [scope, requestKey]
+          );
+      finalize
+        .catch((error) => console.error('Error guardando idempotencia:', error.message || error))
+        .finally(() => sender(body));
+      return res;
+    };
+    res.json = (body) => finalizeResponse(body, sendJson);
+    res.send = (body) => finalizeResponse(body, sendBody);
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+});
+
 function combineFechaHora(fecha, hora) {
   if (!fecha) return null;
   const safeHora = hora && String(hora).trim() ? String(hora).trim() : '00:00';
@@ -931,6 +1013,28 @@ async function ensureAlmacen09Tables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_conteo_errores_created_at ON conteo_errores(created_at DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_conteo_errores_codigo_lote ON conteo_errores(codigo_lote)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_almacen_lotes_procesados_estado_processed ON almacen_lotes_procesados(estado, processed_at DESC)');
+}
+
+async function ensureIdempotencyRequestsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS idempotency_requests (
+      scope VARCHAR(120) NOT NULL,
+      request_key VARCHAR(120) NOT NULL,
+      response_status INT,
+      response_body JSONB,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMP,
+      PRIMARY KEY (scope, request_key)
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_idempotency_requests_created_at
+    ON idempotency_requests (created_at DESC)
+  `);
+  await pool.query(`
+    DELETE FROM idempotency_requests
+    WHERE completed_at < NOW() - INTERVAL '90 days'
+  `);
 }
 
 async function ensureCambiosProductosTables() {
@@ -2277,7 +2381,11 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
          TRIM(item.value->>'producto') AS producto,
          TRIM(item.value->>'razon') AS razon,
          COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int AS cantidad
-       FROM cambios_registros cr
+       FROM (
+         SELECT DISTINCT ON (id_cambio) *
+         FROM cambios_registros
+         ORDER BY id_cambio
+       ) cr
        CROSS JOIN LATERAL jsonb_array_elements(
          CASE
            WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
@@ -2836,20 +2944,32 @@ app.get('/api/control-inventario/lotes', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `WITH entradas_validas AS (
+      `WITH validaciones_unicas AS (
+         SELECT DISTINCT ON (UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))))
+           alp.codigo_lote,
+           alp.estado,
+           alp.processed_at
+         FROM almacen_lotes_procesados alp
+         WHERE alp.estado = 'validado'
+         ORDER BY UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))), alp.processed_at DESC, alp.codigo_lote DESC
+       ),
+       entradas_validas AS (
          SELECT
            UPPER(TRIM(ed.numero_lote)) AS numero_lote,
            SUM(ed.cantidad)::int AS cantidad_entrada,
            MIN(alp.processed_at) AS primera_entrada,
            STRING_AGG(DISTINCT CONCAT('CAB-', ec.id_cabecera), ' | ' ORDER BY CONCAT('CAB-', ec.id_cabecera)) AS codigos_entrada,
            STRING_AGG(DISTINCT NULLIF(TRIM(ec.numero_registro), ''), ' | ' ORDER BY NULLIF(TRIM(ec.numero_registro), '')) AS numeros_registro
-         FROM almacen_lotes_procesados alp
+         FROM validaciones_unicas alp
          JOIN empaquetados_cabecera ec
            ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
          JOIN destinos d ON d.id_destino = ec.id_destino
-         JOIN empaquetados_detalle ed ON ed.id_cabecera = ec.id_cabecera
-         WHERE alp.estado = 'validado'
-           AND DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') = $2::date
+         JOIN (
+           SELECT DISTINCT ON (id_detalle) *
+           FROM empaquetados_detalle
+           ORDER BY id_detalle
+         ) ed ON ed.id_cabecera = ec.id_cabecera
+         WHERE DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') = $2::date
            AND ed.id_producto = $1
            AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
@@ -3086,7 +3206,11 @@ app.get('/api/registros', async (req, res) => {
           hr.total_cestas AS "Cestas",
           COALESCE(hr.usuario, '') AS "Usuario",
           COALESCE(hr.nombre_archivo, '') AS "Archivo"
-        FROM hojas_ruta_exportadas hr
+        FROM (
+          SELECT DISTINCT ON (id_hoja) *
+          FROM hojas_ruta_exportadas
+          ORDER BY id_hoja
+        ) hr
         ${whereClause}
         ORDER BY hr.created_at DESC, hr.id_hoja DESC
         LIMIT $${params.length - 1}
@@ -3167,7 +3291,11 @@ app.get('/api/registros', async (req, res) => {
           COALESCE(productos.cantidades, '') AS "Cantidad de cada uno",
           COALESCE(productos.razones, '') AS "Razon del cambio",
           cr.responsable AS "Responsable del registro"
-        FROM cambios_registros cr
+        FROM (
+          SELECT DISTINCT ON (id_cambio) *
+          FROM cambios_registros
+          ORDER BY id_cambio
+        ) cr
         LEFT JOIN LATERAL (
           SELECT
             STRING_AGG(
@@ -3289,7 +3417,11 @@ app.get('/api/registros', async (req, res) => {
           r.nombre_completo AS "RESPONSABLE",
           md.motivo AS "Motivo",
           md.numero_lote AS "Lote"
-        FROM mermas_detalle md
+        FROM (
+          SELECT DISTINCT ON (id_detalle) *
+          FROM mermas_detalle
+          ORDER BY id_detalle
+        ) md
         JOIN mermas_cabecera mc ON mc.id_merma = md.id_merma
         JOIN responsables r ON r.id_responsable = mc.id_responsable
         ${whereClause}
@@ -3369,7 +3501,11 @@ app.get('/api/registros', async (req, res) => {
           cg.momento_conteo AS "Momento",
           cg.almacen AS "Almacen",
           cg.cestas AS "Cestas"
-         FROM control_inventario_guardia cg
+         FROM (
+           SELECT DISTINCT ON (id_control) *
+           FROM control_inventario_guardia
+           ORDER BY id_control
+         ) cg
          JOIN productos p ON p.id_producto = cg.id_producto
          ${whereClause}
          ORDER BY cg.created_at DESC, cg.id_control DESC
@@ -3461,13 +3597,24 @@ app.get('/api/registros', async (req, res) => {
             s.nombre AS "SEDE",
             ed.numero_lote AS "NUMERO DE LOTE",
             ec.fecha_hora AS "__ORDER_TS"
-          FROM empaquetados_detalle ed
+          FROM (
+            SELECT DISTINCT ON (id_detalle) *
+            FROM empaquetados_detalle
+            ORDER BY id_detalle
+          ) ed
           JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
           JOIN productos p ON p.id_producto = ed.id_producto
           JOIN destinos d ON d.id_destino = ec.id_destino
           JOIN responsables r ON r.id_responsable = ec.id_responsable
           JOIN sedes s ON s.id_sede = ec.id_sede
-          LEFT JOIN almacen_lotes_procesados alp ON ${almacenCabCodigoExpr} = UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera)))
+          LEFT JOIN LATERAL (
+            SELECT alp_latest.estado, alp_latest.processed_at
+            FROM almacen_lotes_procesados alp_latest
+            WHERE UPPER(TRIM(SPLIT_PART(alp_latest.codigo_lote, '::', 1))) =
+                  UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera)))
+            ORDER BY alp_latest.processed_at DESC NULLS LAST, alp_latest.codigo_lote DESC
+            LIMIT 1
+          ) alp ON true
           ${whereClauseActual}
         ),
         historico AS (
@@ -3571,7 +3718,17 @@ app.get('/api/registros', async (req, res) => {
       params.push(limit);
 
       const result = await pool.query(
-        `WITH empa_reg AS (
+        `WITH almacen_unico AS (
+           SELECT DISTINCT ON (UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))))
+             alp.codigo_lote,
+             alp.estado,
+             alp.processed_at,
+             alp.resumen_validacion
+           FROM almacen_lotes_procesados alp
+           WHERE alp.estado = 'validado'
+           ORDER BY UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))), alp.processed_at DESC, alp.codigo_lote DESC
+         ),
+         empa_reg AS (
            SELECT
              CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
              ec.numero_registro,
@@ -3579,7 +3736,11 @@ app.get('/api/registros', async (req, res) => {
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
              STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
-           FROM empaquetados_detalle ed
+           FROM (
+             SELECT DISTINCT ON (id_detalle) *
+             FROM empaquetados_detalle
+             ORDER BY id_detalle
+           ) ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
            JOIN destinos d ON d.id_destino = ec.id_destino
            JOIN productos p ON p.id_producto = ed.id_producto
@@ -3591,7 +3752,7 @@ app.get('/api/registros', async (req, res) => {
            SELECT
              alp.codigo_lote,
              COALESCE(SUM((elem.value->>'cantidad_validada')::int), 0)::int AS cantidad_almacen
-           FROM almacen_lotes_procesados alp
+           FROM almacen_unico alp
            LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
            GROUP BY alp.codigo_lote
          )
@@ -3607,7 +3768,7 @@ app.get('/api/registros', async (req, res) => {
            COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
            TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
            alp.estado AS "ESTADO"
-         FROM almacen_lotes_procesados alp
+         FROM almacen_unico alp
          LEFT JOIN empa_reg el ON UPPER(TRIM(el.codigo_lote)) = ${almacenCabCodigoExpr}
          LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
          WHERE ${whereParts.join(' AND ')}
@@ -3662,7 +3823,17 @@ app.get('/api/registros', async (req, res) => {
       params.push(limit);
 
       const result = await pool.query(
-        `WITH empa AS (
+        `WITH almacen_unico AS (
+           SELECT DISTINCT ON (UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))))
+             alp.codigo_lote,
+             alp.estado,
+             alp.processed_at,
+             alp.resumen_validacion
+           FROM almacen_lotes_procesados alp
+           WHERE alp.estado = 'validado'
+           ORDER BY UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))), alp.processed_at DESC, alp.codigo_lote DESC
+         ),
+         empa AS (
            SELECT
              ed.id_detalle AS "__ROW_ID",
              'Empaquetado' AS "ORIGEN",
@@ -3675,7 +3846,11 @@ app.get('/api/registros', async (req, res) => {
              NULL::int AS "CANTIDAD ALMACEN",
              NULL::text AS "FECHA ENTRADA",
              'registrado'::text AS "ESTADO"
-           FROM empaquetados_detalle ed
+           FROM (
+             SELECT DISTINCT ON (id_detalle) *
+             FROM empaquetados_detalle
+             ORDER BY id_detalle
+           ) ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
             JOIN destinos d ON d.id_destino = ec.id_destino
            JOIN productos p ON p.id_producto = ed.id_producto
@@ -3689,7 +3864,11 @@ app.get('/api/registros', async (req, res) => {
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
              STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
-           FROM empaquetados_detalle ed
+           FROM (
+             SELECT DISTINCT ON (id_detalle) *
+             FROM empaquetados_detalle
+             ORDER BY id_detalle
+           ) ed
            JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
              JOIN destinos d ON d.id_destino = ec.id_destino
            JOIN productos p ON p.id_producto = ed.id_producto
@@ -3701,7 +3880,7 @@ app.get('/api/registros', async (req, res) => {
            SELECT
              alp.codigo_lote,
              COALESCE(SUM((elem.value->>'cantidad_validada')::int), 0)::int AS cantidad_almacen
-           FROM almacen_lotes_procesados alp
+           FROM almacen_unico alp
            LEFT JOIN LATERAL jsonb_array_elements(COALESCE(alp.resumen_validacion, '[]'::jsonb)) elem(value) ON true
            GROUP BY alp.codigo_lote
          ),
@@ -3718,7 +3897,7 @@ app.get('/api/registros', async (req, res) => {
              COALESCE(al.cantidad_almacen, 0) AS "CANTIDAD ALMACEN",
              TO_CHAR(${almacenTsVzExpr}, 'YYYY-MM-DD HH24:MI') AS "FECHA ENTRADA",
              alp.estado AS "ESTADO"
-           FROM almacen_lotes_procesados alp
+           FROM almacen_unico alp
            LEFT JOIN empa_reg el ON UPPER(TRIM(el.codigo_lote)) = ${almacenCabCodigoExpr}
            LEFT JOIN alm_lote al ON al.codigo_lote = alp.codigo_lote
            WHERE ${whereAlm.join(' AND ')}
@@ -3782,7 +3961,11 @@ app.get('/api/registros', async (req, res) => {
         r.nombre_completo AS "RESPONSABLE",
         s.nombre AS "SEDE",
         ed.numero_lote AS "NUMERO DE LOTE"
-      FROM empaquetados_detalle ed
+      FROM (
+        SELECT DISTINCT ON (id_detalle) *
+        FROM empaquetados_detalle
+        ORDER BY id_detalle
+      ) ed
       JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
       JOIN productos p ON p.id_producto = ed.id_producto
       JOIN destinos d ON d.id_destino = ec.id_destino
@@ -4004,7 +4187,11 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
            ed.id_producto,
            SUM(ed.cantidad)::int AS cantidad,
            MAX(ec.fecha_hora) AS fecha_hora
-         FROM empaquetados_detalle ed
+         FROM (
+           SELECT DISTINCT ON (id_detalle) *
+           FROM empaquetados_detalle
+           ORDER BY id_detalle
+         ) ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
           WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
@@ -4015,7 +4202,8 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
        pendientes AS (
          SELECT da.*
          FROM detalle_agregado da
-         LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = da.codigo_lote
+         LEFT JOIN almacen_lotes_procesados alp
+           ON UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))) = UPPER(TRIM(da.codigo_lote))
          WHERE alp.codigo_lote IS NULL
        )
        SELECT
@@ -4087,7 +4275,11 @@ app.post('/api/almacen09/validar-conteo', async (req, res) => {
            ELSE NULL
          END AS cestas_calculadas,
          STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_producto
-       FROM empaquetados_detalle ed
+       FROM (
+         SELECT DISTINCT ON (id_detalle) *
+         FROM empaquetados_detalle
+         ORDER BY id_detalle
+       ) ed
        JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
        JOIN destinos d ON d.id_destino = ec.id_destino
        JOIN productos p ON p.id_producto = ed.id_producto
@@ -4214,7 +4406,11 @@ app.post('/api/almacen09/borrar-lotes', async (req, res) => {
     const result = await pool.query(
       `WITH detalle_agregado AS (
          SELECT CONCAT('CAB-', ec.id_cabecera) AS codigo_lote
-         FROM empaquetados_detalle ed
+         FROM (
+           SELECT DISTINCT ON (id_detalle) *
+           FROM empaquetados_detalle
+           ORDER BY id_detalle
+         ) ed
          JOIN empaquetados_cabecera ec ON ec.id_cabecera = ed.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
@@ -4224,7 +4420,8 @@ app.post('/api/almacen09/borrar-lotes', async (req, res) => {
        pendientes AS (
          SELECT da.codigo_lote
          FROM detalle_agregado da
-         LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = da.codigo_lote
+         LEFT JOIN almacen_lotes_procesados alp
+           ON UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))) = UPPER(TRIM(da.codigo_lote))
          WHERE alp.codigo_lote IS NULL
        )
        INSERT INTO almacen_lotes_procesados (codigo_lote, estado)
@@ -4315,7 +4512,11 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
            cantidad_esperada,
            cantidad_recibida,
            created_at
-         FROM conteo_errores
+         FROM (
+           SELECT DISTINCT ON (id) *
+           FROM conteo_errores
+           ORDER BY id
+         ) conteo_errores
          WHERE ${whereParts.join(' AND ')}
        ),
        lotes_referencia AS (
@@ -4323,7 +4524,11 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
            CONCAT('CAB-', ec.id_cabecera) AS codigo_lote,
            STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia
          FROM empaquetados_cabecera ec
-         JOIN empaquetados_detalle ed ON ed.id_cabecera = ec.id_cabecera
+         JOIN (
+           SELECT DISTINCT ON (id_detalle) *
+           FROM empaquetados_detalle
+           ORDER BY id_detalle
+         ) ed ON ed.id_cabecera = ec.id_cabecera
          JOIN destinos d ON d.id_destino = ec.id_destino
          WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
@@ -4504,7 +4709,11 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
            LOWER(TRIM(cr.nombre_cliente)) AS cliente_key,
            UPPER(TRIM(item.value->>'codigo')) AS codigo,
            COALESCE(NULLIF(TRIM(item.value->>'cantidad'), ''), '0')::int AS cantidad
-         FROM cambios_registros cr
+         FROM (
+           SELECT DISTINCT ON (id_cambio) *
+           FROM cambios_registros
+           ORDER BY id_cambio
+         ) cr
          CROSS JOIN LATERAL jsonb_array_elements(
            CASE
              WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
@@ -4735,8 +4944,16 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sd.numero_lote,
          sd.cantidad,
          TO_CHAR(sd.created_at, 'YYYY-MM-DD HH24:MI:SS') AS detalle_created_at
-      FROM salidas_facturas sf
-       JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
+      FROM (
+        SELECT DISTINCT ON (id_factura) *
+        FROM salidas_facturas
+        ORDER BY id_factura
+      ) sf
+       JOIN (
+         SELECT DISTINCT ON (id_detalle) *
+         FROM almacen09_salidas_detalle
+         ORDER BY id_detalle
+       ) sd ON sd.id_factura = sf.id_factura
        ${whereSql}
        ORDER BY sf.fecha_emision DESC, sf.id_factura DESC, sd.id_detalle ASC
        LIMIT $${params.length + 1}
@@ -4943,7 +5160,11 @@ app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
          COALESCE(hoja_html, '') AS hoja_html,
          COALESCE(nombre_archivo, '') AS nombre_archivo,
          created_at
-       FROM hojas_ruta_exportadas
+       FROM (
+         SELECT DISTINCT ON (id_hoja) *
+         FROM hojas_ruta_exportadas
+         ORDER BY id_hoja
+       ) hojas_ruta_exportadas
        WHERE ${whereParts.join(' AND ')}`,
       params
     );
@@ -4983,7 +5204,11 @@ app.get('/api/hoja-ruta', async (req, res) => {
       appendVendedorAccessFilter(dateWhereParts, dateParams, auth, 'sf.vendedor_nombre');
       const dateResult = await pool.query(
         `SELECT TO_CHAR(MAX(sf.fecha_emision)::date, 'YYYY-MM-DD') AS fecha
-         FROM salidas_facturas sf
+         FROM (
+           SELECT DISTINCT ON (id_factura) *
+           FROM salidas_facturas
+           ORDER BY id_factura
+         ) sf
          WHERE ${dateWhereParts.join(' AND ')}`,
         dateParams
       );
@@ -5031,8 +5256,16 @@ app.get('/api/hoja-ruta', async (req, res) => {
          sd.cantidad,
          COALESCE(NULLIF(p.paquetes, 0), 10) AS paquetes_por_cesta,
          COALESCE(p.sobre_piso, 0) AS sobre_piso
-       FROM salidas_facturas sf
-       JOIN almacen09_salidas_detalle sd ON sd.id_factura = sf.id_factura
+       FROM (
+         SELECT DISTINCT ON (id_factura) *
+         FROM salidas_facturas
+         ORDER BY id_factura
+       ) sf
+       JOIN (
+         SELECT DISTINCT ON (id_detalle) *
+         FROM almacen09_salidas_detalle
+         ORDER BY id_detalle
+       ) sd ON sd.id_factura = sf.id_factura
        LEFT JOIN productos p ON p.id_producto = sd.id_producto
        WHERE ${sheetWhereParts.join(' AND ')}
        ORDER BY
@@ -5180,21 +5413,32 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
     }
 
     const result = await pool.query(
-      `WITH stock_validado AS (
+      `WITH validaciones_unicas AS (
+         SELECT DISTINCT ON (UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))))
+           alp.codigo_lote,
+           alp.processed_at
+         FROM almacen_lotes_procesados alp
+         WHERE alp.estado = 'validado'
+         ORDER BY UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))), alp.processed_at DESC, alp.codigo_lote DESC
+       ),
+       stock_validado AS (
          SELECT
            UPPER(TRIM(p.codigo_producto)) AS codigo_producto,
            p.descripcion AS producto,
            UPPER(TRIM(ed.numero_lote)) AS numero_lote,
            DATE(ec.fecha_hora) AS fecha_empaquetado,
            SUM(ed.cantidad)::int AS cantidad
-         FROM almacen_lotes_procesados alp
+         FROM validaciones_unicas alp
          JOIN empaquetados_cabecera ec
            ON UPPER(TRIM(CONCAT('CAB-', ec.id_cabecera))) = UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1)))
          JOIN destinos d ON d.id_destino = ec.id_destino
-         JOIN empaquetados_detalle ed ON ed.id_cabecera = ec.id_cabecera
+         JOIN (
+           SELECT DISTINCT ON (id_detalle) *
+           FROM empaquetados_detalle
+           ORDER BY id_detalle
+         ) ed ON ed.id_cabecera = ec.id_cabecera
          JOIN productos p ON p.id_producto = ed.id_producto
-         WHERE alp.estado = 'validado'
-           AND DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+         WHERE DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
            AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
            AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
          GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
@@ -5204,8 +5448,16 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
            UPPER(TRIM(sd.codigo_producto)) AS codigo_producto,
            UPPER(TRIM(sd.numero_lote)) AS numero_lote,
            SUM(sd.cantidad)::int AS cantidad_salida
-         FROM almacen09_salidas_detalle sd
-         JOIN salidas_facturas sf ON sf.id_factura = sd.id_factura
+         FROM (
+           SELECT DISTINCT ON (id_detalle) *
+           FROM almacen09_salidas_detalle
+           ORDER BY id_detalle
+         ) sd
+         JOIN (
+           SELECT DISTINCT ON (id_factura) *
+           FROM salidas_facturas
+           ORDER BY id_factura
+         ) sf ON sf.id_factura = sd.id_factura
          WHERE DATE(sf.fecha_emision) >= $1
          GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
        ),
@@ -5254,6 +5506,7 @@ async function startServer() {
   const startupSteps = [
     ['ensureAuthTables', ensureAuthTables],
     ['ensureAlmacen09Tables', ensureAlmacen09Tables],
+    ['ensureIdempotencyRequestsTable', ensureIdempotencyRequestsTable],
     ['ensureCambiosProductosTables', ensureCambiosProductosTables],
     ['ensureProductosSoftDelete', ensureProductosSoftDelete],
     ['ensureHistoricoResultadosTable', ensureHistoricoResultadosTable],
