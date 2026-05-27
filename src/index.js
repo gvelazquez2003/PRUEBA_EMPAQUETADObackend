@@ -257,8 +257,8 @@ function normalizeAuthRole(value) {
   const role = stripDiacritics(raw).toLowerCase();
   if (role === APP_ROLES.ADMIN || role === 'administrador') return APP_ROLES.ADMIN;
   if (role === APP_ROLES.PRODUCCION || role === 'empaquetado' || role === 'produccion' || role === 'producción') return APP_ROLES.PRODUCCION;
-  if (role === APP_ROLES.CONTROLP_CARGA || role === 'controlp' || role === 'control_p' || role === 'controlprod_carga' || role === 'control_produccion_carga') return APP_ROLES.CONTROLP_CARGA;
-  if (role === APP_ROLES.CONTROLP_EDITOR || role === 'controlp_editor' || role === 'controlprod_editor' || role === 'control_produccion_editor') return APP_ROLES.CONTROLP_EDITOR;
+  if (role === APP_ROLES.CONTROLP_CARGA || role === 'controlp' || role === 'control_p' || role === 'controlprod_carga' || role === 'control_produccion_carga' || role === 'control_carga') return APP_ROLES.CONTROLP_CARGA;
+  if (role === APP_ROLES.CONTROLP_EDITOR || role === 'controlp_editor' || role === 'controlprod_editor' || role === 'control_produccion_editor' || role === 'control_editor') return APP_ROLES.CONTROLP_EDITOR;
   if (role === APP_ROLES.ALMACEN || role === 'almacen') return APP_ROLES.ALMACEN;
   if (role === APP_ROLES.FACTURACION || role === 'facturacion' || role === 'facturación') return APP_ROLES.FACTURACION;
   if (role === APP_ROLES.VENTAS || role === 'ventas' || role === 'venta') return APP_ROLES.VENTAS;
