@@ -12,6 +12,7 @@ const adminKey = process.env.ADMIN_KEY || '#FANDETATA';
 const legacyAdminKey = '#FANDETATA';
 const STOCK_RESET_DATE = String(process.env.STOCK_RESET_DATE || '2026-03-30').trim();
 const AUTH_SESSION_TTL_HOURS = Number(process.env.AUTH_SESSION_TTL_HOURS || 168);
+const CONTROL_PRODUCCION_API_BASE = String(process.env.CONTROL_PRODUCCION_API_BASE || 'https://proyectosoftware-8poo.onrender.com').trim().replace(/\/+$/, '');
 const APP_ROLES = {
   ADMIN: 'administrador',
   PRODUCCION: 'produccion',
@@ -421,6 +422,42 @@ async function requireRolesForRequest(req, res, allowedRoles) {
 
   req.auth = session;
   return session;
+}
+
+async function callControlProduccionApi(pathname, options = {}) {
+  if (!CONTROL_PRODUCCION_API_BASE) {
+    throw new Error('CONTROL_PRODUCCION_API_BASE no configurado');
+  }
+
+  const url = `${CONTROL_PRODUCCION_API_BASE}${pathname}`;
+  const fetchOptions = {
+    method: options.method || 'GET',
+    headers: {
+      Accept: 'application/json',
+      ...(options.headers || {}),
+    },
+  };
+
+  if (options.body !== undefined) {
+    fetchOptions.body = JSON.stringify(options.body);
+    fetchOptions.headers['Content-Type'] = 'application/json';
+  }
+
+  const response = await fetch(url, fetchOptions);
+  const raw = await response.text();
+  let parsed = null;
+  try {
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    parsed = null;
+  }
+
+  if (!response.ok) {
+    const remoteError = parsed && typeof parsed.error === 'string' ? parsed.error : '';
+    throw new Error(remoteError || `Control Produccion upstream HTTP ${response.status}`);
+  }
+
+  return parsed;
 }
 
 async function hasAdminAccess(req) {
@@ -5992,6 +6029,45 @@ app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
+  }
+});
+
+app.get('/api/control-produccion/lotes-activos', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  if (!auth) return;
+
+  try {
+    const data = await callControlProduccionApi('/api/lotes_activos');
+    return res.json(data || { ok: true, lotes: [] });
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `No se pudo leer lotes activos: ${error.message}` });
+  }
+});
+
+app.post('/api/control-produccion/produccion', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  if (!auth) return;
+
+  try {
+    const data = await callControlProduccionApi('/api/produccion', {
+      method: 'POST',
+      body: req.body || {},
+    });
+    return res.json(data || { ok: true });
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `No se pudo guardar produccion: ${error.message}` });
+  }
+});
+
+app.get('/api/control-produccion/datos-graficos', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  try {
+    const data = await callControlProduccionApi('/api/datos_graficos');
+    return res.json(data || []);
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `No se pudieron cargar graficas: ${error.message}` });
   }
 });
 
