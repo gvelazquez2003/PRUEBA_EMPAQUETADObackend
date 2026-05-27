@@ -460,6 +460,28 @@ async function callControlProduccionApi(pathname, options = {}) {
   return parsed;
 }
 
+async function callControlProduccionApiWithApiFallback(pathname, options = {}) {
+  const candidates = [pathname];
+  if (pathname.startsWith('/api/')) {
+    candidates.push(pathname.replace('/api/', '/'));
+  } else {
+    candidates.push(`/api${pathname.startsWith('/') ? pathname : `/${pathname}`}`);
+  }
+
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      return await callControlProduccionApi(candidate, options);
+    } catch (error) {
+      const msg = String(error && error.message ? error.message : '');
+      const is404 = msg.includes('HTTP 404');
+      if (!is404) throw error;
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('Control Produccion upstream HTTP 404');
+}
+
 async function hasAdminAccess(req) {
   const sentKey = req.body?.adminKey || req.query?.adminKey || req.headers['x-admin-key'];
   if (isValidAdminKey(sentKey)) return true;
@@ -6037,7 +6059,7 @@ app.get('/api/control-produccion/lotes-activos', async (req, res) => {
   if (!auth) return;
 
   try {
-    const data = await callControlProduccionApi('/api/lotes_activos');
+    const data = await callControlProduccionApiWithApiFallback('/api/lotes_activos');
     return res.json(data || { ok: true, lotes: [] });
   } catch (error) {
     return res.status(502).json({ ok: false, error: `No se pudo leer lotes activos: ${error.message}` });
@@ -6049,7 +6071,7 @@ app.post('/api/control-produccion/produccion', async (req, res) => {
   if (!auth) return;
 
   try {
-    const data = await callControlProduccionApi('/api/produccion', {
+    const data = await callControlProduccionApiWithApiFallback('/api/produccion', {
       method: 'POST',
       body: req.body || {},
     });
@@ -6064,7 +6086,7 @@ app.get('/api/control-produccion/datos-graficos', async (req, res) => {
   if (!auth) return;
 
   try {
-    const data = await callControlProduccionApi('/api/datos_graficos');
+    const data = await callControlProduccionApiWithApiFallback('/api/datos_graficos');
     return res.json(data || []);
   } catch (error) {
     return res.status(502).json({ ok: false, error: `No se pudieron cargar graficas: ${error.message}` });
@@ -6082,7 +6104,7 @@ app.get('/api/control-produccion/historial', async (req, res) => {
       if (value) params.set(key, value);
     });
     const suffix = params.toString() ? `?${params.toString()}` : '';
-    const data = await callControlProduccionApi(`/api/historial${suffix}`);
+    const data = await callControlProduccionApiWithApiFallback(`/api/historial${suffix}`);
     return res.json(data || { ok: true, rows: [], total: 0 });
   } catch (error) {
     return res.status(502).json({ ok: false, error: `No se pudo leer historial: ${error.message}` });
@@ -6094,7 +6116,7 @@ app.put('/api/control-produccion/historial', async (req, res) => {
   if (!auth) return;
 
   try {
-    const data = await callControlProduccionApi('/api/produccion/editar', {
+    const data = await callControlProduccionApiWithApiFallback('/api/produccion/editar', {
       method: 'PUT',
       body: req.body || {},
     });
