@@ -6071,6 +6071,39 @@ app.get('/api/control-produccion/datos-graficos', async (req, res) => {
   }
 });
 
+app.get('/api/control-produccion/historial', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  if (!auth) return;
+
+  try {
+    const params = new URLSearchParams();
+    ['q', 'lote', 'amasadora', 'desde', 'hasta', 'limit', 'offset'].forEach((key) => {
+      const value = String(req.query?.[key] || '').trim();
+      if (value) params.set(key, value);
+    });
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    const data = await callControlProduccionApi(`/api/historial${suffix}`);
+    return res.json(data || { ok: true, rows: [], total: 0 });
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `No se pudo leer historial: ${error.message}` });
+  }
+});
+
+app.put('/api/control-produccion/historial', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  if (!auth) return;
+
+  try {
+    const data = await callControlProduccionApi('/api/produccion/editar', {
+      method: 'PUT',
+      body: req.body || {},
+    });
+    return res.json(data || { ok: true });
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `No se pudo editar registro: ${error.message}` });
+  }
+});
+
 app.get('/api/almacen09/stock-actual', async (req, res) => {
   try {
     const result = await getAlmacen09StockActualRows(pool, {
