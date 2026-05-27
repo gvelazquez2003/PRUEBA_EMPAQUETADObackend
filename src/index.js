@@ -16,6 +16,8 @@ const CONTROL_PRODUCCION_API_BASE = String(process.env.CONTROL_PRODUCCION_API_BA
 const APP_ROLES = {
   ADMIN: 'administrador',
   PRODUCCION: 'produccion',
+  CONTROLP_CARGA: 'controlp_carga',
+  CONTROLP_EDITOR: 'controlp_editor',
   ALMACEN: 'almacen',
   FACTURACION: 'facturacion',
   VENTAS: 'ventas',
@@ -255,6 +257,8 @@ function normalizeAuthRole(value) {
   const role = stripDiacritics(raw).toLowerCase();
   if (role === APP_ROLES.ADMIN || role === 'administrador') return APP_ROLES.ADMIN;
   if (role === APP_ROLES.PRODUCCION || role === 'empaquetado' || role === 'produccion' || role === 'producción') return APP_ROLES.PRODUCCION;
+  if (role === APP_ROLES.CONTROLP_CARGA || role === 'controlp' || role === 'control_p' || role === 'controlprod_carga' || role === 'control_produccion_carga') return APP_ROLES.CONTROLP_CARGA;
+  if (role === APP_ROLES.CONTROLP_EDITOR || role === 'controlp_editor' || role === 'controlprod_editor' || role === 'control_produccion_editor') return APP_ROLES.CONTROLP_EDITOR;
   if (role === APP_ROLES.ALMACEN || role === 'almacen') return APP_ROLES.ALMACEN;
   if (role === APP_ROLES.FACTURACION || role === 'facturacion' || role === 'facturación') return APP_ROLES.FACTURACION;
   if (role === APP_ROLES.VENTAS || role === 'ventas' || role === 'venta') return APP_ROLES.VENTAS;
@@ -500,7 +504,7 @@ async function ensureAuthTables() {
     CREATE TABLE IF NOT EXISTS auth_users (
       id_user SERIAL PRIMARY KEY,
       username VARCHAR(20) NOT NULL UNIQUE,
-      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas', 'vendedor')),
+      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'controlp_carga', 'controlp_editor', 'almacen', 'facturacion', 'ventas', 'vendedor')),
       password_hash TEXT NOT NULL,
       activo BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -528,7 +532,7 @@ async function ensureAuthTables() {
   await pool.query(`
     ALTER TABLE auth_users
     ADD CONSTRAINT auth_users_role_check
-    CHECK (role IN ('administrador', 'produccion', 'almacen', 'facturacion', 'ventas', 'vendedor')) NOT VALID
+    CHECK (role IN ('administrador', 'produccion', 'controlp_carga', 'controlp_editor', 'almacen', 'facturacion', 'ventas', 'vendedor')) NOT VALID
   `);
 
   // Normalize common role variants (case, whitespace, old names, accents)
@@ -572,7 +576,7 @@ async function ensureAuthTables() {
   await pool.query(`
     UPDATE auth_users
        SET role = 'almacen'
-     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','almacen','facturacion','ventas','vendedor')
+     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','controlp_carga','controlp_editor','almacen','facturacion','ventas','vendedor')
   `).catch(() => {});
 
   // Now validate the constraint (should succeed after normalization)
@@ -6055,7 +6059,7 @@ app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
 });
 
 app.get('/api/control-produccion/lotes-activos', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.CONTROLP_CARGA, APP_ROLES.CONTROLP_EDITOR]);
   if (!auth) return;
 
   try {
@@ -6067,7 +6071,7 @@ app.get('/api/control-produccion/lotes-activos', async (req, res) => {
 });
 
 app.post('/api/control-produccion/produccion', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.CONTROLP_CARGA, APP_ROLES.CONTROLP_EDITOR]);
   if (!auth) return;
 
   try {
@@ -6094,7 +6098,7 @@ app.get('/api/control-produccion/datos-graficos', async (req, res) => {
 });
 
 app.get('/api/control-produccion/historial', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.CONTROLP_CARGA, APP_ROLES.CONTROLP_EDITOR]);
   if (!auth) return;
 
   try {
@@ -6112,7 +6116,7 @@ app.get('/api/control-produccion/historial', async (req, res) => {
 });
 
 app.put('/api/control-produccion/historial', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.CONTROLP_EDITOR]);
   if (!auth) return;
 
   try {
