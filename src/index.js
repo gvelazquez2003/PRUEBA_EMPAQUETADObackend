@@ -5706,7 +5706,10 @@ app.get('/api/hoja-ruta/rutas', async (req, res) => {
 
   try {
     const params = [];
-    const whereParts = [`TRIM(COALESCE(ruta_nombre, '')) <> ''`];
+    const whereParts = [
+      `TRIM(COALESCE(ruta_nombre, '')) <> ''`,
+      `LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'`,
+    ];
     appendVendedorAccessFilter(whereParts, params, auth, 'vendedor_nombre');
     const result = await pool.query(
       `SELECT
@@ -5752,11 +5755,17 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   if ((fechaDesdeRaw && !isIsoDate(fechaDesdeRaw)) || (fechaHastaRaw && !isIsoDate(fechaHastaRaw))) {
     return res.status(400).json({ ok: false, error: 'Las fechas de busqueda deben tener formato YYYY-MM-DD' });
   }
+  if (facturas.some((factura) => normalizeSalidasText(factura?.transporte_nombre || factura?.transporte, 120).toLowerCase() === 'retiro')) {
+    return res.status(400).json({ ok: false, error: 'Las hojas de ruta son solo para despachos y no pueden incluir clientes con transporte retiro.' });
+  }
 
   try {
     if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
       const routeParams = [ruta];
-      const routeWhereParts = [`LOWER(TRIM(COALESCE(ruta_nombre, ''))) = LOWER(TRIM($1))`];
+      const routeWhereParts = [
+        `LOWER(TRIM(COALESCE(ruta_nombre, ''))) = LOWER(TRIM($1))`,
+        `LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'`,
+      ];
       appendVendedorAccessFilter(routeWhereParts, routeParams, auth, 'vendedor_nombre');
       const assignedRoute = await pool.query(
         `SELECT 1 FROM salidas_facturas WHERE ${routeWhereParts.join(' AND ')} LIMIT 1`,
@@ -5876,7 +5885,10 @@ app.get('/api/hoja-ruta', async (req, res) => {
 
     if (!fechaDesde && !fechaHasta) {
       const dateParams = [ruta];
-      const dateWhereParts = [`LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`];
+      const dateWhereParts = [
+        `LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`,
+        `LOWER(TRIM(COALESCE(sf.transporte_nombre, ''))) <> 'retiro'`,
+      ];
       appendVendedorAccessFilter(dateWhereParts, dateParams, auth, 'sf.vendedor_nombre');
       const dateResult = await pool.query(
         `SELECT TO_CHAR(MAX(sf.fecha_emision)::date, 'YYYY-MM-DD') AS fecha
@@ -5910,6 +5922,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
     const sheetWhereParts = [
       `LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = LOWER(TRIM($1))`,
       `sf.fecha_emision::date BETWEEN $2::date AND $3::date`,
+      `LOWER(TRIM(COALESCE(sf.transporte_nombre, ''))) <> 'retiro'`,
     ];
     appendVendedorAccessFilter(sheetWhereParts, sheetParams, auth, 'sf.vendedor_nombre');
     const result = await pool.query(
