@@ -39,9 +39,10 @@ try {
     `${pendingCte}
      SELECT COUNT(*)::int AS old_pending
      FROM detalle_agregado da
-     LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = da.codigo_lote
+     LEFT JOIN almacen_lotes_procesados alp
+       ON UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))) = UPPER(TRIM(da.codigo_lote))
      WHERE alp.codigo_lote IS NULL
-       AND da.fecha <> $1::date`,
+       AND da.fecha < ($1::date - 3)`,
     [targetDate]
   );
 
@@ -50,9 +51,10 @@ try {
      old_pending AS (
        SELECT da.codigo_lote
        FROM detalle_agregado da
-       LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = da.codigo_lote
+       LEFT JOIN almacen_lotes_procesados alp
+         ON UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))) = UPPER(TRIM(da.codigo_lote))
        WHERE alp.codigo_lote IS NULL
-         AND da.fecha <> $1::date
+         AND da.fecha < ($1::date - 3)
      )
      INSERT INTO almacen_lotes_procesados (codigo_lote, estado, processed_at)
      SELECT codigo_lote, 'descartado', NOW()
@@ -65,11 +67,12 @@ try {
 
   const after = await pool.query(
     `${pendingCte}
-     SELECT COUNT(*)::int AS today_pending
+     SELECT COUNT(*)::int AS pending_window
      FROM detalle_agregado da
-     LEFT JOIN almacen_lotes_procesados alp ON alp.codigo_lote = da.codigo_lote
+     LEFT JOIN almacen_lotes_procesados alp
+       ON UPPER(TRIM(SPLIT_PART(alp.codigo_lote, '::', 1))) = UPPER(TRIM(da.codigo_lote))
      WHERE alp.codigo_lote IS NULL
-       AND da.fecha = $1::date`,
+       AND da.fecha BETWEEN ($1::date - 3) AND $1::date`,
     [targetDate]
   );
 
@@ -77,7 +80,7 @@ try {
     fecha_objetivo: targetDate,
     pendientes_viejos_antes: before.rows[0]?.old_pending || 0,
     marcados_descartado: result.rowCount || 0,
-    pendientes_hoy: after.rows[0]?.today_pending || 0,
+    pendientes_en_ventana_3_dias: after.rows[0]?.pending_window || 0,
   }, null, 2));
 } catch (error) {
   console.error(error.message);

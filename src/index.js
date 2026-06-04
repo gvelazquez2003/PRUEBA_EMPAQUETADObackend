@@ -4955,7 +4955,8 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
          ) d ON d.id_destino = ec.id_destino
           WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
             AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-            AND ec.fecha_hora::date = (NOW() AT TIME ZONE 'America/Caracas')::date
+            AND ec.fecha_hora::date BETWEEN ((NOW() AT TIME ZONE 'America/Caracas')::date - 3)
+              AND (NOW() AT TIME ZONE 'America/Caracas')::date
           GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote)), ed.id_producto
         ),
        pendientes AS (
