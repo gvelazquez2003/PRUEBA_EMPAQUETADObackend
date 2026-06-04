@@ -22,6 +22,7 @@ const APP_ROLES = {
   FACTURACION: 'facturacion',
   VENTAS: 'ventas',
   VENDEDOR: 'vendedor',
+  CONDUCTOR: 'conductor',
 };
 const SALIDAS_DOCUMENT_TYPES = {
   FACTURA: 'factura',
@@ -29,6 +30,17 @@ const SALIDAS_DOCUMENT_TYPES = {
 };
 const INITIAL_ADMIN_USERNAMES = ['ATovar', 'EValerio', 'LGil'];
 const INITIAL_ADMIN_PASSWORD = String(process.env.INITIAL_ADMIN_PASSWORD || 'Admin12345');
+const INITIAL_DRIVER_PASSWORD = String(process.env.INITIAL_DRIVER_PASSWORD || 'C12345');
+const INITIAL_DRIVER_USERS = [
+  { username: 'YMENDEZ', fullName: 'Youglis Mendez', vehiclePlate: 'A06CA2M' },
+  { username: 'FHERRERA', fullName: 'Fernando Herrera', vehiclePlate: '34PMBB' },
+  { username: 'FJIMENEZ', fullName: 'Fransoa Jimenez', vehiclePlate: 'A88BE3S' },
+  { username: 'JMARTINEZ', fullName: 'Juan Martínez', vehiclePlate: 'A44CY7A' },
+  { username: 'JMONTANO', fullName: 'Jairo Montaño', vehiclePlate: 'A13BS5D' },
+  { username: 'WGUZMAN', fullName: 'Willys Guzman', vehiclePlate: '25SMBA' },
+  { username: 'JMAY', fullName: 'José May', vehiclePlate: 'A88EE5P' },
+  { username: 'OPLOGISTICO', fullName: 'OP Logistico', vehiclePlate: '' },
+];
 const MERMA_MOTIVOS = [
   'Adherido a Bandeja/Molde/Aro',
   'Adherido al Silpad',
@@ -263,11 +275,19 @@ function normalizeAuthRole(value) {
   if (role === APP_ROLES.FACTURACION || role === 'facturacion' || role === 'facturación') return APP_ROLES.FACTURACION;
   if (role === APP_ROLES.VENTAS || role === 'ventas' || role === 'venta') return APP_ROLES.VENTAS;
   if (role === APP_ROLES.VENDEDOR || role === 'vendedor' || role === 'seller') return APP_ROLES.VENDEDOR;
+  if (role === APP_ROLES.CONDUCTOR || role === 'conductor' || role === 'chofer' || role === 'driver') return APP_ROLES.CONDUCTOR;
   return '';
 }
 
 function normalizeAuthUsername(value) {
-  return String(value || '')
+  return stripDiacritics(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 20);
+}
+
+function normalizeVehiclePlate(value) {
+  return stripDiacritics(value)
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
     .slice(0, 20);
@@ -351,6 +371,8 @@ function buildAuthSessionResponse(row) {
     token: String(row.token || '').trim(),
     username: String(row.username || '').trim(),
     role: normalizeAuthRole(row.role),
+    fullName: String(row.fullName || row.full_name || '').trim(),
+    vehiclePlate: normalizeVehiclePlate(row.vehiclePlate || row.vehicle_plate || ''),
     loggedAt: row.loggedAt || row.logged_at || row.created_at || new Date().toISOString(),
     expiresAt: row.expiresAt || row.expires_at || null,
   };
@@ -384,7 +406,9 @@ async function getSessionContext(token, touch) {
        s.created_at AS logged_at,
        s.expires_at,
        u.username,
-       u.role
+       u.role,
+       COALESCE(u.full_name, '') AS full_name,
+       COALESCE(u.vehicle_plate, '') AS vehicle_plate
      FROM auth_sessions s
      JOIN auth_users u ON u.id_user = s.id_user
      WHERE s.token = $1
@@ -406,6 +430,8 @@ async function getSessionContext(token, touch) {
     userId: Number(row.id_user),
     username: String(row.username || '').trim(),
     role: normalizeAuthRole(row.role),
+    fullName: String(row.full_name || '').trim(),
+    vehiclePlate: normalizeVehiclePlate(row.vehicle_plate || ''),
     loggedAt: row.logged_at,
     expiresAt: row.expires_at || null,
   };
@@ -504,8 +530,10 @@ async function ensureAuthTables() {
     CREATE TABLE IF NOT EXISTS auth_users (
       id_user SERIAL PRIMARY KEY,
       username VARCHAR(20) NOT NULL UNIQUE,
-      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'controlp_carga', 'controlp_editor', 'almacen', 'facturacion', 'ventas', 'vendedor')),
+      role VARCHAR(20) NOT NULL CHECK (role IN ('administrador', 'produccion', 'controlp_carga', 'controlp_editor', 'almacen', 'facturacion', 'ventas', 'vendedor', 'conductor')),
       password_hash TEXT NOT NULL,
+      full_name VARCHAR(120),
+      vehicle_plate VARCHAR(20),
       activo BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -516,6 +544,9 @@ async function ensureAuthTables() {
     ALTER TABLE auth_users
     ALTER COLUMN username TYPE VARCHAR(20)
   `).catch(() => {});
+
+  await pool.query('ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS full_name VARCHAR(120)');
+  await pool.query('ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS vehicle_plate VARCHAR(20)');
 
   await pool.query(`
     ALTER TABLE auth_users
@@ -532,7 +563,7 @@ async function ensureAuthTables() {
   await pool.query(`
     ALTER TABLE auth_users
     ADD CONSTRAINT auth_users_role_check
-    CHECK (role IN ('administrador', 'produccion', 'controlp_carga', 'controlp_editor', 'almacen', 'facturacion', 'ventas', 'vendedor')) NOT VALID
+    CHECK (role IN ('administrador', 'produccion', 'controlp_carga', 'controlp_editor', 'almacen', 'facturacion', 'ventas', 'vendedor', 'conductor')) NOT VALID
   `);
 
   // Normalize common role variants (case, whitespace, old names, accents)
@@ -572,11 +603,17 @@ async function ensureAuthTables() {
      WHERE lower(trim(role)) IN ('vendedor', 'seller')
   `).catch(() => {});
 
+  await pool.query(`
+    UPDATE auth_users
+       SET role = 'conductor'
+     WHERE lower(trim(role)) IN ('conductor', 'chofer', 'driver')
+  `).catch(() => {});
+
   // Set any remaining unknown/empty roles to 'almacen' as a safe default
   await pool.query(`
     UPDATE auth_users
        SET role = 'almacen'
-     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','controlp_carga','controlp_editor','almacen','facturacion','ventas','vendedor')
+     WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','controlp_carga','controlp_editor','almacen','facturacion','ventas','vendedor','conductor')
   `).catch(() => {});
 
   // Now validate the constraint (should succeed after normalization)
@@ -640,6 +677,29 @@ async function ensureInitialAdminUsers() {
   }
 }
 
+async function ensureInitialDriverUsers() {
+  for (const driver of INITIAL_DRIVER_USERS) {
+    const username = normalizeAuthUsername(driver.username);
+    if (!username) continue;
+
+    const fullName = normalizeCatalogText(driver.fullName || username, 120) || username;
+    const vehiclePlate = normalizeVehiclePlate(driver.vehiclePlate || '');
+    const passwordHash = hashPassword(INITIAL_DRIVER_PASSWORD);
+    await pool.query(
+      `INSERT INTO auth_users (username, role, password_hash, full_name, vehicle_plate, activo)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       ON CONFLICT (username) DO UPDATE
+         SET role = EXCLUDED.role,
+             password_hash = EXCLUDED.password_hash,
+             full_name = EXCLUDED.full_name,
+             vehicle_plate = EXCLUDED.vehicle_plate,
+             activo = TRUE,
+             updated_at = NOW()`,
+      [username, APP_ROLES.CONDUCTOR, passwordHash, fullName, vehiclePlate]
+    );
+  }
+}
+
 app.post('/auth/register', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
   if (!auth) return;
@@ -647,6 +707,8 @@ app.post('/auth/register', async (req, res) => {
   const username = normalizeAuthUsername(req.body?.username);
   const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
+  const fullName = normalizeCatalogText(req.body?.full_name || req.body?.fullName || '', 120);
+  const vehiclePlate = normalizeVehiclePlate(req.body?.vehicle_plate || req.body?.vehiclePlate || '');
 
   if (!isValidAuthUsername(username)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
@@ -661,10 +723,10 @@ app.post('/auth/register', async (req, res) => {
   try {
     const passwordHash = hashPassword(password);
     const inserted = await pool.query(
-      `INSERT INTO auth_users (username, role, password_hash, activo)
-       VALUES ($1, $2, $3, TRUE)
-       RETURNING id_user, username, role, created_at`,
-      [username, role, passwordHash]
+      `INSERT INTO auth_users (username, role, password_hash, full_name, vehicle_plate, activo)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       RETURNING id_user, username, role, full_name, vehicle_plate, created_at`,
+      [username, role, passwordHash, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : '']
     );
 
     const user = inserted.rows[0];
@@ -673,6 +735,8 @@ app.post('/auth/register', async (req, res) => {
       user: {
         username: String(user.username || '').trim(),
         role: normalizeAuthRole(user.role),
+        full_name: String(user.full_name || '').trim(),
+        vehicle_plate: normalizeVehiclePlate(user.vehicle_plate || ''),
         createdAt: user.created_at,
       },
     });
@@ -695,7 +759,7 @@ app.post('/auth/login', async (req, res) => {
 
   try {
     const userResult = await pool.query(
-      `SELECT id_user, username, role, password_hash, created_at
+      `SELECT id_user, username, role, password_hash, full_name, vehicle_plate, created_at
        FROM auth_users
        WHERE username = $1
          AND activo = TRUE
@@ -721,6 +785,8 @@ app.post('/auth/login', async (req, res) => {
       token: sessionData.token,
       username: String(user.username || '').trim(),
       role: normalizeAuthRole(user.role),
+      fullName: String(user.full_name || '').trim(),
+      vehiclePlate: normalizeVehiclePlate(user.vehicle_plate || ''),
       loggedAt: new Date().toISOString(),
       expiresAt: sessionData.expiresAt,
     };
@@ -770,7 +836,7 @@ app.post('/auth/logout', async (req, res) => {
 async function listRegisteredUsers(_auth, res) {
   try {
     const result = await pool.query(
-      `SELECT username, role, created_at
+      `SELECT username, role, COALESCE(full_name, '') AS full_name, COALESCE(vehicle_plate, '') AS vehicle_plate, created_at
        FROM auth_users
        WHERE activo = TRUE
        ORDER BY
@@ -780,7 +846,8 @@ async function listRegisteredUsers(_auth, res) {
            WHEN 'facturacion' THEN 2
            WHEN 'ventas' THEN 3
            WHEN 'vendedor' THEN 4
-           WHEN 'produccion' THEN 5
+           WHEN 'conductor' THEN 5
+           WHEN 'produccion' THEN 6
            ELSE 9
          END,
          username ASC`
@@ -801,6 +868,35 @@ app.get('/auth/users/registered', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
   if (!auth) return;
   return listRegisteredUsers(auth, res);
+});
+
+app.get('/auth/conductores', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR, APP_ROLES.CONDUCTOR]);
+  if (!auth) return;
+
+  try {
+    const result = await pool.query(
+      `SELECT username, COALESCE(full_name, username) AS full_name, COALESCE(vehicle_plate, '') AS vehicle_plate
+       FROM auth_users
+       WHERE activo = TRUE
+         AND role = $1
+       ORDER BY
+         CASE WHEN username = 'OPLOGISTICO' THEN 1 ELSE 0 END,
+         full_name ASC,
+         username ASC`,
+      [APP_ROLES.CONDUCTOR]
+    );
+    return res.json({
+      ok: true,
+      drivers: result.rows.map((row) => ({
+        username: normalizeAuthUsername(row.username),
+        full_name: String(row.full_name || row.username || '').trim(),
+        vehicle_plate: normalizeVehiclePlate(row.vehicle_plate || ''),
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
 });
 
 async function deleteAuthUserWithAdmin(auth, targetUser) {
@@ -860,6 +956,8 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
   const username = normalizeAuthUsername(payload?.username);
   const role = normalizeAuthRole(payload?.role);
   const password = String(payload?.password || '');
+  const fullName = normalizeCatalogText(payload?.full_name || payload?.fullName || '', 120);
+  const vehiclePlate = normalizeVehiclePlate(payload?.vehicle_plate || payload?.vehiclePlate || '');
 
   if (!username || username.length < 2) {
     return { ok: false, status: 400, error: 'username invÃ¡lido' };
@@ -905,8 +1003,8 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
       }
     }
 
-    const fields = ['username = $1', 'role = $2', 'updated_at = NOW()'];
-    const params = [username, role];
+    const fields = ['username = $1', 'role = $2', 'full_name = $3', 'vehicle_plate = $4', 'updated_at = NOW()'];
+    const params = [username, role, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : ''];
     if (password) {
       params.push(hashPassword(password));
       fields.push(`password_hash = $${params.length}`);
@@ -917,7 +1015,7 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
       `UPDATE auth_users
           SET ${fields.join(', ')}
         WHERE id_user = $${params.length}
-        RETURNING id_user, username, role`,
+        RETURNING id_user, username, role, full_name, vehicle_plate`,
       params
     );
 
@@ -930,6 +1028,8 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
         user: {
           username: String(user.username || '').trim(),
           role: normalizeAuthRole(user.role),
+          full_name: String(user.full_name || '').trim(),
+          vehicle_plate: normalizeVehiclePlate(user.vehicle_plate || ''),
         },
         currentUserUpdated: Number(auth.userId) === Number(user.id_user),
       },
@@ -5673,7 +5773,7 @@ app.patch('/auth/profile', async (req, res) => {
           SET ${fields.join(', ')}
         WHERE id_user = $${params.length}
           AND activo = TRUE
-        RETURNING id_user, username, role`,
+        RETURNING id_user, username, role, full_name, vehicle_plate`,
       params
     );
 
@@ -5688,6 +5788,8 @@ app.patch('/auth/profile', async (req, res) => {
         token: auth.token,
         username: row.username,
         role: row.role,
+        full_name: row.full_name,
+        vehicle_plate: row.vehicle_plate,
         logged_at: auth.loggedAt,
         expires_at: auth.expiresAt,
       }),
@@ -5742,8 +5844,9 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   const totalCestas = Math.max(0, Math.floor(Number(req.body?.total_cestas) || 0));
   const facturas = Array.isArray(req.body?.facturas) ? req.body.facturas.slice(0, 500) : [];
   const usuario = normalizeAuthUsername(req.body?.usuario) || normalizeAuthUsername(auth?.username) || 'sistema';
+  const conductorUsername = normalizeAuthUsername(req.body?.conductor_username || req.body?.conductorUsername || '');
   const hojaHtml = String(req.body?.hoja_html || '').slice(0, 2000000);
-  const nombreArchivo = normalizeSalidasText(req.body?.nombre_archivo, 180);
+  let nombreArchivo = normalizeSalidasText(req.body?.nombre_archivo, 180);
 
   const isIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim());
   if (!ruta) {
@@ -5751,6 +5854,15 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   }
   if (!isIsoDate(fechaEntregaRaw)) {
     return res.status(400).json({ ok: false, error: 'fecha_entrega debe tener formato YYYY-MM-DD' });
+  }
+  if (!conductorUsername) {
+    return res.status(400).json({ ok: false, error: 'Selecciona un conductor valido para la hoja de ruta.' });
+  }
+  if (!conductor) {
+    return res.status(400).json({ ok: false, error: 'El nombre del conductor es obligatorio.' });
+  }
+  if (!numeroCamion) {
+    return res.status(400).json({ ok: false, error: 'La placa o numero de camion es obligatoria.' });
   }
   if ((fechaDesdeRaw && !isIsoDate(fechaDesdeRaw)) || (fechaHastaRaw && !isIsoDate(fechaHastaRaw))) {
     return res.status(400).json({ ok: false, error: 'Las fechas de busqueda deben tener formato YYYY-MM-DD' });
@@ -5760,6 +5872,31 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   }
 
   try {
+    const driverResult = await pool.query(
+      `SELECT username, COALESCE(full_name, username) AS full_name, COALESCE(vehicle_plate, '') AS vehicle_plate
+       FROM auth_users
+       WHERE username = $1
+         AND role = $2
+         AND activo = TRUE
+       LIMIT 1`,
+      [conductorUsername, APP_ROLES.CONDUCTOR]
+    );
+    if (!driverResult.rowCount) {
+      return res.status(400).json({ ok: false, error: 'El conductor seleccionado no existe o no esta activo.' });
+    }
+    const driver = driverResult.rows[0];
+    const driverPlate = normalizeVehiclePlate(driver.vehicle_plate || '');
+    if (driverPlate && normalizeVehiclePlate(numeroCamion) !== driverPlate) {
+      return res.status(400).json({ ok: false, error: `La placa asignada a ${driver.full_name || driver.username} es ${driverPlate}.` });
+    }
+    const fileSuffix = `_${conductorUsername}`;
+    const upperFileName = String(nombreArchivo || '').toUpperCase();
+    if (!upperFileName.endsWith(fileSuffix)) {
+      const maxBaseLength = Math.max(1, 180 - fileSuffix.length);
+      const baseFileName = normalizeSalidasText(nombreArchivo || 'RUTA', maxBaseLength);
+      nombreArchivo = `${baseFileName}${fileSuffix}`;
+    }
+
     if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
       const routeParams = [ruta];
       const routeWhereParts = [
@@ -6172,6 +6309,7 @@ async function startServer() {
     ['ensurePerformanceIndexes', ensurePerformanceIndexes],
     ['dropLegacyUnusedTables', dropLegacyUnusedTables],
     ['ensureInitialAdminUsers', ensureInitialAdminUsers],
+    ['ensureInitialDriverUsers', ensureInitialDriverUsers],
   ];
 
   for (const [stepName, step] of startupSteps) {
