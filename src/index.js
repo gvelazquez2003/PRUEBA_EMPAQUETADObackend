@@ -2099,7 +2099,7 @@ async function listZonasByCliente(client, clienteRaw, auth) {
   return Array.from(dedupe.values()).sort((a, b) => a.zona.localeCompare(b.zona, 'es', { sensitivity: 'base' }));
 }
 
-async function listRutasByCliente(client, clienteRaw, auth) {
+async function listRutasByCliente(client, clienteRaw, auth, options = {}) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   if (!cliente) return [];
   const params = [cliente];
@@ -2107,7 +2107,7 @@ async function listRutasByCliente(client, clienteRaw, auth) {
     `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
     `TRIM(COALESCE(ruta, '')) <> ''`,
   ];
-  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(ruta, '')) AS ruta,
@@ -2162,7 +2162,7 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth) {
   return result.rows.map(normalizeClienteDireccionMeta).filter((row) => row.direccion);
 }
 
-async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth) {
+async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth, options = {}) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   const ruta = normalizeSalidasText(rutaRaw, 120);
   if (!cliente || !ruta) return [];
@@ -2172,7 +2172,7 @@ async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth) {
     `LOWER(TRIM(COALESCE(ruta, ''))) = LOWER(TRIM($2))`,
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
-  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(direccion, '')) AS direccion,
@@ -2531,8 +2531,6 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
       whereParts.push(`CAST(id_cliente AS TEXT) ILIKE $${params.length}`);
     }
 
-    appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
-
     params.push(limit);
 
     const result = await pool.query(
@@ -2588,8 +2586,8 @@ app.get('/api/almacen09/cambios/contexto-cliente', async (req, res) => {
   }
 
   try {
-    const rutas = await listRutasByCliente(pool, clienteRaw, auth);
-    const direccionesMeta = rutaRaw ? await listDireccionesByClienteRuta(pool, clienteRaw, rutaRaw, auth) : [];
+    const rutas = await listRutasByCliente(pool, clienteRaw, auth, { skipVendedorFilter: true });
+    const direccionesMeta = rutaRaw ? await listDireccionesByClienteRuta(pool, clienteRaw, rutaRaw, auth, { skipVendedorFilter: true }) : [];
     return res.json({
       ok: true,
       cliente: clienteRaw,
@@ -2620,8 +2618,6 @@ app.get('/api/almacen09/cambios/ruta', async (req, res) => {
       `LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($2))`,
       `TRIM(COALESCE(ruta, '')) <> ''`
     ];
-    appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
-
     const result = await pool.query(
       `SELECT TRIM(COALESCE(ruta, '')) AS ruta
        FROM public.clientes
@@ -2981,15 +2977,6 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
   try {
     const cambioTsVzExpr = `(cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
     const params = [clienteRaw];
-    const vendedorWhereParts = [`LOWER(TRIM(COALESCE(c.descripcion, ''))) = LOWER(TRIM(cr.nombre_cliente))`];
-    appendVendedorAccessFilter(vendedorWhereParts, params, auth, 'c.vendedor');
-    const vendedorGuardSql = normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR
-      ? `AND EXISTS (
-           SELECT 1
-           FROM public.clientes c
-           WHERE ${vendedorWhereParts.join(' AND ')}
-         )`
-      : '';
     const extraWhereParts = [];
     if (direccionRaw) {
       params.push(direccionRaw);
@@ -3041,7 +3028,6 @@ app.get('/api/almacen09/cambios/por-cliente', async (req, res) => {
          END
        ) WITH ORDINALITY AS item(value, ord)
        WHERE LOWER(TRIM(cr.nombre_cliente)) = LOWER(TRIM($1))
-         ${vendedorGuardSql}
          ${extraWhereSql}
          AND NULLIF(TRIM(item.value->>'codigo'), '') IS NOT NULL
          AND NULLIF(TRIM(item.value->>'producto'), '') IS NOT NULL
