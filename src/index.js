@@ -2894,23 +2894,6 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     const direccionCatalog = direccionRaw
       ? await upsertSalidasCatalogValue(client, 'direccion', direccionRaw)
       : { id: null, value: '' };
-    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
-      const params = [clienteRaw];
-      const whereParts = [`LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`];
-      if (direccionRaw) {
-        params.push(direccionRaw);
-        whereParts.push(`LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($${params.length}))`);
-      }
-      appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
-      const assigned = await client.query(
-        `SELECT 1 FROM public.clientes WHERE ${whereParts.join(' AND ')} LIMIT 1`,
-        params
-      );
-      if (!assigned.rowCount) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({ ok: false, error: 'Cliente no asignado a este vendedor' });
-      }
-    }
     let rutaCambio = '';
     if (clienteRaw && direccionRaw) {
       const rutaResult = await client.query(
