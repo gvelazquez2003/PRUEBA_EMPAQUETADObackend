@@ -2067,7 +2067,7 @@ function normalizeClienteDireccionMeta(row) {
   };
 }
 
-async function listZonasByCliente(client, clienteRaw, auth) {
+async function listZonasByCliente(client, clienteRaw, auth, options = {}) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   if (!cliente) return [];
   const params = [cliente];
@@ -2075,7 +2075,7 @@ async function listZonasByCliente(client, clienteRaw, auth) {
     `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
     `TRIM(COALESCE(zona, '')) <> ''`,
   ];
-  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(zona, '')) AS zona,
@@ -2130,7 +2130,7 @@ async function listRutasByCliente(client, clienteRaw, auth, options = {}) {
   return Array.from(dedupe.values()).sort((a, b) => a.ruta.localeCompare(b.ruta, 'es', { sensitivity: 'base' }));
 }
 
-async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth) {
+async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth, options = {}) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   const zona = normalizeSalidasText(zonaRaw, 120);
   if (!cliente || !zona) return [];
@@ -2140,7 +2140,7 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth) {
     `LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))`,
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
-  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(direccion, '')) AS direccion,
@@ -2194,7 +2194,7 @@ async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth, o
   return result.rows.map(normalizeClienteDireccionMeta).filter((row) => row.direccion);
 }
 
-async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direccionRaw, auth) {
+async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direccionRaw, auth, options = {}) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   const zona = normalizeSalidasText(zonaRaw, 120);
   const direccion = normalizeSalidasText(direccionRaw, 240);
@@ -2205,7 +2205,7 @@ async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direcci
     `LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))`,
     `LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($3))`,
   ];
-  appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
        TRIM(COALESCE(direccion, '')) AS direccion,
@@ -2580,21 +2580,33 @@ app.get('/api/almacen09/cambios/contexto-cliente', async (req, res) => {
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
+  const zonaRaw = normalizeSalidasText(req.query?.zona, 120);
   const rutaRaw = normalizeSalidasText(req.query?.ruta, 120);
+  const direccionRaw = normalizeSalidasText(req.query?.direccion, 240);
   if (clienteRaw.length < 2) {
-    return res.json({ ok: true, cliente: clienteRaw, rutas: [], direcciones: [], direcciones_meta: [], autofill: null });
+    return res.json({ ok: true, cliente: clienteRaw, zonas: [], rutas: [], direcciones: [], direcciones_meta: [], autofill: null });
   }
 
   try {
-    const rutas = await listRutasByCliente(pool, clienteRaw, auth, { skipVendedorFilter: true });
-    const direccionesMeta = rutaRaw ? await listDireccionesByClienteRuta(pool, clienteRaw, rutaRaw, auth, { skipVendedorFilter: true }) : [];
+    const skipVendedorFilter = { skipVendedorFilter: true };
+    const zonas = await listZonasByCliente(pool, clienteRaw, auth, skipVendedorFilter);
+    const rutas = await listRutasByCliente(pool, clienteRaw, auth, skipVendedorFilter);
+    const direccionesMeta = zonaRaw
+      ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw, auth, skipVendedorFilter)
+      : rutaRaw
+        ? await listDireccionesByClienteRuta(pool, clienteRaw, rutaRaw, auth, skipVendedorFilter)
+        : [];
+    const autofill = direccionRaw
+      ? await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw, auth, skipVendedorFilter)
+      : null;
     return res.json({
       ok: true,
       cliente: clienteRaw,
+      zonas,
       rutas,
       direcciones: direccionesMeta.map((row) => row.direccion).filter(Boolean),
       direcciones_meta: direccionesMeta,
-      autofill: null,
+      autofill,
     });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
