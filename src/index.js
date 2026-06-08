@@ -2736,8 +2736,10 @@ async function getAlmacen09StockActualRows(db, options = {}) {
     : [];
   const loteFiltro = String(options.loteFiltro || '').trim().toLowerCase();
   const rawLimit = Number(options.limit);
+  const rawOffset = Number(options.offset);
   const hasLimit = Number.isFinite(rawLimit) && rawLimit > 0;
   const limit = hasLimit ? Math.min(Math.max(Math.floor(rawLimit), 1), 4000) : 0;
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
 
   const params = [desde];
   let dynamicWhere = '';
@@ -2763,6 +2765,11 @@ async function getAlmacen09StockActualRows(db, options = {}) {
   if (hasLimit) {
     params.push(limit);
     limitSql = ` LIMIT $${params.length}`;
+  }
+  let offsetSql = '';
+  if (offset > 0) {
+    params.push(offset);
+    offsetSql = ` OFFSET $${params.length}`;
   }
 
   const result = await db.query(
@@ -2850,14 +2857,18 @@ async function getAlmacen09StockActualRows(db, options = {}) {
        sa.producto,
        sa.numero_lote,
        TO_CHAR(sa.fecha_empaquetado, 'YYYY-MM-DD') AS fecha_empaquetado,
-       sa.cantidad
+       sa.cantidad,
+       SUM(sa.cantidad) OVER (PARTITION BY sa.codigo_producto)::int AS stock_producto_total,
+       COUNT(*) OVER()::int AS total_count
      FROM stock_actual sa
      WHERE sa.cantidad > 0 ${dynamicWhere}
-     ORDER BY sa.codigo_producto, sa.fecha_empaquetado, sa.numero_lote${limitSql}`,
+     ORDER BY sa.codigo_producto, sa.fecha_empaquetado, sa.numero_lote${limitSql}${offsetSql}`,
     params
   );
 
-  return { desde, rows: result.rows };
+  const total = Number(result.rows?.[0]?.total_count || 0);
+  const rows = result.rows.map(({ total_count, ...row }) => row);
+  return { desde, rows, total };
 }
 
 app.post('/api/almacen09/cambios', async (req, res) => {
@@ -6293,7 +6304,7 @@ app.put('/api/control-produccion/historial', async (req, res) => {
   }
 });
 
-app.get('/api/almacen09/stock-actual', async (req, res) => {
+async function sendAlmacen09StockActualResponse(req, res) {
   try {
     const result = await getAlmacen09StockActualRows(pool, {
       desde: req.query?.desde,
@@ -6301,11 +6312,24 @@ app.get('/api/almacen09/stock-actual', async (req, res) => {
       codigo: req.query?.codigo,
       loteFiltro: req.query?.loteFiltro,
       limit: req.query?.limit,
+      offset: req.query?.offset,
     });
-    return res.json({ ok: true, desde: result.desde, rows: result.rows, total: result.rows.length });
+    return res.json({ ok: true, desde: result.desde, rows: result.rows, total: result.total });
   } catch (error) {
     return res.status(500).json({ ok: false, error: 'Error al calcular stock actual desde Almacén09' });
   }
+}
+
+app.get('/api/almacen09/stock-actual', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+  return sendAlmacen09StockActualResponse(req, res);
+});
+
+app.get('/api/stock/actual', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  return sendAlmacen09StockActualResponse(req, res);
 });
 
 async function startServer() {
