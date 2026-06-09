@@ -2728,7 +2728,13 @@ app.get('/api/almacen09/cambios/razones', async (req, res) => {
 
 async function getAlmacen09StockActualRows(db, options = {}) {
   const desdeRaw = String(options.desde || STOCK_RESET_DATE).trim();
+  const hastaRaw = String(options.hasta || '').trim();
   const desde = /^\d{4}-\d{2}-\d{2}$/.test(desdeRaw) ? desdeRaw : STOCK_RESET_DATE;
+  const hasHasta = /^\d{4}-\d{2}-\d{2}$/.test(hastaRaw);
+  const hasta = hasHasta ? hastaRaw : '';
+  const useRange = Boolean(hasta);
+  const fromDate = useRange && desde > hasta ? hasta : desde;
+  const toDate = useRange && desde > hasta ? desde : hasta;
   const q = String(options.q || '').trim();
   const codigo = String(options.codigo || '').trim().toUpperCase();
   const codigos = Array.isArray(options.codigos)
@@ -2741,7 +2747,14 @@ async function getAlmacen09StockActualRows(db, options = {}) {
   const limit = hasLimit ? Math.min(Math.max(Math.floor(rawLimit), 1), 4000) : 0;
   const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
 
-  const params = [desde];
+  const params = [fromDate];
+  const stockDateWhere = useRange
+    ? `DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') BETWEEN $1 AND $2`
+    : `DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1`;
+  const salidasDateWhere = useRange
+    ? `DATE(sf.fecha_emision) BETWEEN $1 AND $2`
+    : `DATE(sf.fecha_emision) >= $1`;
+  if (useRange) params.push(toDate);
   let dynamicWhere = '';
 
   if (codigo) {
@@ -2806,7 +2819,7 @@ async function getAlmacen09StockActualRows(db, options = {}) {
          FROM productos
          ORDER BY id_producto
        ) p ON p.id_producto = ed.id_producto
-       WHERE DATE(alp.processed_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas') >= $1
+       WHERE ${stockDateWhere}
          AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
          AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
        GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
@@ -2826,7 +2839,7 @@ async function getAlmacen09StockActualRows(db, options = {}) {
          FROM salidas_facturas
          ORDER BY id_factura
        ) sf ON sf.id_factura = sd.id_factura
-       WHERE DATE(sf.fecha_emision) >= $1
+      WHERE ${salidasDateWhere}
        GROUP BY UPPER(TRIM(sd.codigo_producto)), UPPER(TRIM(sd.numero_lote))
      ),
      base AS (
@@ -2868,7 +2881,7 @@ async function getAlmacen09StockActualRows(db, options = {}) {
 
   const total = Number(result.rows?.[0]?.total_count || 0);
   const rows = result.rows.map(({ total_count, ...row }) => row);
-  return { desde, rows, total };
+  return { desde: fromDate, hasta: useRange ? toDate : '', rows, total };
 }
 
 app.post('/api/almacen09/cambios', async (req, res) => {
@@ -6308,13 +6321,14 @@ async function sendAlmacen09StockActualResponse(req, res) {
   try {
     const result = await getAlmacen09StockActualRows(pool, {
       desde: req.query?.desde,
+      hasta: req.query?.hasta,
       q: req.query?.q,
       codigo: req.query?.codigo,
       loteFiltro: req.query?.loteFiltro,
       limit: req.query?.limit,
       offset: req.query?.offset,
     });
-    return res.json({ ok: true, desde: result.desde, rows: result.rows, total: result.total });
+    return res.json({ ok: true, desde: result.desde, hasta: result.hasta, rows: result.rows, total: result.total });
   } catch (error) {
     return res.status(500).json({ ok: false, error: 'Error al calcular stock actual desde Almacén09' });
   }
