@@ -13,6 +13,8 @@ const legacyAdminKey = '#FANDETATA';
 const STOCK_RESET_DATE = String(process.env.STOCK_RESET_DATE || '2026-03-30').trim();
 const AUTH_SESSION_TTL_HOURS = Number(process.env.AUTH_SESSION_TTL_HOURS || 168);
 const CONTROL_PRODUCCION_API_BASE = String(process.env.CONTROL_PRODUCCION_API_BASE || 'https://proyectosoftware-8poo.onrender.com').trim().replace(/\/+$/, '');
+const ALMACEN09_ENTRADAS_START_DATE = String(process.env.ALMACEN09_ENTRADAS_START_DATE || '2026-06-09').trim();
+const ALMACEN09_ENTRADAS_VISIBLE_DAYS = Math.max(0, Number(process.env.ALMACEN09_ENTRADAS_VISIBLE_DAYS || 2) || 2);
 const APP_ROLES = {
   ADMIN: 'administrador',
   PRODUCCION: 'produccion',
@@ -4960,7 +4962,7 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
          ) d ON d.id_destino = ec.id_destino
           WHERE TRIM(COALESCE(ed.numero_lote, '')) <> ''
             AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-            AND ec.fecha_hora::date BETWEEN ((NOW() AT TIME ZONE 'America/Caracas')::date - 3)
+            AND ec.fecha_hora::date BETWEEN GREATEST($1::date, (NOW() AT TIME ZONE 'America/Caracas')::date - $2::int)
               AND (NOW() AT TIME ZONE 'America/Caracas')::date
           GROUP BY ec.id_cabecera, ec.numero_registro, UPPER(TRIM(ed.numero_lote)), ed.id_producto
         ),
@@ -5000,7 +5002,8 @@ app.get('/api/almacen09/lotes', async (_req, res) => {
          ORDER BY id_producto
        ) pr ON pr.id_producto = p.id_producto
        GROUP BY p.codigo_lote
-       ORDER BY MAX(p.fecha_hora) ASC`
+       ORDER BY MAX(p.fecha_hora) ASC`,
+      [ALMACEN09_ENTRADAS_START_DATE, ALMACEN09_ENTRADAS_VISIBLE_DAYS]
     );
 
     res.json(result.rows);
