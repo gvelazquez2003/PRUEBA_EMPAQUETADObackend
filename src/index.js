@@ -5399,8 +5399,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const rutaInputRaw = normalizeSalidasText(req.body?.ruta, 120);
   const transporteInputRaw = normalizeSalidasText(req.body?.transporte, 120);
 
-  const numeroFacturaDigits = String(numeroFacturaRaw).replace(/\D+/g, '').slice(0, 4);
-  const numeroFactura = numeroFacturaDigits ? numeroFacturaDigits.padStart(4, '0') : '';
+  const numeroFacturaDigits = String(numeroFacturaRaw).replace(/\D+/g, '').slice(0, 8);
+  const numeroFactura = numeroFacturaDigits ? numeroFacturaDigits.padStart(8, '0') : '';
   const fechaEmision = /^\d{4}-\d{2}-\d{2}$/.test(fechaEmisionRaw)
     ? `${fechaEmisionRaw} 00:00:00`
     : fechaEmisionRaw;
@@ -5409,8 +5409,8 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     ? Math.floor(numeroControlProvided)
     : null;
 
-  if (!/^[0-9]{1,4}$/.test(numeroFacturaDigits)) {
-    return res.status(400).json({ ok: false, error: 'numero_factura debe tener entre 1 y 4 dígitos numéricos' });
+  if (!/^[0-9]{1,8}$/.test(numeroFacturaDigits)) {
+    return res.status(400).json({ ok: false, error: 'numero_factura debe tener entre 1 y 8 dígitos numéricos' });
   }
   if (!detalleRaw.length) {
     return res.status(400).json({ ok: false, error: 'detalle es obligatorio' });
