@@ -2069,6 +2069,90 @@ function normalizeClienteDireccionMeta(row) {
   };
 }
 
+function normalizeDireccionMatchKey(value) {
+  return stripDiacritics(value)
+    .toUpperCase()
+    .replace(/\bAVENIDA\b|\bAVDA\b|\bAV\b/g, ' AV ')
+    .replace(/\bURBANIZACION\b|\bURB\b/g, ' URB ')
+    .replace(/\bCALLE\b|\bCLL\b/g, ' CALLE ')
+    .replace(/\bEDIFICIO\b|\bEDIF\b/g, ' EDIF ')
+    .replace(/\bAPARTAMENTO\b|\bAPTO\b/g, ' APTO ')
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function scoreDireccionMatch(source, candidate) {
+  const a = normalizeDireccionMatchKey(source);
+  const b = normalizeDireccionMatchKey(candidate);
+  if (!a || !b) return 0;
+  if (a === b) return 100;
+  const ac = a.replace(/\s+/g, '');
+  const bc = b.replace(/\s+/g, '');
+  if (ac === bc) return 98;
+  const shorter = ac.length <= bc.length ? ac : bc;
+  const longer = ac.length > bc.length ? ac : bc;
+  if (shorter.length >= 12 && longer.includes(shorter)) return 92;
+
+  const aTokens = new Set(a.split(' ').filter((token) => token.length > 1));
+  const bTokens = new Set(b.split(' ').filter((token) => token.length > 1));
+  if (!aTokens.size || !bTokens.size) return 0;
+  let common = 0;
+  aTokens.forEach((token) => {
+    if (bTokens.has(token)) common += 1;
+  });
+  return Math.round((common / Math.max(aTokens.size, bTokens.size)) * 88);
+}
+
+function findBestClienteDireccionMeta(rows, direccionRaw, vendedorRaw = '') {
+  const vendedorKey = normalizeAuthLookupText(vendedorRaw);
+  let best = null;
+  let bestScore = 0;
+  for (const row of rows || []) {
+    const meta = normalizeClienteDireccionMeta(row);
+    const direccionScore = scoreDireccionMatch(direccionRaw, meta.direccion);
+    if (!direccionScore) continue;
+    const vendedorDb = normalizeAuthLookupText(meta.vendedor);
+    const vendedorBonus = vendedorKey && vendedorDb && (vendedorKey === vendedorDb || vendedorKey.includes(vendedorDb) || vendedorDb.includes(vendedorKey)) ? 8 : 0;
+    const score = direccionScore + vendedorBonus;
+    if (score > bestScore) {
+      bestScore = score;
+      best = meta;
+    }
+  }
+  return bestScore >= 58 ? best : null;
+}
+
+async function listDireccionesMetaByCliente(client, clienteRaw, auth, options = {}) {
+  const cliente = normalizeSalidasText(clienteRaw, 160);
+  if (!cliente) return [];
+  const params = [cliente];
+  const whereParts = [
+    `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
+    `TRIM(COALESCE(direccion, '')) <> ''`,
+  ];
+  if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
+  const result = await client.query(
+    `SELECT
+       TRIM(COALESCE(direccion, '')) AS direccion,
+       TRIM(COALESCE(zona, '')) AS zona,
+       TRIM(COALESCE(ruta, '')) AS ruta,
+       TRIM(COALESCE(transporte, '')) AS transporte,
+       TRIM(COALESCE(vendedor, '')) AS vendedor
+     FROM public.clientes
+     WHERE ${whereParts.join(' AND ')}
+     GROUP BY
+       TRIM(COALESCE(direccion, '')),
+       TRIM(COALESCE(zona, '')),
+       TRIM(COALESCE(ruta, '')),
+       TRIM(COALESCE(transporte, '')),
+       TRIM(COALESCE(vendedor, ''))
+     ORDER BY TRIM(COALESCE(direccion, '')) ASC`,
+    params
+  );
+  return result.rows.map(normalizeClienteDireccionMeta).filter((row) => row.direccion);
+}
+
 async function listZonasByCliente(client, clienteRaw, auth, options = {}) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   if (!cliente) return [];
@@ -2655,16 +2739,29 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
   const zonaRaw = normalizeSalidasText(req.query?.zona, 120);
   const direccionRaw = normalizeSalidasText(req.query?.direccion, 240);
+  const vendedorRaw = normalizeSalidasText(req.query?.vendedor, 160);
   if (clienteRaw.length < 2) {
     return res.json({ ok: true, cliente: clienteRaw, zonas: [], direcciones: [], direcciones_meta: [], sucursales: [], autofill: null });
   }
 
   try {
     const zonas = await listZonasByCliente(pool, clienteRaw, auth);
-    const direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw, auth) : [];
-    const autofill = direccionRaw
-      ? await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw, auth)
-      : null;
+    let direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw, auth) : [];
+    let autofill = null;
+    if (direccionRaw) {
+      if (zonaRaw) {
+        autofill = await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw, auth)
+          || findBestClienteDireccionMeta(direccionesMeta, direccionRaw, vendedorRaw);
+      } else {
+        const allDireccionesMeta = await listDireccionesMetaByCliente(pool, clienteRaw, auth);
+        autofill = findBestClienteDireccionMeta(allDireccionesMeta, direccionRaw, vendedorRaw);
+        if (autofill?.zona) {
+          direccionesMeta = await listDireccionesByClienteZona(pool, clienteRaw, autofill.zona, auth);
+        } else {
+          direccionesMeta = allDireccionesMeta;
+        }
+      }
+    }
     return res.json({
       ok: true,
       cliente: clienteRaw,
