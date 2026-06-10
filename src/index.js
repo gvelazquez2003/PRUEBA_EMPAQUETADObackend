@@ -6320,6 +6320,21 @@ app.put('/api/control-produccion/historial', async (req, res) => {
   }
 });
 
+app.delete('/api/control-produccion/historial', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.CONTROLP_EDITOR]);
+  if (!auth) return;
+
+  try {
+    const data = await callControlProduccionApiWithApiFallback('/api/produccion/eliminar', {
+      method: 'DELETE',
+      body: req.body || {},
+    });
+    return res.json(data || { ok: true });
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `No se pudo eliminar registro: ${error.message}` });
+  }
+});
+
 async function sendAlmacen09StockActualResponse(req, res) {
   try {
     const result = await getAlmacen09StockActualRows(pool, {
