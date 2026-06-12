@@ -6377,7 +6377,13 @@ app.get('/api/control-produccion/datos-graficos', async (req, res) => {
   if (!auth) return;
 
   try {
-    const data = await callControlProduccionApiWithApiFallback('/api/datos_graficos');
+    const params = new URLSearchParams();
+    ['restriccion', 'excluir', 'desde', 'hasta'].forEach((key) => {
+      const value = String(req.query?.[key] || '').trim();
+      if (value) params.set(key, value);
+    });
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    const data = await callControlProduccionApiWithApiFallback(`/api/datos_graficos${suffix}`);
     return res.json(data || []);
   } catch (error) {
     return res.status(502).json({ ok: false, error: `No se pudieron cargar graficas: ${error.message}` });
