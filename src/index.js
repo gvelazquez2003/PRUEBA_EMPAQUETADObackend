@@ -4285,16 +4285,15 @@ app.get('/api/registros', async (req, res) => {
           cg.id_control AS "__ROW_ID",
           'control_inventario_guardia'::text AS "__ROW_SOURCE",
           TO_CHAR(cg.created_at, 'YYYY-MM-DD') AS "FECHA",
-          TO_CHAR(cg.created_at, 'DD/MM/YYYY HH24:MI:SS') AS "Fecha",
-          TO_CHAR(cg.fecha_elaboracion, 'DD/MM/YYYY') AS "FECHA DE ELABORACION",
-          p.codigo_producto AS "Codigo",
-          p.descripcion AS "Producto",
-          cg.cantidad_fisica_contada AS "Cantidad contada",
-          COALESCE(NULLIF(TRIM(cg.responsable), ''), NULLIF(TRIM(cg.almacenista), ''), '') AS "Almacenista",
+          TO_CHAR(cg.created_at, 'DD/MM/YYYY HH24:MI:SS') AS "Fecha y Hora",
+          COALESCE(NULLIF(TRIM(au.full_name), ''), NULLIF(TRIM(cg.responsable), ''), NULLIF(TRIM(cg.almacenista), ''), '') AS "Usuario",
           cg.turno_actual AS "Turno",
           cg.momento_conteo AS "Momento",
+          p.codigo_producto AS "Codigo",
+          cg.cantidad_fisica_contada AS "Cantidad Contada",
+          TO_CHAR(cg.fecha_elaboracion, 'DD/MM/YYYY') AS "Fecha de Elaboracion",
           cg.almacen AS "Almacen",
-          cg.cestas AS "Cestas"
+          p.descripcion AS "Producto"
          FROM (
            SELECT DISTINCT ON (id_control) *
            FROM control_inventario_guardia
@@ -4305,6 +4304,8 @@ app.get('/api/registros', async (req, res) => {
            FROM productos
            ORDER BY id_producto
          ) p ON p.id_producto = cg.id_producto
+         LEFT JOIN auth_users au
+           ON UPPER(TRIM(au.username)) = UPPER(TRIM(COALESCE(NULLIF(cg.responsable, ''), NULLIF(cg.almacenista, ''), '')))
          ${whereClause}
          ORDER BY cg.created_at DESC, cg.id_control DESC
          LIMIT $${params.length - 1}
@@ -4316,7 +4317,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha', 'FECHA DE ELABORACION', 'Codigo', 'Producto', 'Cantidad contada', 'Almacenista', 'Turno', 'Momento', 'Almacen', 'Cestas'];
+        : ['Fecha y Hora', 'Usuario', 'Turno', 'Momento', 'Codigo', 'Cantidad Contada', 'Fecha de Elaboracion', 'Almacen', 'Producto'];
       return res.json({
         ok: true,
         sheet: 'Control de Inventario',
