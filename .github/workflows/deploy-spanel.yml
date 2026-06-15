@@ -39,13 +39,33 @@ jobs:
           SSH_PRIVATE_KEY: ${{ secrets.SPANEL_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/spanel_deploy_key
-          chmod 600 ~/.ssh/spanel_deploy_key
-          ssh-keyscan -p "${SSH_PORT:-22}" "$SSH_HOST" >> ~/.ssh/known_hosts
+          SSH_PORT="${SSH_PORT:-22}"
 
-          ssh -i ~/.ssh/spanel_deploy_key -p "${SSH_PORT:-22}" "$SSH_USER@$SSH_HOST" <<'REMOTE'
-            set -e
+          echo "Preparing SSH key..."
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/spanel_deploy_key
+          chmod 600 ~/.ssh/spanel_deploy_key
+
+          if ! ssh-keygen -y -f ~/.ssh/spanel_deploy_key > /dev/null 2>&1; then
+            echo "::error::SPANEL_SSH_PRIVATE_KEY is not a valid private key or was pasted incorrectly."
+            exit 1
+          fi
+
+          echo "Scanning SSH host key..."
+          if ! timeout 20 ssh-keyscan -T 10 -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts; then
+            echo "::error::Could not reach SSH host/port. Check SPANEL_SSH_HOST and SPANEL_SSH_PORT."
+            exit 1
+          fi
+
+          echo "Testing SSH login..."
+          if ! ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -i ~/.ssh/spanel_deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "echo SSH_OK"; then
+            echo "::error::SSH login failed. Check SPANEL_SSH_USER, the private key secret, and that the matching public key is in /home/$SSH_USER/.ssh/authorized_keys on SPanel."
+            exit 1
+          fi
+
+          echo "Deploying backend..."
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -i ~/.ssh/spanel_deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<'REMOTE'
+            set -eux
             cd /home/admin01/api.produccionpdt.com
             git pull --ff-only origin main
             npm install
