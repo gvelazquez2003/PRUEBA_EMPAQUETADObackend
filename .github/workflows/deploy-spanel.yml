@@ -9,6 +9,28 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate SSH secrets
+        env:
+          SSH_HOST: ${{ secrets.SPANEL_SSH_HOST }}
+          SSH_PORT: ${{ secrets.SPANEL_SSH_PORT }}
+          SSH_USER: ${{ secrets.SPANEL_SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SPANEL_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in SSH_HOST SSH_USER SSH_PRIVATE_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing GitHub secret mapped to $name"
+              missing=1
+            fi
+          done
+          if [ -z "${SSH_PORT}" ]; then
+            echo "SSH_PORT not set; using default port 22."
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
       - name: Deploy over SSH
         env:
           SSH_HOST: ${{ secrets.SPANEL_SSH_HOST }}
