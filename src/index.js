@@ -324,6 +324,28 @@ function isValidAuthUsername(username) {
   return /^[A-Z0-9]{2,20}$/.test(clean) && /[A-Z]/.test(clean);
 }
 
+async function authUsernameExists(db, username, excludeUserId) {
+  const cleanUsername = normalizeAuthUsername(username);
+  if (!cleanUsername) return false;
+
+  const params = [cleanUsername];
+  let excludeSql = '';
+  if (Number.isInteger(Number(excludeUserId)) && Number(excludeUserId) > 0) {
+    params.push(Number(excludeUserId));
+    excludeSql = `AND id_user <> $${params.length}`;
+  }
+
+  const result = await db.query(
+    `SELECT 1
+       FROM auth_users
+      WHERE username = $1
+        ${excludeSql}
+      LIMIT 1`,
+    params
+  );
+  return Boolean(result.rowCount);
+}
+
 function hashPassword(password) {
   const clean = String(password || '');
   const salt = crypto.randomBytes(16).toString('hex');
@@ -707,7 +729,6 @@ app.post('/auth/register', async (req, res) => {
   if (!auth) return;
 
   const username = normalizeAuthUsername(req.body?.username);
-  const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
   const fullName = normalizeCatalogText(req.body?.full_name || req.body?.fullName || '', 120);
   const vehiclePlate = normalizeVehiclePlate(req.body?.vehicle_plate || req.body?.vehiclePlate || '');
@@ -723,6 +744,10 @@ app.post('/auth/register', async (req, res) => {
   }
 
   try {
+    if (await authUsernameExists(pool, username)) {
+      return res.status(409).json({ ok: false, error: 'Ese usuario ya existe' });
+    }
+
     const passwordHash = hashPassword(password);
     const inserted = await pool.query(
       `INSERT INTO auth_users (username, role, password_hash, full_name, vehicle_plate, activo)
@@ -752,10 +777,9 @@ app.post('/auth/register', async (req, res) => {
 
 app.post('/auth/login', async (req, res) => {
   const username = normalizeAuthUsername(req.body?.username);
-  const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
 
-  if (!isValidAuthUsername(username) || !role || password.length < 4) {
+  if (!isValidAuthUsername(username) || password.length < 4) {
     return res.status(400).json({ ok: false, error: 'Credenciales inválidas' });
   }
 
@@ -774,9 +798,6 @@ app.post('/auth/login', async (req, res) => {
     }
 
     const user = userResult.rows[0];
-    if (normalizeAuthRole(user.role) !== role) {
-      return res.status(401).json({ ok: false, error: 'Credenciales inválidas' });
-    }
 
     if (!verifyPassword(password, user.password_hash)) {
       return res.status(401).json({ ok: false, error: 'Credenciales inválidas' });
@@ -990,6 +1011,11 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
     }
 
     const target = targetResult.rows[0];
+    if (await authUsernameExists(client, username, Number(target.id_user))) {
+      await client.query('ROLLBACK');
+      return { ok: false, status: 409, error: 'Ese usuario ya existe' };
+    }
+
     const oldRole = normalizeAuthRole(target.role);
     if (oldRole === APP_ROLES.ADMIN && role !== APP_ROLES.ADMIN) {
       const adminsResult = await client.query(
