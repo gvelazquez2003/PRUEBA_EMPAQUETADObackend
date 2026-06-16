@@ -4102,6 +4102,7 @@ app.get('/api/registros', async (req, res) => {
           TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
           TO_CHAR(${cambioTsVzExpr}, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
           cr.nombre_cliente AS "Nombre del cliente",
+          COALESCE(NULLIF(TRIM(cr.direccion_texto), ''), '') AS "Direccion del cliente",
           ${cambioRutaExpr} AS "Ruta",
           COALESCE(productos.productos_cambiados, '') AS "Producto(s) cambiados",
           COALESCE(productos.cantidades, '') AS "Cantidad de cada uno",
@@ -4170,7 +4171,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha de registro', 'Nombre del cliente', 'Ruta', 'Producto(s) cambiados', 'Cantidad de cada uno', 'Razon del cambio', 'Responsable del registro'];
+        : ['Fecha de registro', 'Nombre del cliente', 'Direccion del cliente', 'Ruta', 'Producto(s) cambiados', 'Cantidad de cada uno', 'Razon del cambio', 'Responsable del registro'];
       return res.json({
         ok: true,
         sheet: 'Cambios',
