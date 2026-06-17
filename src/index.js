@@ -1365,6 +1365,7 @@ async function ensureCambiosProductosTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cambios_registros (
       id_cambio BIGSERIAL PRIMARY KEY,
+      codigo_cambio VARCHAR(20),
       id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       nombre_cliente VARCHAR(180) NOT NULL,
       direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
@@ -1408,6 +1409,7 @@ async function ensureCambiosProductosTables() {
   await pool.query('ALTER TABLE cambios_razones ADD CONSTRAINT cambios_razones_pkey PRIMARY KEY (id_razon)').catch(() => {});
 
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS codigo_cambio VARCHAR(20)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)`);
@@ -1417,6 +1419,11 @@ async function ensureCambiosProductosTables() {
   await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => {});
   await pool.query(`UPDATE cambios_registros SET nombre_cliente = COALESCE(nombre_cliente, cliente_nombre) WHERE nombre_cliente IS NULL`).catch(() => {});
   await pool.query(`UPDATE cambios_registros SET producto = COALESCE(producto, detalle_productos) WHERE producto IS NULL`).catch(() => {});
+  await pool.query(`
+    UPDATE cambios_registros
+       SET codigo_cambio = 'CAM' || LPAD(id_cambio::text, 4, '0')
+     WHERE codigo_cambio IS NULL OR TRIM(codigo_cambio) = ''
+  `).catch(() => {});
   await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_id`).catch(() => {});
   await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_nombre`).catch(() => {});
   await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS razon_id`).catch(() => {});
@@ -1427,6 +1434,7 @@ async function ensureCambiosProductosTables() {
   // Use a new name: a restored database may already have a non-unique legacy index with the old name.
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto_unique ON cambios_razones(razon_texto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_created_at ON cambios_registros(created_at DESC)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_registros_codigo_unique ON cambios_registros(codigo_cambio)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_ruta ON cambios_registros(ruta_nombre)');
 
   const razonesEjemplo = [
@@ -1434,6 +1442,8 @@ async function ensureCambiosProductosTables() {
     'Empaque deteriorado',
     'Error de despacho',
     'Cambio por calidad',
+    'Producto vencido',
+    'Error en FIFO',
   ];
   for (const razon of razonesEjemplo) {
     await pool.query(
@@ -3158,36 +3168,51 @@ app.post('/api/almacen09/cambios', async (req, res) => {
       );
     }
 
-    const insertResult = await client.query(
-      `INSERT INTO cambios_registros (
-         id_cliente,
-         nombre_cliente,
-         direccion_id,
-         direccion_texto,
-         ruta_nombre,
-         responsable,
-         producto
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-       RETURNING id_cambio, created_at`,
-      [
-        clienteCatalog.id,
-        clienteCatalog.value || clienteRaw,
-        direccionCatalog.id,
-        direccionCatalog.value || direccionRaw || null,
-        rutaCambio || null,
-        responsableRaw,
-        JSON.stringify(detalle),
-      ]
-    );
+    const cambiosInsertados = [];
+    for (const item of detalle) {
+      const insertResult = await client.query(
+        `INSERT INTO cambios_registros (
+           id_cliente,
+           nombre_cliente,
+           direccion_id,
+           direccion_texto,
+           ruta_nombre,
+           responsable,
+           producto
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+         RETURNING id_cambio, created_at`,
+        [
+          clienteCatalog.id,
+          clienteCatalog.value || clienteRaw,
+          direccionCatalog.id,
+          direccionCatalog.value || direccionRaw || null,
+          rutaCambio || null,
+          responsableRaw,
+          JSON.stringify([item]),
+        ]
+      );
+      const inserted = insertResult.rows[0] || {};
+      const codigoCambio = `CAM${String(Number(inserted.id_cambio || 0)).padStart(4, '0')}`;
+      await client.query(
+        `UPDATE cambios_registros
+            SET codigo_cambio = $1
+          WHERE id_cambio = $2`,
+        [codigoCambio, Number(inserted.id_cambio)]
+      );
+      cambiosInsertados.push({
+        id_cambio: Number(inserted.id_cambio || 0),
+        codigo_cambio: codigoCambio,
+        created_at: inserted.created_at || null,
+        producto: item,
+      });
+    }
 
     await client.query('COMMIT');
     return res.status(201).json({
       ok: true,
-      cambio: {
-        id_cambio: Number(insertResult.rows[0]?.id_cambio || 0),
-        created_at: insertResult.rows[0]?.created_at || null,
-      },
+      cambios: cambiosInsertados,
+      cambio: cambiosInsertados[0] || null,
     });
   } catch (error) {
     try { await client.query('ROLLBACK'); } catch (_) {}
@@ -4189,51 +4214,39 @@ app.get('/api/registros', async (req, res) => {
       const result = await pool.query(
         `SELECT
           cr.id_cambio AS "__ROW_ID",
+          (cr.id_cambio::text || ':' || producto_item.ord::text) AS "__ROW_KEY",
           'cambios_registros'::text AS "__ROW_SOURCE",
           TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
+          COALESCE(NULLIF(TRIM(cr.codigo_cambio), ''), 'CAM' || LPAD(cr.id_cambio::text, 4, '0')) AS "Codigo de cambio",
           TO_CHAR(${cambioTsVzExpr}, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
           cr.nombre_cliente AS "Nombre del cliente",
           COALESCE(NULLIF(TRIM(cr.direccion_texto), ''), '') AS "Direccion del cliente",
           ${cambioRutaExpr} AS "Ruta",
-          COALESCE(productos.productos_cambiados, '') AS "Producto(s) cambiados",
-          COALESCE(productos.cantidades, '') AS "Cantidad de cada uno",
-          COALESCE(productos.razones, '') AS "Razon del cambio",
+          NULLIF(TRIM(CONCAT(
+            NULLIF(TRIM(producto_item.value->>'codigo'), ''),
+            CASE
+              WHEN NULLIF(TRIM(producto_item.value->>'codigo'), '') IS NOT NULL
+               AND NULLIF(TRIM(producto_item.value->>'producto'), '') IS NOT NULL
+              THEN ' - '
+              ELSE ''
+            END,
+            NULLIF(TRIM(producto_item.value->>'producto'), '')
+          )), '') AS "Producto cambiado",
+          COALESCE(NULLIF(TRIM(producto_item.value->>'cantidad'), ''), '0') AS "Cantidad",
+          COALESCE(NULLIF(TRIM(producto_item.value->>'razon'), ''), '') AS "Razon del cambio",
           cr.responsable AS "Responsable del registro"
         FROM (
           SELECT DISTINCT ON (id_cambio) *
           FROM cambios_registros
           ORDER BY id_cambio
         ) cr
-        LEFT JOIN LATERAL (
-          SELECT
-            STRING_AGG(
-              NULLIF(TRIM(CONCAT(
-                NULLIF(TRIM(elem.value->>'codigo'), ''),
-                CASE
-                  WHEN NULLIF(TRIM(elem.value->>'codigo'), '') IS NOT NULL
-                   AND NULLIF(TRIM(elem.value->>'producto'), '') IS NOT NULL
-                  THEN ' - '
-                  ELSE ''
-                END,
-                NULLIF(TRIM(elem.value->>'producto'), '')
-              )), ''),
-              ' | '
-              ORDER BY ord
-            ) AS productos_cambiados,
-            STRING_AGG(
-              COALESCE(NULLIF(TRIM(elem.value->>'cantidad'), ''), '0'),
-              ' | '
-              ORDER BY ord
-            ) AS cantidades,
-            STRING_AGG(DISTINCT NULLIF(TRIM(elem.value->>'razon'), ''), ' | ') AS razones
-          FROM jsonb_array_elements(
-            CASE
-              WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
-              WHEN jsonb_typeof(cr.producto) = 'object' THEN jsonb_build_array(cr.producto)
-              ELSE '[]'::jsonb
-            END
-          ) WITH ORDINALITY AS elem(value, ord)
-        ) productos ON true
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE
+            WHEN jsonb_typeof(COALESCE(cr.producto, '[]'::jsonb)) = 'array' THEN COALESCE(cr.producto, '[]'::jsonb)
+            WHEN jsonb_typeof(cr.producto) = 'object' THEN jsonb_build_array(cr.producto)
+            ELSE '[]'::jsonb
+          END
+        ) WITH ORDINALITY AS producto_item(value, ord)
         LEFT JOIN LATERAL (
           SELECT TRIM(COALESCE(c.ruta, '')) AS ruta
           FROM public.clientes c
@@ -4252,7 +4265,7 @@ app.get('/api/registros', async (req, res) => {
           LIMIT 1
         ) ruta_meta ON true
         ${whereClause}
-        ORDER BY cr.created_at DESC, cr.id_cambio DESC
+        ORDER BY cr.created_at DESC, cr.id_cambio DESC, producto_item.ord ASC
         LIMIT $${params.length - 1}
         OFFSET $${params.length}`,
         params
@@ -4262,7 +4275,7 @@ app.get('/api/registros', async (req, res) => {
       const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
       const headers = rows.length
         ? Object.keys(rows[0])
-        : ['Fecha de registro', 'Nombre del cliente', 'Direccion del cliente', 'Ruta', 'Producto(s) cambiados', 'Cantidad de cada uno', 'Razon del cambio', 'Responsable del registro'];
+        : ['Codigo de cambio', 'Fecha de registro', 'Nombre del cliente', 'Direccion del cliente', 'Ruta', 'Producto cambiado', 'Cantidad', 'Razon del cambio', 'Responsable del registro'];
       return res.json({
         ok: true,
         sheet: 'Cambios',
