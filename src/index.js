@@ -571,6 +571,7 @@ async function ensureAuthTables() {
 
   await pool.query('ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS full_name VARCHAR(120)');
   await pool.query('ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS vehicle_plate VARCHAR(20)');
+  await pool.query('ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS password_visible TEXT');
 
   await pool.query(`
     ALTER TABLE auth_users
@@ -689,14 +690,15 @@ async function ensureInitialAdminUsers() {
 
     const passwordHash = hashPassword(INITIAL_ADMIN_PASSWORD);
     await pool.query(
-      `INSERT INTO auth_users (username, role, password_hash, activo)
-       VALUES ($1, $2, $3, TRUE)
+      `INSERT INTO auth_users (username, role, password_hash, password_visible, activo)
+       VALUES ($1, $2, $3, $4, TRUE)
        ON CONFLICT (username) DO UPDATE
          SET role = EXCLUDED.role,
              password_hash = EXCLUDED.password_hash,
+             password_visible = EXCLUDED.password_visible,
              activo = TRUE,
              updated_at = NOW()`,
-      [username, APP_ROLES.ADMIN, passwordHash]
+      [username, APP_ROLES.ADMIN, passwordHash, INITIAL_ADMIN_PASSWORD]
     );
   }
 }
@@ -710,18 +712,24 @@ async function ensureInitialDriverUsers() {
     const vehiclePlate = normalizeVehiclePlate(driver.vehiclePlate || '');
     const passwordHash = hashPassword(INITIAL_DRIVER_PASSWORD);
     await pool.query(
-      `INSERT INTO auth_users (username, role, password_hash, full_name, vehicle_plate, activo)
-       VALUES ($1, $2, $3, $4, $5, TRUE)
+      `INSERT INTO auth_users (username, role, password_hash, password_visible, full_name, vehicle_plate, activo)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)
        ON CONFLICT (username) DO UPDATE
          SET role = EXCLUDED.role,
              password_hash = EXCLUDED.password_hash,
+             password_visible = EXCLUDED.password_visible,
              full_name = EXCLUDED.full_name,
              vehicle_plate = EXCLUDED.vehicle_plate,
              activo = TRUE,
              updated_at = NOW()`,
-      [username, APP_ROLES.CONDUCTOR, passwordHash, fullName, vehiclePlate]
+      [username, APP_ROLES.CONDUCTOR, passwordHash, INITIAL_DRIVER_PASSWORD, fullName, vehiclePlate]
     );
   }
+}
+
+function canManageVisiblePasswords(auth) {
+  return normalizeAuthRole(auth?.role) === APP_ROLES.ADMIN
+    && normalizeAuthUsername(auth?.username) === 'PRUEBAS';
 }
 
 app.post('/auth/register', async (req, res) => {
@@ -729,6 +737,7 @@ app.post('/auth/register', async (req, res) => {
   if (!auth) return;
 
   const username = normalizeAuthUsername(req.body?.username);
+  const role = normalizeAuthRole(req.body?.role);
   const password = String(req.body?.password || '');
   const fullName = normalizeCatalogText(req.body?.full_name || req.body?.fullName || '', 120);
   const vehiclePlate = normalizeVehiclePlate(req.body?.vehicle_plate || req.body?.vehiclePlate || '');
@@ -750,10 +759,10 @@ app.post('/auth/register', async (req, res) => {
 
     const passwordHash = hashPassword(password);
     const inserted = await pool.query(
-      `INSERT INTO auth_users (username, role, password_hash, full_name, vehicle_plate, activo)
-       VALUES ($1, $2, $3, $4, $5, TRUE)
+      `INSERT INTO auth_users (username, role, password_hash, password_visible, full_name, vehicle_plate, activo)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)
        RETURNING id_user, username, role, full_name, vehicle_plate, created_at`,
-      [username, role, passwordHash, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : '']
+      [username, role, passwordHash, password, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : '']
     );
 
     const user = inserted.rows[0];
@@ -991,6 +1000,9 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
   if (password && password.length < 4) {
     return { ok: false, status: 400, error: 'password invÃ¡lido' };
   }
+  if (password && !canManageVisiblePasswords(auth)) {
+    return { ok: false, status: 403, error: 'Solo PRUEBAS puede modificar contrasenas de usuarios' };
+  }
 
   const client = await pool.connect();
   try {
@@ -1036,6 +1048,8 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
     if (password) {
       params.push(hashPassword(password));
       fields.push(`password_hash = $${params.length}`);
+      params.push(password);
+      fields.push(`password_visible = $${params.length}`);
     }
     params.push(Number(target.id_user));
 
@@ -1103,6 +1117,83 @@ app.post('/auth/users/update', async (req, res) => {
     return res.status(result.status).json({ ok: false, error: result.error });
   }
   return res.json(result.payload);
+});
+
+app.get('/auth/users/:username/password', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  if (!canManageVisiblePasswords(auth)) {
+    return res.status(403).json({ ok: false, error: 'Solo PRUEBAS puede ver contraseñas de usuarios' });
+  }
+
+  const targetUser = normalizeAuthUsername(req.params?.username);
+  if (!targetUser) {
+    return res.status(400).json({ ok: false, error: 'username inválido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT username, COALESCE(password_visible, '') AS password_visible
+       FROM auth_users
+       WHERE username = $1
+         AND activo = TRUE
+       LIMIT 1`,
+      [targetUser]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: 'Usuario no encontrado' });
+    }
+    const row = result.rows[0];
+    return res.json({
+      ok: true,
+      username: String(row.username || '').trim(),
+      password: String(row.password_visible || ''),
+      hasPassword: Boolean(String(row.password_visible || '')),
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/auth/users/:username/password', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  if (!canManageVisiblePasswords(auth)) {
+    return res.status(403).json({ ok: false, error: 'Solo PRUEBAS puede modificar contraseñas de usuarios' });
+  }
+
+  const targetUser = normalizeAuthUsername(req.params?.username);
+  const password = String(req.body?.password || '');
+  if (!targetUser) {
+    return res.status(400).json({ ok: false, error: 'username inválido' });
+  }
+  if (password.length < 4) {
+    return res.status(400).json({ ok: false, error: 'password inválido' });
+  }
+
+  try {
+    const updated = await pool.query(
+      `UPDATE auth_users
+          SET password_hash = $1,
+              password_visible = $2,
+              updated_at = NOW()
+        WHERE username = $3
+          AND activo = TRUE
+        RETURNING id_user, username`,
+      [hashPassword(password), password, targetUser]
+    );
+    if (!updated.rowCount) {
+      return res.status(404).json({ ok: false, error: 'Usuario no encontrado' });
+    }
+    const user = updated.rows[0];
+    return res.json({
+      ok: true,
+      username: String(user.username || '').trim(),
+      currentUserUpdated: Number(auth.userId) === Number(user.id_user),
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
 });
 
 app.delete('/auth/users/:username', async (req, res) => {
@@ -5930,6 +6021,8 @@ app.patch('/auth/profile', async (req, res) => {
     if (password) {
       params.push(hashPassword(password));
       fields.unshift(`password_hash = $${params.length}`);
+      params.push(password);
+      fields.unshift(`password_visible = $${params.length}`);
     }
     params.push(Number(auth.userId));
 
