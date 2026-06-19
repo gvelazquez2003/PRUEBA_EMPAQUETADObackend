@@ -2149,6 +2149,13 @@ function normalizeSalidasLookupKey(value, maxLength) {
   return normalizeSalidasText(value, maxLength).toLowerCase();
 }
 
+function appendClienteRifFilter(whereParts, params, rifRaw) {
+  const rif = normalizeSalidasText(rifRaw, 40);
+  if (!rif) return;
+  params.push(rif);
+  whereParts.push(`regexp_replace(CAST(id_cliente AS TEXT), '[^0-9]', '', 'g') = regexp_replace($${params.length}, '[^0-9]', '', 'g')`);
+}
+
 async function listDireccionesByCliente(client, clienteRaw, auth) {
   const cliente = normalizeSalidasText(clienteRaw, 160);
   if (!cliente) return [];
@@ -2259,8 +2266,7 @@ async function listDireccionesMetaByCliente(client, clienteRaw, auth, options = 
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
   if (options.rif) {
-    params.push(normalizeSalidasText(options.rif, 40));
-    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+    appendClienteRifFilter(whereParts, params, options.rif);
   }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
@@ -2293,8 +2299,7 @@ async function listZonasByCliente(client, clienteRaw, auth, options = {}) {
     `TRIM(COALESCE(zona, '')) <> ''`,
   ];
   if (options.rif) {
-    params.push(normalizeSalidasText(options.rif, 40));
-    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+    appendClienteRifFilter(whereParts, params, options.rif);
   }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
@@ -2329,8 +2334,7 @@ async function listRutasByCliente(client, clienteRaw, auth, options = {}) {
     `TRIM(COALESCE(ruta, '')) <> ''`,
   ];
   if (options.rif) {
-    params.push(normalizeSalidasText(options.rif, 40));
-    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+    appendClienteRifFilter(whereParts, params, options.rif);
   }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
@@ -2366,8 +2370,7 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth, o
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
   if (options.rif) {
-    params.push(normalizeSalidasText(options.rif, 40));
-    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+    appendClienteRifFilter(whereParts, params, options.rif);
   }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
@@ -2402,8 +2405,7 @@ async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth, o
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
   if (options.rif) {
-    params.push(normalizeSalidasText(options.rif, 40));
-    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+    appendClienteRifFilter(whereParts, params, options.rif);
   }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
@@ -2439,8 +2441,7 @@ async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direcci
     `LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($3))`,
   ];
   if (options.rif) {
-    params.push(normalizeSalidasText(options.rif, 40));
-    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+    appendClienteRifFilter(whereParts, params, options.rif);
   }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
