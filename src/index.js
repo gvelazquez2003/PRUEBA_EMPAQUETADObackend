@@ -2153,7 +2153,7 @@ function appendClienteRifFilter(whereParts, params, rifRaw) {
   const rif = normalizeSalidasText(rifRaw, 40);
   if (!rif) return;
   params.push(rif);
-  whereParts.push(`regexp_replace(CAST(id_cliente AS TEXT), '[^0-9]', '', 'g') = regexp_replace($${params.length}, '[^0-9]', '', 'g')`);
+  whereParts.push(`regexp_replace(UPPER(TRIM(CAST(id_cliente AS TEXT))), '^([A-Z])-', '\\1') = regexp_replace(UPPER(TRIM($${params.length})), '^([A-Z])-', '\\1')`);
 }
 
 async function listDireccionesByCliente(client, clienteRaw, auth) {
