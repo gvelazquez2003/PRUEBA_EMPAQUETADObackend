@@ -2195,6 +2195,8 @@ function normalizeClienteRutaRow(row) {
 
 function normalizeClienteDireccionMeta(row) {
   return {
+    id_cliente: normalizeSalidasText(row?.id_cliente || row?.rif, 40),
+    rif: normalizeSalidasText(row?.id_cliente || row?.rif, 40),
     direccion: normalizeSalidasText(row?.direccion, 240),
     zona: normalizeSalidasText(row?.zona, 120),
     ruta: normalizeSalidasText(row?.ruta, 120),
@@ -2271,6 +2273,7 @@ async function listDireccionesMetaByCliente(client, clienteRaw, auth, options = 
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
+       TRIM(CAST(id_cliente AS TEXT)) AS id_cliente,
        TRIM(COALESCE(direccion, '')) AS direccion,
        TRIM(COALESCE(zona, '')) AS zona,
        TRIM(COALESCE(ruta, '')) AS ruta,
@@ -2279,6 +2282,7 @@ async function listDireccionesMetaByCliente(client, clienteRaw, auth, options = 
      FROM public.clientes
      WHERE ${whereParts.join(' AND ')}
      GROUP BY
+       TRIM(CAST(id_cliente AS TEXT)),
        TRIM(COALESCE(direccion, '')),
        TRIM(COALESCE(zona, '')),
        TRIM(COALESCE(ruta, '')),
@@ -2375,6 +2379,7 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth, o
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
+       TRIM(CAST(id_cliente AS TEXT)) AS id_cliente,
        TRIM(COALESCE(direccion, '')) AS direccion,
        TRIM(COALESCE(zona, '')) AS zona,
        TRIM(COALESCE(ruta, '')) AS ruta,
@@ -2383,6 +2388,7 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth, o
      FROM public.clientes
      WHERE ${whereParts.join(' AND ')}
      GROUP BY
+       TRIM(CAST(id_cliente AS TEXT)),
        TRIM(COALESCE(direccion, '')),
        TRIM(COALESCE(zona, '')),
        TRIM(COALESCE(ruta, '')),
@@ -2410,6 +2416,7 @@ async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth, o
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
+       TRIM(CAST(id_cliente AS TEXT)) AS id_cliente,
        TRIM(COALESCE(direccion, '')) AS direccion,
        TRIM(COALESCE(zona, '')) AS zona,
        TRIM(COALESCE(ruta, '')) AS ruta,
@@ -2418,6 +2425,7 @@ async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth, o
      FROM public.clientes
      WHERE ${whereParts.join(' AND ')}
      GROUP BY
+       TRIM(CAST(id_cliente AS TEXT)),
        TRIM(COALESCE(direccion, '')),
        TRIM(COALESCE(zona, '')),
        TRIM(COALESCE(ruta, '')),
@@ -2446,6 +2454,7 @@ async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direcci
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
+       TRIM(CAST(id_cliente AS TEXT)) AS id_cliente,
        TRIM(COALESCE(direccion, '')) AS direccion,
        TRIM(COALESCE(zona, '')) AS zona,
        TRIM(COALESCE(ruta, '')) AS ruta,
