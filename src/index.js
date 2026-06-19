@@ -5947,6 +5947,8 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
     const fetchLimit = limit + 1;
     const whereParts = [];
     const params = [];
+    const facturaCreatedVzExpr = `(sf.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
+    const detalleCreatedVzExpr = `(sd.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
     if (hasMes) {
       params.push(mes);
       whereParts.push(`TO_CHAR(sf.fecha_emision, 'YYYY-MM') = $${params.length}`);
@@ -5979,7 +5981,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sf.sucursal_nombre,
          sf.direccion_id,
          sf.direccion_texto,
-         TO_CHAR(sf.created_at, 'YYYY-MM-DD HH24:MI:SS') AS factura_created_at,
+         TO_CHAR(${facturaCreatedVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS factura_created_at,
          sf.estado,
          sd.id_detalle,
          sd.id_producto,
@@ -5988,7 +5990,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sd.producto,
          sd.numero_lote,
          sd.cantidad,
-         TO_CHAR(sd.created_at, 'YYYY-MM-DD HH24:MI:SS') AS detalle_created_at
+         TO_CHAR(${detalleCreatedVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS detalle_created_at
       FROM (
         SELECT DISTINCT ON (id_factura) *
         FROM salidas_facturas
