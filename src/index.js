@@ -5800,7 +5800,11 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       }
     }
 
-    const direccionMeta = await getExactClienteDireccionMeta(client, clienteRaw, zonaInputRaw, direccionInputRaw, auth);
+    let direccionMeta = await getExactClienteDireccionMeta(client, clienteRaw, zonaInputRaw, direccionInputRaw, auth);
+    if (!direccionMeta && zonaInputRaw && direccionInputRaw) {
+      const direccionesMeta = await listDireccionesByClienteZona(client, clienteRaw, zonaInputRaw, auth);
+      direccionMeta = findBestClienteDireccionMeta(direccionesMeta, direccionInputRaw, vendedorRaw);
+    }
     if (!direccionMeta || !direccionMeta.zona || !direccionMeta.direccion) {
       await client.query('ROLLBACK');
       return res.status(400).json({
