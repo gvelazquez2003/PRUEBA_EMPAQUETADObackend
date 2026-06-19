@@ -2258,6 +2258,10 @@ async function listDireccionesMetaByCliente(client, clienteRaw, auth, options = 
     `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
+  if (options.rif) {
+    params.push(normalizeSalidasText(options.rif, 40));
+    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+  }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
@@ -2288,6 +2292,10 @@ async function listZonasByCliente(client, clienteRaw, auth, options = {}) {
     `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
     `TRIM(COALESCE(zona, '')) <> ''`,
   ];
+  if (options.rif) {
+    params.push(normalizeSalidasText(options.rif, 40));
+    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+  }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
@@ -2320,6 +2328,10 @@ async function listRutasByCliente(client, clienteRaw, auth, options = {}) {
     `LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($1))`,
     `TRIM(COALESCE(ruta, '')) <> ''`,
   ];
+  if (options.rif) {
+    params.push(normalizeSalidasText(options.rif, 40));
+    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+  }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
@@ -2353,6 +2365,10 @@ async function listDireccionesByClienteZona(client, clienteRaw, zonaRaw, auth, o
     `LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))`,
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
+  if (options.rif) {
+    params.push(normalizeSalidasText(options.rif, 40));
+    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+  }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
@@ -2385,6 +2401,10 @@ async function listDireccionesByClienteRuta(client, clienteRaw, rutaRaw, auth, o
     `LOWER(TRIM(COALESCE(ruta, ''))) = LOWER(TRIM($2))`,
     `TRIM(COALESCE(direccion, '')) <> ''`,
   ];
+  if (options.rif) {
+    params.push(normalizeSalidasText(options.rif, 40));
+    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+  }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
@@ -2418,6 +2438,10 @@ async function getExactClienteDireccionMeta(client, clienteRaw, zonaRaw, direcci
     `LOWER(TRIM(COALESCE(zona, ''))) = LOWER(TRIM($2))`,
     `LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($3))`,
   ];
+  if (options.rif) {
+    params.push(normalizeSalidasText(options.rif, 40));
+    whereParts.push(`LOWER(TRIM(CAST(id_cliente AS TEXT))) = LOWER(TRIM($${params.length}))`);
+  }
   if (!options.skipVendedorFilter) appendVendedorAccessFilter(whereParts, params, auth, 'vendedor');
   const result = await client.query(
     `SELECT
@@ -2777,8 +2801,8 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
            TRIM(COALESCE(direccion, '')),
            TRIM(COALESCE(zona, ''))
        ) base
-       GROUP BY nombre
-       ORDER BY nombre ASC
+       GROUP BY nombre, id_cliente_text
+       ORDER BY nombre ASC, id_cliente_text ASC
        LIMIT $${params.length}`,
       params
     );
@@ -2864,6 +2888,7 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
+  const rifRaw = normalizeSalidasText(req.query?.rif || req.query?.id_cliente, 40);
   const zonaRaw = normalizeSalidasText(req.query?.zona, 120);
   const direccionRaw = normalizeSalidasText(req.query?.direccion, 240);
   const vendedorRaw = normalizeSalidasText(req.query?.vendedor, 160);
@@ -2872,18 +2897,19 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
   }
 
   try {
-    const zonas = await listZonasByCliente(pool, clienteRaw, auth);
-    let direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw, auth) : [];
+    const clientFilter = rifRaw ? { rif: rifRaw } : {};
+    const zonas = await listZonasByCliente(pool, clienteRaw, auth, clientFilter);
+    let direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw, auth, clientFilter) : [];
     let autofill = null;
     if (direccionRaw) {
       if (zonaRaw) {
-        autofill = await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw, auth)
+        autofill = await getExactClienteDireccionMeta(pool, clienteRaw, zonaRaw, direccionRaw, auth, clientFilter)
           || findBestClienteDireccionMeta(direccionesMeta, direccionRaw, vendedorRaw);
       } else {
-        const allDireccionesMeta = await listDireccionesMetaByCliente(pool, clienteRaw, auth);
+        const allDireccionesMeta = await listDireccionesMetaByCliente(pool, clienteRaw, auth, clientFilter);
         autofill = findBestClienteDireccionMeta(allDireccionesMeta, direccionRaw, vendedorRaw);
         if (autofill?.zona) {
-          direccionesMeta = await listDireccionesByClienteZona(pool, clienteRaw, autofill.zona, auth);
+          direccionesMeta = await listDireccionesByClienteZona(pool, clienteRaw, autofill.zona, auth, clientFilter);
         } else {
           direccionesMeta = allDireccionesMeta;
         }
@@ -5625,6 +5651,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const fechaEmisionRaw = String(req.body?.fecha_emision || '').trim();
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 160);
+  const clienteRifRaw = normalizeSalidasText(req.body?.rif || req.body?.id_cliente, 40);
   const vendedorRaw = normalizeSalidasText(req.body?.vendedor, 160);
   const zonaInputRaw = normalizeSalidasText(req.body?.zona, 120);
   const direccionInputRaw = normalizeSalidasText(req.body?.direccion, 240);
@@ -5800,9 +5827,10 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       }
     }
 
-    let direccionMeta = await getExactClienteDireccionMeta(client, clienteRaw, zonaInputRaw, direccionInputRaw, auth);
+    const clienteFilter = clienteRifRaw ? { rif: clienteRifRaw } : {};
+    let direccionMeta = await getExactClienteDireccionMeta(client, clienteRaw, zonaInputRaw, direccionInputRaw, auth, clienteFilter);
     if (!direccionMeta && zonaInputRaw && direccionInputRaw) {
-      const direccionesMeta = await listDireccionesByClienteZona(client, clienteRaw, zonaInputRaw, auth);
+      const direccionesMeta = await listDireccionesByClienteZona(client, clienteRaw, zonaInputRaw, auth, clienteFilter);
       direccionMeta = findBestClienteDireccionMeta(direccionesMeta, direccionInputRaw, vendedorRaw);
     }
     if (!direccionMeta || !direccionMeta.zona || !direccionMeta.direccion) {
