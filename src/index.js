@@ -2902,12 +2902,16 @@ app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => 
   const zonaRaw = normalizeSalidasText(req.query?.zona, 120);
   const direccionRaw = normalizeSalidasText(req.query?.direccion, 240);
   const vendedorRaw = normalizeSalidasText(req.query?.vendedor, 160);
+  const pdfAutofill = String(req.query?.pdf_autofill || '').trim() === '1';
   if (clienteRaw.length < 2) {
     return res.json({ ok: true, cliente: clienteRaw, zonas: [], direcciones: [], direcciones_meta: [], sucursales: [], autofill: null });
   }
 
   try {
-    const clientFilter = rifRaw ? { rif: rifRaw } : {};
+    const clientFilter = {
+      ...(rifRaw ? { rif: rifRaw } : {}),
+      ...(pdfAutofill && direccionRaw ? { skipVendedorFilter: true } : {})
+    };
     const zonas = await listZonasByCliente(pool, clienteRaw, auth, clientFilter);
     let direccionesMeta = zonaRaw ? await listDireccionesByClienteZona(pool, clienteRaw, zonaRaw, auth, clientFilter) : [];
     let autofill = null;
@@ -5663,6 +5667,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 160);
   const clienteRifRaw = normalizeSalidasText(req.body?.rif || req.body?.id_cliente, 40);
   const vendedorRaw = normalizeSalidasText(req.body?.vendedor, 160);
+  const pdfAutofill = req.body?.pdf_autofill === true || String(req.body?.pdf_autofill || '').trim() === '1';
   const zonaInputRaw = normalizeSalidasText(req.body?.zona, 120);
   const direccionInputRaw = normalizeSalidasText(req.body?.direccion, 240);
   const rutaInputRaw = normalizeSalidasText(req.body?.ruta, 120);
@@ -5843,6 +5848,12 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       const direccionesMeta = await listDireccionesByClienteZona(client, clienteRaw, zonaInputRaw, auth, clienteFilter);
       direccionMeta = findBestClienteDireccionMeta(direccionesMeta, direccionInputRaw, vendedorRaw);
     }
+    if (!direccionMeta && pdfAutofill && direccionInputRaw) {
+      const pdfRows = zonaInputRaw
+        ? await listDireccionesByClienteZona(client, clienteRaw, zonaInputRaw, auth, { skipVendedorFilter: true })
+        : await listDireccionesMetaByCliente(client, clienteRaw, auth, { skipVendedorFilter: true });
+      direccionMeta = findBestClienteDireccionMeta(pdfRows, direccionInputRaw, vendedorRaw);
+    }
     if (!direccionMeta || !direccionMeta.zona || !direccionMeta.direccion) {
       await client.query('ROLLBACK');
       return res.status(400).json({
@@ -5863,7 +5874,13 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
         error: 'La direccion seleccionada no tiene vendedor asociado.'
       });
     }
-    if (vendedorRaw && direccionMeta.vendedor && vendedorRaw !== direccionMeta.vendedor) {
+    const vendedorInputKey = normalizeAuthLookupText(vendedorRaw);
+    const vendedorMetaKey = normalizeAuthLookupText(direccionMeta.vendedor);
+    const vendedorCompatible = !vendedorInputKey || !vendedorMetaKey
+      || vendedorInputKey === vendedorMetaKey
+      || vendedorInputKey.includes(vendedorMetaKey)
+      || vendedorMetaKey.includes(vendedorInputKey);
+    if (!pdfAutofill && vendedorRaw && direccionMeta.vendedor && !vendedorCompatible) {
       await client.query('ROLLBACK');
       return res.status(409).json({
         ok: false,
