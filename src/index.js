@@ -5655,11 +5655,11 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     .map((linea) => ({
       codigo: String(linea?.codigo || '').trim().toUpperCase(),
       producto: String(linea?.producto || '').trim(),
-      lote: String(linea?.lote || '').trim().toUpperCase(),
+      lote: String(linea?.lote || 'SIN-LOTE').trim().toUpperCase() || 'SIN-LOTE',
       cantidad: Number(linea?.cantidad),
       id_cambio: Number(linea?.id_cambio || 0),
     }))
-    .filter((linea) => linea.codigo && linea.lote && Number.isFinite(linea.cantidad) && linea.cantidad > 0);
+    .filter((linea) => linea.codigo && Number.isFinite(linea.cantidad) && linea.cantidad > 0);
 
   if (!detalle.length) {
     return res.status(400).json({ ok: false, error: 'No hay líneas válidas en detalle' });
@@ -5778,7 +5778,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
     }
 
     const solicitadoPorLote = new Map();
-    detalle.forEach((linea) => {
+    detalle.filter((linea) => linea.lote !== 'SIN-LOTE').forEach((linea) => {
       const key = `${linea.codigo}::${linea.lote}`;
       solicitadoPorLote.set(key, (solicitadoPorLote.get(key) || 0) + Math.floor(linea.cantidad));
     });
