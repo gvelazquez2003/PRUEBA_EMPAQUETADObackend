@@ -1966,6 +1966,34 @@ async function ensureSalidas09Tables() {
   `);
 }
 
+async function ensureRouteDeliveryTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS delivery_status (
+      client_key TEXT PRIMARY KEY,
+      delivered BOOLEAN NOT NULL DEFAULT FALSE,
+      delivered_baskets INT NOT NULL DEFAULT 0,
+      delivered_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS delivered_baskets INT NOT NULL DEFAULT 0
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS partial BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS partial_detail JSONB
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_delivery_status_updated_at
+    ON delivery_status (updated_at DESC)
+  `);
+}
+
 async function ensureMermaTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS motivos_merma (
@@ -6343,6 +6371,250 @@ app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
   }
 });
 
+function normalizeRouteResultText(value) {
+  return String(value || '').trim();
+}
+
+function makeRouteResultRouteKey(sheetId) {
+  return `hoja:${normalizeRouteResultText(sheetId)}`;
+}
+
+function formatRouteResultDate(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return normalizeRouteResultText(value);
+  return date.toISOString().slice(0, 10);
+}
+
+function makeRouteResultDisplayName(sheet) {
+  const routeName = normalizeRouteResultText(sheet.ruta_nombre) || 'SIN RUTA';
+  const date = formatRouteResultDate(sheet.fecha_entrega);
+  return date ? `${routeName} - ${date}` : routeName;
+}
+
+function normalizeRouteResultAddress(address) {
+  const value = normalizeRouteResultText(address);
+  if (!value) return '';
+  const comparable = normalizeSalidasLookupKey(value, 500);
+  if (comparable.includes('venezuela')) return value;
+  if (comparable.includes('caracas')) return `${value}, Venezuela`;
+  return `${value}, Caracas, Venezuela`;
+}
+
+function makeRouteResultClientKey(clientId, route, address) {
+  return [normalizeRouteResultText(clientId), normalizeRouteResultText(route), normalizeRouteResultText(address)].join('::');
+}
+
+function normalizeRouteResultFacturas(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+}
+
+function flattenRouteResultClients(sheet) {
+  const clients = [];
+  const routeKey = makeRouteResultRouteKey(sheet.id_hoja);
+  const routeName = normalizeRouteResultText(sheet.ruta_nombre) || 'SIN RUTA';
+  const routeDisplayName = makeRouteResultDisplayName(sheet);
+  const facturas = normalizeRouteResultFacturas(sheet.facturas);
+
+  facturas.forEach((invoice, index) => {
+    const clientId = normalizeRouteResultText(invoice?.numero_control || invoice?.id_factura || index + 1);
+    const address = normalizeRouteResultAddress(invoice?.direccion_texto);
+    const name = normalizeRouteResultText(invoice?.cliente_nombre);
+    const invoiceKey = `${sheet.id_hoja}:${clientId}:${normalizeRouteResultText(invoice?.numero_factura || invoice?.id_factura || index + 1)}`;
+    const key = makeRouteResultClientKey(invoiceKey, routeKey, address);
+    clients.push({
+      key,
+      sheetId: String(sheet.id_hoja),
+      rowNumber: index + 1,
+      clientId,
+      invoiceId: normalizeRouteResultText(invoice?.id_factura),
+      invoiceNumber: normalizeRouteResultText(invoice?.numero_factura),
+      controlNumber: normalizeRouteResultText(invoice?.numero_control),
+      name,
+      nombre_o_razon_social: name,
+      address,
+      originalAddress: normalizeRouteResultText(invoice?.direccion_texto),
+      route: routeKey,
+      routeName,
+      routeDisplayName,
+      zone: normalizeRouteResultText(invoice?.zona_nombre),
+      transport: normalizeRouteResultText(invoice?.transporte_nombre || sheet.numero_camion),
+      driver: normalizeRouteResultText(sheet.conductor),
+      truck: normalizeRouteResultText(sheet.numero_camion),
+      deliveryDate: formatRouteResultDate(sheet.fecha_entrega),
+      totalDispatches: Number(sheet.total_despachos || facturas.length || 0),
+      totalBaskets: Number(sheet.total_cestas || 0),
+      baskets: Number(invoice?.total_cestas || invoice?.cestas || invoice?.cantidad_cestas || 0),
+      delivered: invoice?.entregado === true,
+      detail: Array.isArray(invoice?.detalle) ? invoice.detalle : [],
+    });
+  });
+
+  return clients;
+}
+
+async function getRouteDeliveryStatusMap(clientKeys) {
+  const keys = Array.from(new Set((clientKeys || []).map((key) => String(key || '').trim()).filter(Boolean)));
+  const map = new Map();
+  if (!keys.length) return map;
+  const result = await pool.query(
+    `SELECT client_key, delivered, delivered_baskets, delivered_at, partial, partial_detail, updated_at
+     FROM delivery_status
+     WHERE client_key = ANY($1::text[])`,
+    [keys]
+  );
+  result.rows.forEach((row) => map.set(row.client_key, row));
+  return map;
+}
+
+function applyRouteDeliveryStatus(client, status) {
+  const delivered = status ? Boolean(status.delivered) : Boolean(client.delivered);
+  const partial = status ? Boolean(status.partial) && !delivered : false;
+  const partialDetail = Array.isArray(status?.partial_detail) ? status.partial_detail : [];
+  return {
+    ...client,
+    delivered,
+    partial,
+    deliveredBaskets: status ? Number(status.delivered_baskets || 0) : null,
+    deliveredAt: status?.delivered_at || null,
+    partialDetail,
+  };
+}
+
+function buildCompletedRouteResult(sheet, deliveryStatusMap) {
+  const clients = flattenRouteResultClients(sheet).map((client) =>
+    applyRouteDeliveryStatus(client, deliveryStatusMap.get(client.key))
+  );
+  const totalClients = clients.length;
+  const deliveredClients = clients.filter((client) => client.delivered).length;
+  const partialClients = clients.filter((client) => client.partial && !client.delivered).length;
+  const completedClients = deliveredClients + partialClients;
+  const pendingClients = Math.max(0, totalClients - completedClients);
+  if (totalClients <= 0 || pendingClients > 0) return null;
+
+  return {
+    id_hoja: Number(sheet.id_hoja || 0),
+    route: makeRouteResultRouteKey(sheet.id_hoja),
+    routeName: normalizeRouteResultText(sheet.ruta_nombre) || 'SIN RUTA',
+    displayName: makeRouteResultDisplayName(sheet),
+    deliveryDate: formatRouteResultDate(sheet.fecha_entrega),
+    createdAt: sheet.created_at || null,
+    driver: normalizeRouteResultText(sheet.conductor),
+    truck: normalizeRouteResultText(sheet.numero_camion),
+    totalClients,
+    deliveredClients,
+    partialClients,
+    completedClients,
+    pendingClients,
+    progressPercent: 100,
+    completed: true,
+    totalDispatches: Number(sheet.total_despachos || totalClients || 0),
+    totalBaskets: Number(sheet.total_cestas || 0),
+    fileName: normalizeRouteResultText(sheet.nombre_archivo),
+    clients,
+  };
+}
+
+app.get('/api/resultados/rutas-completadas', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
+  const offset = Math.max(Number(req.query.offset || 0), 0);
+  const desde = String(req.query.desde || '').trim();
+  const hasta = String(req.query.hasta || '').trim();
+  const mes = String(req.query.mes || '').trim();
+  const anio = String(req.query.anio || '').trim();
+  const ruta = normalizeSalidasText(req.query.ruta, 120);
+  const hasDesde = /^\d{4}-\d{2}-\d{2}$/.test(desde);
+  const hasHasta = /^\d{4}-\d{2}-\d{2}$/.test(hasta);
+  const hasMesNumero = /^(0[1-9]|1[0-2])$/.test(mes);
+  const hasAnio = /^\d{4}$/.test(anio);
+
+  try {
+    const whereParts = [`COALESCE(jsonb_array_length(COALESCE(hr.facturas, '[]'::jsonb)), 0) > 0`];
+    const params = [];
+
+    if (hasDesde) {
+      params.push(desde);
+      whereParts.push(`hr.fecha_entrega >= $${params.length}::date`);
+    }
+    if (hasHasta) {
+      params.push(hasta);
+      whereParts.push(`hr.fecha_entrega <= $${params.length}::date`);
+    }
+    if (hasMesNumero) {
+      params.push(mes);
+      whereParts.push(`TO_CHAR(hr.fecha_entrega, 'MM') = $${params.length}`);
+    }
+    if (hasAnio) {
+      params.push(anio);
+      whereParts.push(`TO_CHAR(hr.fecha_entrega, 'YYYY') = $${params.length}`);
+    }
+    if (ruta) {
+      params.push(`%${ruta}%`);
+      whereParts.push(`COALESCE(hr.ruta_nombre, '') ILIKE $${params.length}`);
+    }
+    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
+      params.push(normalizeAuthUsername(auth.username));
+      whereParts.push(`REGEXP_REPLACE(UPPER(TRIM(COALESCE(hr.usuario, ''))), '[^A-Z0-9]', '', 'g') = $${params.length}`);
+    }
+
+    const result = await pool.query(
+      `SELECT
+         hr.id_hoja,
+         hr.ruta_nombre,
+         hr.fecha_entrega,
+         hr.conductor,
+         hr.numero_camion,
+         hr.total_despachos,
+         hr.total_cestas,
+         hr.usuario,
+         hr.nombre_archivo,
+         hr.created_at,
+         COALESCE(hr.facturas, '[]'::jsonb) AS facturas
+       FROM (
+         SELECT DISTINCT ON (id_hoja) *
+         FROM hojas_ruta_exportadas
+         ORDER BY id_hoja, created_at DESC
+       ) hr
+       WHERE ${whereParts.join(' AND ')}
+       ORDER BY hr.fecha_entrega DESC, hr.id_hoja DESC`,
+      params
+    );
+
+    const allClientKeys = [];
+    result.rows.forEach((sheet) => {
+      flattenRouteResultClients(sheet).forEach((client) => allClientKeys.push(client.key));
+    });
+    const deliveryStatusMap = await getRouteDeliveryStatusMap(allClientKeys);
+    const completedRoutes = result.rows
+      .map((sheet) => buildCompletedRouteResult(sheet, deliveryStatusMap))
+      .filter(Boolean);
+    const rows = completedRoutes.slice(offset, offset + limit);
+
+    return res.json({
+      ok: true,
+      rows,
+      total: completedRoutes.length,
+      hasMore: offset + limit < completedRoutes.length,
+      offset,
+      limit,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/api/hoja-ruta', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
@@ -6684,6 +6956,7 @@ async function startServer() {
     ['ensureControlInventarioTable', ensureControlInventarioTable],
     ['ensureMermaTables', ensureMermaTables],
     ['ensureSalidas09Tables', ensureSalidas09Tables],
+    ['ensureRouteDeliveryTables', ensureRouteDeliveryTables],
     ['ensurePerformanceIndexes', ensurePerformanceIndexes],
     ['dropLegacyUnusedTables', dropLegacyUnusedTables],
     ['ensureInitialAdminUsers', ensureInitialAdminUsers],
