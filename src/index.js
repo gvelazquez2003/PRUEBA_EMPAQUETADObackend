@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import crypto from 'crypto';
+import { createRequire } from 'module';
 
 dotenv.config();
 
@@ -165,6 +166,11 @@ const pool = new Pool({
   max: Number(process.env.DB_POOL_MAX || 5),
   connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
 });
+
+const require = createRequire(import.meta.url);
+globalThis.__PDT_VRP_APP = app;
+globalThis.__PDT_VRP_POOL = pool;
+const integratedVrpRoutes = require('./vrpRoutes.cjs');
 
 const IDEMPOTENT_WRITE_PATHS = new Set([
   '/api/empaquetados',
@@ -6957,6 +6963,7 @@ async function startServer() {
     ['ensureMermaTables', ensureMermaTables],
     ['ensureSalidas09Tables', ensureSalidas09Tables],
     ['ensureRouteDeliveryTables', ensureRouteDeliveryTables],
+    ['ensureIntegratedVrpTables', integratedVrpRoutes.ensureDatabaseReady],
     ['ensurePerformanceIndexes', ensurePerformanceIndexes],
     ['dropLegacyUnusedTables', dropLegacyUnusedTables],
     ['ensureInitialAdminUsers', ensureInitialAdminUsers],
