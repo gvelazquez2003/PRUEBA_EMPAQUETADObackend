@@ -2261,6 +2261,36 @@ function normalizeClienteDireccionMeta(row) {
   };
 }
 
+function normalizeClienteCatalogPayload(payload) {
+  const idCliente = normalizeSalidasText(payload?.id_cliente || payload?.rif, 40).toUpperCase();
+  return {
+    id_cliente: idCliente,
+    descripcion: normalizeSalidasText(payload?.descripcion || payload?.cliente, 200).toUpperCase(),
+    tipo_cliente: normalizeSalidasText(payload?.tipo_cliente, 80).toUpperCase(),
+    direccion: normalizeSalidasText(payload?.direccion, 500).toUpperCase(),
+    ruta: normalizeSalidasText(payload?.ruta, 120).toUpperCase(),
+    transporte: normalizeSalidasText(payload?.transporte, 120).toUpperCase(),
+    zona: normalizeSalidasText(payload?.zona, 120).toUpperCase(),
+    vendedor: normalizeSalidasText(payload?.vendedor, 160).toUpperCase(),
+  };
+}
+
+async function getClienteCatalogOptions(columnName, fallbackValues = []) {
+  const allowedColumns = new Set(['tipo_cliente', 'ruta', 'transporte', 'zona', 'vendedor']);
+  if (!allowedColumns.has(columnName)) return fallbackValues;
+  const result = await pool.query(
+    `SELECT TRIM(COALESCE(${columnName}, '')) AS value
+       FROM public.clientes
+      WHERE TRIM(COALESCE(${columnName}, '')) <> ''
+      GROUP BY TRIM(COALESCE(${columnName}, ''))
+      ORDER BY TRIM(COALESCE(${columnName}, '')) ASC`
+  );
+  const values = [...fallbackValues, ...result.rows.map((row) => normalizeSalidasText(row?.value, 160))]
+    .map((value) => normalizeSalidasText(value, 160).toUpperCase())
+    .filter(Boolean);
+  return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+}
+
 function normalizeDireccionMatchKey(value) {
   return stripDiacritics(value)
     .toUpperCase()
@@ -2683,6 +2713,12 @@ async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_lote_upper ON empaquetados_detalle(UPPER(TRIM(numero_lote)))');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura)');
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS descripcion TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS tipo_cliente TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS direccion TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS ruta TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS transporte TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS zona TEXT').catch(() => {});
   await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS vendedor TEXT').catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_zona ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(zona)))').catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_direccion ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(direccion)))').catch(() => {});
@@ -3027,6 +3063,102 @@ app.get('/api/almacen09/vendedores', async (req, res) => {
       params
     );
     return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/clientes-catalogo/opciones', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  try {
+    const [tipos, rutas, transportes, zonas, vendedores] = await Promise.all([
+      getClienteCatalogOptions('tipo_cliente', ['CADENAS', 'FOOD SERVICES', 'TIENDAS', 'FOOD TRUCK']),
+      getClienteCatalogOptions('ruta'),
+      getClienteCatalogOptions('transporte', ['DESPACHO', 'RETIRO']),
+      getClienteCatalogOptions('zona'),
+      getClienteCatalogOptions('vendedor'),
+    ]);
+    return res.json({
+      ok: true,
+      opciones: {
+        tipo_cliente: tipos,
+        ruta: rutas,
+        transporte: transportes,
+        zona: zonas,
+        vendedor: vendedores,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/clientes-catalogo', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const payload = normalizeClienteCatalogPayload(req.body || {});
+  const missing = [];
+  if (!payload.id_cliente) missing.push('RIF/C.I.');
+  if (!payload.descripcion) missing.push('cliente');
+  if (!payload.tipo_cliente) missing.push('tipo de cliente');
+  if (!payload.direccion) missing.push('direccion');
+  if (!payload.ruta) missing.push('ruta');
+  if (!payload.transporte) missing.push('transporte');
+  if (!payload.zona) missing.push('zona');
+  if (!payload.vendedor) missing.push('vendedor');
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: `Faltan campos: ${missing.join(', ')}` });
+  }
+
+  try {
+    const duplicated = await pool.query(
+      `SELECT 1
+         FROM public.clientes
+        WHERE regexp_replace(UPPER(TRIM(CAST(id_cliente AS TEXT))), '^([A-Z])-', '\\1') = regexp_replace(UPPER(TRIM($1)), '^([A-Z])-', '\\1')
+          AND LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($2))
+        LIMIT 1`,
+      [payload.id_cliente, payload.direccion]
+    );
+    if (duplicated.rowCount) {
+      return res.status(409).json({ ok: false, error: 'Ya existe un cliente con ese RIF/C.I. y esa direccion.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO public.clientes (
+         id_cliente,
+         descripcion,
+         tipo_cliente,
+         direccion,
+         ruta,
+         transporte,
+         zona,
+         vendedor
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING
+         CAST(id_cliente AS TEXT) AS id_cliente,
+         descripcion,
+         tipo_cliente,
+         direccion,
+         ruta,
+         transporte,
+         zona,
+         vendedor`,
+      [
+        payload.id_cliente,
+        payload.descripcion,
+        payload.tipo_cliente,
+        payload.direccion,
+        payload.ruta,
+        payload.transporte,
+        payload.zona,
+        payload.vendedor,
+      ]
+    );
+    return res.status(201).json({ ok: true, row: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
