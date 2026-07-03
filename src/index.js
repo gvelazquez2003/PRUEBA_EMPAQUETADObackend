@@ -3847,24 +3847,40 @@ app.post('/productos', async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      `INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso, activo)
-       VALUES ($1, $2, $3, $4, $5, TRUE)
-       ON CONFLICT (codigo_producto) DO UPDATE
-       SET descripcion = EXCLUDED.descripcion,
-           unidad_primaria = EXCLUDED.unidad_primaria,
-           paquetes = EXCLUDED.paquetes,
-           sobre_piso = EXCLUDED.sobre_piso,
-           activo = TRUE
-       RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso`,
-      [
-        String(codigo).trim().toUpperCase(),
-        String(descripcion).trim().toUpperCase(),
-        String(unidad || 'PAQ').trim().toUpperCase(),
-        Number.isFinite(Number(paquetes)) ? Number(paquetes) : 0,
-         Number.isFinite(Number(sobre_piso)) ? Number(sobre_piso) : 0,
-      ]
+    const cleanCodigo = String(codigo).trim().toUpperCase();
+    const cleanDescripcion = String(descripcion).trim().toUpperCase();
+    const cleanUnidad = String(unidad || 'PAQ').trim().toUpperCase();
+    const cleanPaquetes = Number.isFinite(Number(paquetes)) ? Number(paquetes) : 0;
+    const cleanSobrePiso = Number.isFinite(Number(sobre_piso)) ? Number(sobre_piso) : 0;
+
+    const existing = await pool.query(
+      `SELECT id_producto
+         FROM productos
+        WHERE UPPER(TRIM(codigo_producto)) = $1
+        ORDER BY id_producto
+        LIMIT 1`,
+      [cleanCodigo]
     );
+
+    const result = existing.rowCount
+      ? await pool.query(
+          `UPDATE productos
+              SET codigo_producto = $1,
+                  descripcion = $2,
+                  unidad_primaria = $3,
+                  paquetes = $4,
+                  sobre_piso = $5,
+                  activo = TRUE
+            WHERE id_producto = $6
+            RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso`,
+          [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso, existing.rows[0].id_producto]
+        )
+      : await pool.query(
+          `INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso, activo)
+           VALUES ($1, $2, $3, $4, $5, TRUE)
+           RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso`,
+          [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso]
+        );
     const barcodeResult = await pool.query(
       `UPDATE productos
           SET codigo_barras = UPPER(TRIM(codigo_producto))
