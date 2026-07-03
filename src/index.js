@@ -1636,6 +1636,7 @@ async function ensureSalidas09Tables() {
       documento VARCHAR(30) NOT NULL DEFAULT 'factura',
       numero_factura VARCHAR(80) NOT NULL,
       fecha_emision TIMESTAMP NOT NULL,
+      fecha_vencimiento DATE,
       cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       cliente_nombre VARCHAR(160),
       vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL,
@@ -1671,6 +1672,7 @@ async function ensureSalidas09Tables() {
 
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS numero_control BIGINT');
   await pool.query(`ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS documento VARCHAR(30) NOT NULL DEFAULT 'factura'`);
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_nombre VARCHAR(160)');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL');
@@ -1733,6 +1735,26 @@ async function ensureSalidas09Tables() {
   `);
 
   await pool.query('ALTER TABLE almacen09_salidas_detalle ADD COLUMN IF NOT EXISTS id_cambio BIGINT');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conciliacion_pagos (
+      id_pago BIGSERIAL PRIMARY KEY,
+      id_factura BIGINT NOT NULL REFERENCES salidas_facturas(id_factura) ON DELETE CASCADE,
+      fecha_pago DATE NOT NULL,
+      registrado_por VARCHAR(80),
+      observacion TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_conciliacion_pagos_factura
+    ON conciliacion_pagos (id_factura)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_conciliacion_pagos_fecha
+    ON conciliacion_pagos (fecha_pago DESC)
+  `);
 
   // Restore natural-key uniqueness required by the catalog upserts after SQL imports.
   await pool.query(`
@@ -5697,6 +5719,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const documento = normalizeSalidasDocumento(req.body?.documento);
   const isFacturaDocumento = documento === SALIDAS_DOCUMENT_TYPES.FACTURA;
   const fechaEmisionRaw = String(req.body?.fecha_emision || '').trim();
+  const fechaVencimientoRaw = String(req.body?.fecha_vencimiento || req.body?.fecha_venc || '').trim();
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 160);
   const clienteRifRaw = normalizeSalidasText(req.body?.rif || req.body?.id_cliente, 40);
@@ -5712,6 +5735,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const fechaEmision = /^\d{4}-\d{2}-\d{2}$/.test(fechaEmisionRaw)
     ? `${fechaEmisionRaw} 00:00:00`
     : fechaEmisionRaw;
+  const fechaVencimiento = /^\d{4}-\d{2}-\d{2}$/.test(fechaVencimientoRaw)
+    ? fechaVencimientoRaw
+    : '';
   const numeroControlProvided = Number.parseInt(numeroControlRaw, 10);
   const numeroControlManual = isFacturaDocumento && Number.isFinite(numeroControlProvided) && numeroControlProvided > 0
     ? Math.floor(numeroControlProvided)
@@ -5725,6 +5751,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   }
   if (!clienteRaw || !zonaInputRaw || !direccionInputRaw || !fechaEmision) {
     return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera (cliente, zona, direccion y fecha)' });
+  }
+  if (fechaVencimientoRaw && !fechaVencimiento) {
+    return res.status(400).json({ ok: false, error: 'fecha_vencimiento debe tener formato YYYY-MM-DD' });
   }
 
   const detalle = detalleRaw
@@ -5951,6 +5980,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
          documento,
          numero_factura,
          fecha_emision,
+         fecha_vencimiento,
          cliente_id,
          cliente_nombre,
          vendedor_id,
@@ -5965,13 +5995,14 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
          direccion_texto,
          estado
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, 'emitida')
-       RETURNING id_factura, numero_control, documento, numero_factura, fecha_emision`,
+       VALUES ($1, $2, $3, $4, NULLIF($5, '')::date, $6, $7, $8, $9, $10, $11, $12, $13, NULL, NULL, $14, $15, 'emitida')
+       RETURNING id_factura, numero_control, documento, numero_factura, fecha_emision, fecha_vencimiento`,
       [
         numeroControl,
         documento,
         numeroFactura,
         fechaEmision,
+        fechaVencimiento,
         cliente.id,
         cliente.value,
         vendedor.id,
@@ -6020,6 +6051,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
         documento: facturaInsert.rows[0].documento,
         numero_factura: facturaInsert.rows[0].numero_factura,
         fecha_emision: facturaInsert.rows[0].fecha_emision,
+        fecha_vencimiento: facturaInsert.rows[0].fecha_vencimiento,
         lineas: detalle.length,
         cliente: cliente.value,
         vendedor: vendedor.value,
@@ -6073,6 +6105,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sf.documento,
          sf.numero_factura,
          TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD HH24:MI:SS') AS fecha_emision,
+         TO_CHAR(sf.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
          sf.cliente_id,
          sf.cliente_nombre,
          sf.vendedor_id,
@@ -6457,6 +6490,8 @@ function flattenRouteResultClients(sheet) {
       driver: normalizeRouteResultText(sheet.conductor),
       truck: normalizeRouteResultText(sheet.numero_camion),
       deliveryDate: formatRouteResultDate(sheet.fecha_entrega),
+      invoiceIssueDate: formatRouteResultDate(invoice?.fecha_emision),
+      invoiceDueDate: formatRouteResultDate(invoice?.fecha_vencimiento),
       totalDispatches: Number(sheet.total_despachos || facturas.length || 0),
       totalBaskets: Number(sheet.total_cestas || 0),
       baskets: Number(invoice?.total_cestas || invoice?.cestas || invoice?.cantidad_cestas || 0),
@@ -6529,6 +6564,304 @@ function buildCompletedRouteResult(sheet, deliveryStatusMap) {
     clients,
   };
 }
+
+function getTodayCaracasIsoDate() {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Caracas',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+  } catch (_) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+function dateOnlyToUtcMs(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const [year, month, day] = raw.split('-').map((part) => Number(part));
+  if (![year, month, day].every(Number.isInteger)) return null;
+  return Date.UTC(year, month - 1, day);
+}
+
+function diffDaysDateOnly(fromDate, toDate) {
+  const fromMs = dateOnlyToUtcMs(fromDate);
+  const toMs = dateOnlyToUtcMs(toDate);
+  if (fromMs === null || toMs === null) return null;
+  return Math.round((toMs - fromMs) / 86400000);
+}
+
+function getConciliacionEstado(fechaVencimiento, pago, todayIso = getTodayCaracasIsoDate()) {
+  const due = normalizeRouteResultText(fechaVencimiento);
+  const fechaPago = normalizeRouteResultText(pago?.fecha_pago);
+  if (fechaPago) {
+    return due && fechaPago > due ? 'pagada_tarde' : 'pagada';
+  }
+  if (!due) return 'sin_vencimiento';
+  const days = diffDaysDateOnly(todayIso, due);
+  if (days === null) return 'sin_vencimiento';
+  if (days < 0) return 'vencida';
+  if (days <= 3) return 'por_vencer';
+  return 'pendiente';
+}
+
+function getDeliveredProductsForConciliacion(client) {
+  const detail = Array.isArray(client?.detail) ? client.detail : [];
+  if (!detail.length) return [];
+  if (client?.delivered) {
+    return detail
+      .map((item) => ({
+        codigo: normalizeRouteResultText(item?.codigo_producto || item?.codigo),
+        producto: normalizeRouteResultText(item?.producto || item?.descripcion),
+        cantidad: Math.max(0, Math.trunc(Number(item?.cantidad || 0))),
+      }))
+      .filter((item) => item.codigo && item.producto && item.cantidad > 0);
+  }
+
+  if (!client?.partial) return [];
+  const partialDetail = Array.isArray(client.partialDetail) ? client.partialDetail : [];
+  const deliveredByName = new Map();
+  partialDetail.forEach((item) => {
+    const key = normalizeSalidasLookupKey(item?.producto, 240);
+    const qty = Math.max(0, Math.trunc(Number(item?.cantidadEntregada || 0)));
+    if (key && qty > 0) deliveredByName.set(key, qty);
+  });
+
+  return detail
+    .map((item) => {
+      const producto = normalizeRouteResultText(item?.producto || item?.descripcion);
+      const expected = Math.max(0, Math.trunc(Number(item?.cantidad || 0)));
+      const delivered = deliveredByName.get(normalizeSalidasLookupKey(producto, 240)) || 0;
+      return {
+        codigo: normalizeRouteResultText(item?.codigo_producto || item?.codigo),
+        producto,
+        cantidad: Math.min(expected || delivered, delivered),
+      };
+    })
+    .filter((item) => item.codigo && item.producto && item.cantidad > 0);
+}
+
+async function buildConciliacionRows(auth) {
+  const facturasWhere = [`LOWER(TRIM(COALESCE(sf.transporte_nombre, ''))) <> 'retiro'`];
+  const facturasParams = [];
+  if (normalizeAuthRole(auth?.role) === APP_ROLES.VENDEDOR) {
+    appendVendedorAccessFilter(facturasWhere, facturasParams, auth, 'sf.vendedor_nombre');
+  }
+
+  const facturasResult = await pool.query(
+    `SELECT
+       sf.id_factura,
+       sf.numero_control,
+       sf.documento,
+       sf.numero_factura,
+       TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+       TO_CHAR(sf.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
+       sf.cliente_nombre,
+       sf.vendedor_nombre,
+       sf.zona_nombre,
+       sf.ruta_nombre,
+       sf.direccion_texto
+     FROM (
+       SELECT DISTINCT ON (id_factura) *
+       FROM salidas_facturas
+       ORDER BY id_factura
+     ) sf
+     WHERE ${facturasWhere.join(' AND ')}`,
+    facturasParams
+  );
+  const facturaMap = new Map();
+  facturasResult.rows.forEach((row) => facturaMap.set(Number(row.id_factura), row));
+  if (!facturaMap.size) return [];
+
+  const sheetsResult = await pool.query(
+    `SELECT
+       id_hoja,
+       ruta_nombre,
+       fecha_entrega,
+       conductor,
+       numero_camion,
+       total_despachos,
+       total_cestas,
+       usuario,
+       nombre_archivo,
+       created_at,
+       COALESCE(facturas, '[]'::jsonb) AS facturas
+     FROM (
+       SELECT DISTINCT ON (id_hoja) *
+       FROM hojas_ruta_exportadas
+       ORDER BY id_hoja, created_at DESC
+     ) hr
+     WHERE COALESCE(jsonb_array_length(COALESCE(hr.facturas, '[]'::jsonb)), 0) > 0
+     ORDER BY hr.fecha_entrega DESC, hr.id_hoja DESC`
+  );
+
+  const clients = [];
+  sheetsResult.rows.forEach((sheet) => {
+    flattenRouteResultClients(sheet).forEach((client) => {
+      const idFactura = Number(client.invoiceId || 0);
+      if (!facturaMap.has(idFactura)) return;
+      clients.push(client);
+    });
+  });
+  if (!clients.length) return [];
+
+  const deliveryStatusMap = await getRouteDeliveryStatusMap(clients.map((client) => client.key));
+  const deliveredByFactura = new Map();
+  clients.forEach((client) => {
+    const withStatus = applyRouteDeliveryStatus(client, deliveryStatusMap.get(client.key));
+    if (!withStatus.delivered && !withStatus.partial) return;
+    const productos = getDeliveredProductsForConciliacion(withStatus);
+    if (!productos.length) return;
+    const idFactura = Number(withStatus.invoiceId || 0);
+    if (!idFactura || deliveredByFactura.has(idFactura)) return;
+    deliveredByFactura.set(idFactura, { client: withStatus, productos });
+  });
+  if (!deliveredByFactura.size) return [];
+
+  const ids = Array.from(deliveredByFactura.keys());
+  const pagosResult = await pool.query(
+    `SELECT
+       id_pago,
+       id_factura,
+       TO_CHAR(fecha_pago, 'YYYY-MM-DD') AS fecha_pago,
+       registrado_por,
+       COALESCE(observacion, '') AS observacion,
+       created_at,
+       updated_at
+     FROM conciliacion_pagos
+     WHERE id_factura = ANY($1::bigint[])`,
+    [ids]
+  );
+  const pagoMap = new Map();
+  pagosResult.rows.forEach((row) => pagoMap.set(Number(row.id_factura), row));
+
+  const todayIso = getTodayCaracasIsoDate();
+  return ids.map((idFactura) => {
+    const factura = facturaMap.get(idFactura);
+    const delivered = deliveredByFactura.get(idFactura);
+    const pago = pagoMap.get(idFactura) || null;
+    const fechaVencimiento = normalizeRouteResultText(factura?.fecha_vencimiento || delivered.client.invoiceDueDate);
+    const fechaEmision = normalizeRouteResultText(factura?.fecha_emision || delivered.client.invoiceIssueDate);
+    const diasParaVencer = fechaVencimiento ? diffDaysDateOnly(todayIso, fechaVencimiento) : null;
+    const diasCredito = fechaEmision && fechaVencimiento ? diffDaysDateOnly(fechaEmision, fechaVencimiento) : null;
+    return {
+      id_factura: idFactura,
+      documento: normalizeRouteResultText(factura.documento),
+      numero_factura: normalizeRouteResultText(factura.numero_factura),
+      numero_control: factura.numero_control === null ? null : Number(factura.numero_control),
+      cliente_nombre: normalizeRouteResultText(factura.cliente_nombre || delivered.client.name),
+      vendedor_nombre: normalizeRouteResultText(factura.vendedor_nombre),
+      zona_nombre: normalizeRouteResultText(factura.zona_nombre || delivered.client.zone),
+      ruta_nombre: normalizeRouteResultText(factura.ruta_nombre || delivered.client.routeName),
+      direccion_texto: normalizeRouteResultText(factura.direccion_texto || delivered.client.originalAddress),
+      fecha_emision: fechaEmision,
+      fecha_vencimiento: fechaVencimiento,
+      fecha_entrega: normalizeRouteResultText(delivered.client.deliveryDate),
+      estado_entrega: delivered.client.delivered ? 'entregado' : 'entrega_incompleta',
+      productos: delivered.productos,
+      total_productos_entregados: delivered.productos.reduce((sum, item) => sum + Number(item.cantidad || 0), 0),
+      pago,
+      estado_pago: getConciliacionEstado(fechaVencimiento, pago, todayIso),
+      dias_para_vencer: diasParaVencer,
+      dias_credito: diasCredito,
+    };
+  }).sort((a, b) => {
+    const order = { vencida: 0, por_vencer: 1, pendiente: 2, sin_vencimiento: 3, pagada_tarde: 4, pagada: 5 };
+    const byStatus = (order[a.estado_pago] ?? 9) - (order[b.estado_pago] ?? 9);
+    if (byStatus) return byStatus;
+    return String(a.fecha_vencimiento || '9999-12-31').localeCompare(String(b.fecha_vencimiento || '9999-12-31'));
+  });
+}
+
+app.get('/api/conciliacion-pagos', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  try {
+    const estado = normalizeSalidasText(req.query?.estado, 40);
+    const q = normalizeSalidasLookupKey(req.query?.q, 160);
+    const rows = await buildConciliacionRows(auth);
+    const filtered = rows.filter((row) => {
+      if (estado && row.estado_pago !== estado) return false;
+      if (!q) return true;
+      const haystack = normalizeSalidasLookupKey([
+        row.numero_factura,
+        row.numero_control,
+        row.cliente_nombre,
+        row.vendedor_nombre,
+        row.ruta_nombre,
+        row.direccion_texto,
+      ].join(' '), 800);
+      return haystack.includes(q);
+    });
+    return res.json({
+      ok: true,
+      rows: filtered,
+      total: filtered.length,
+      today: getTodayCaracasIsoDate(),
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.put('/api/conciliacion-pagos/:id_factura', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  const idFactura = Number(req.params?.id_factura);
+  const fechaPago = String(req.body?.fecha_pago || '').trim();
+  const observacion = normalizeSalidasText(req.body?.observacion, 500);
+  if (!Number.isInteger(idFactura) || idFactura <= 0) {
+    return res.status(400).json({ ok: false, error: 'Factura invalida.' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fechaPago)) {
+    return res.status(400).json({ ok: false, error: 'fecha_pago debe tener formato YYYY-MM-DD' });
+  }
+
+  try {
+    const rows = await buildConciliacionRows(auth);
+    const target = rows.find((row) => Number(row.id_factura) === idFactura);
+    if (!target) {
+      return res.status(404).json({ ok: false, error: 'Factura no entregada o no disponible para este usuario.' });
+    }
+    if (!target.fecha_vencimiento) {
+      return res.status(409).json({ ok: false, error: 'Esta factura no tiene fecha de vencimiento registrada.' });
+    }
+    if (fechaPago > target.fecha_vencimiento) {
+      return res.status(409).json({ ok: false, error: 'La fecha de pago no puede ser posterior al vencimiento.' });
+    }
+    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR && getTodayCaracasIsoDate() > target.fecha_vencimiento) {
+      return res.status(409).json({ ok: false, error: 'Esta factura ya vencio. Solicita conciliacion administrativa.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO conciliacion_pagos (
+         id_factura,
+         fecha_pago,
+         registrado_por,
+         observacion,
+         updated_at
+       )
+       VALUES ($1, $2::date, $3, $4, NOW())
+       ON CONFLICT (id_factura) DO UPDATE
+         SET fecha_pago = EXCLUDED.fecha_pago,
+             registrado_por = EXCLUDED.registrado_por,
+             observacion = EXCLUDED.observacion,
+             updated_at = NOW()
+       RETURNING id_pago, id_factura, TO_CHAR(fecha_pago, 'YYYY-MM-DD') AS fecha_pago, registrado_por, COALESCE(observacion, '') AS observacion`,
+      [idFactura, fechaPago, normalizeAuthUsername(auth.username), observacion]
+    );
+
+    return res.json({ ok: true, pago: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
 app.get('/api/resultados/rutas-completadas', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
@@ -6689,6 +7022,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
          sf.numero_control,
          sf.numero_factura,
          TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+         TO_CHAR(sf.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
          sf.cliente_nombre,
          sf.vendedor_nombre,
          sf.zona_nombre,
@@ -6736,6 +7070,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
           numero_control: row.numero_control,
           numero_factura: row.numero_factura,
           fecha_emision: row.fecha_emision,
+          fecha_vencimiento: row.fecha_vencimiento,
           cliente_nombre: row.cliente_nombre,
           vendedor_nombre: row.vendedor_nombre,
           zona_nombre: row.zona_nombre,
