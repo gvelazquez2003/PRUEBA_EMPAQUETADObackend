@@ -1372,6 +1372,7 @@ async function ensureCambiosProductosTables() {
     CREATE TABLE IF NOT EXISTS cambios_registros (
       id_cambio BIGSERIAL PRIMARY KEY,
       codigo_cambio VARCHAR(20),
+      grupo_cambio VARCHAR(40),
       id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       nombre_cliente VARCHAR(180) NOT NULL,
       direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
@@ -1416,6 +1417,7 @@ async function ensureCambiosProductosTables() {
 
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS codigo_cambio VARCHAR(20)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS grupo_cambio VARCHAR(40)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)`);
@@ -1441,6 +1443,7 @@ async function ensureCambiosProductosTables() {
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto_unique ON cambios_razones(razon_texto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_created_at ON cambios_registros(created_at DESC)');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_registros_codigo_unique ON cambios_registros(codigo_cambio)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_grupo ON cambios_registros(grupo_cambio)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_ruta ON cambios_registros(ruta_nombre)');
 
   const razonesEjemplo = [
@@ -3397,10 +3400,12 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     }
 
     const cambiosInsertados = [];
+    const grupoCambio = crypto.randomUUID();
     for (const item of detalle) {
       const insertResult = await client.query(
         `INSERT INTO cambios_registros (
            id_cliente,
+           grupo_cambio,
            nombre_cliente,
            direccion_id,
            direccion_texto,
@@ -3408,10 +3413,11 @@ app.post('/api/almacen09/cambios', async (req, res) => {
            responsable,
            producto
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
          RETURNING id_cambio, created_at`,
         [
           clienteCatalog.id,
+          grupoCambio,
           clienteCatalog.value || clienteRaw,
           direccionCatalog.id,
           direccionCatalog.value || direccionRaw || null,
@@ -3431,6 +3437,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
       cambiosInsertados.push({
         id_cambio: Number(inserted.id_cambio || 0),
         codigo_cambio: codigoCambio,
+        grupo_cambio: grupoCambio,
         created_at: inserted.created_at || null,
         producto: item,
       });
@@ -4460,6 +4467,9 @@ app.get('/api/registros', async (req, res) => {
           cr.id_cambio AS "__ROW_ID",
           (cr.id_cambio::text || ':' || producto_item.ord::text) AS "__ROW_KEY",
           'cambios_registros'::text AS "__ROW_SOURCE",
+          cr.grupo_cambio AS "__CAMBIO_GROUP",
+          COALESCE(NULLIF(TRIM(ruta_meta.rif), ''), '') AS "__RIF_CLIENTE",
+          COALESCE(NULLIF(TRIM(ruta_meta.vendedor), ''), '') AS "__VENDEDOR_CLIENTE",
           TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
           COALESCE(NULLIF(TRIM(cr.codigo_cambio), ''), 'CAM' || LPAD(cr.id_cambio::text, 4, '0')) AS "Codigo de cambio",
           TO_CHAR(${cambioTsVzExpr}, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
@@ -4492,7 +4502,10 @@ app.get('/api/registros', async (req, res) => {
           END
         ) WITH ORDINALITY AS producto_item(value, ord)
         LEFT JOIN LATERAL (
-          SELECT TRIM(COALESCE(c.ruta, '')) AS ruta
+          SELECT
+            TRIM(COALESCE(c.ruta, '')) AS ruta,
+            TRIM(COALESCE(c.id_cliente::text, '')) AS rif,
+            TRIM(COALESCE(c.vendedor, '')) AS vendedor
           FROM public.clientes c
           WHERE LOWER(TRIM(COALESCE(c.descripcion, ''))) = LOWER(TRIM(cr.nombre_cliente))
             AND (
