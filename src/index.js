@@ -1373,11 +1373,14 @@ async function ensureCambiosProductosTables() {
       id_cambio BIGSERIAL PRIMARY KEY,
       codigo_cambio VARCHAR(20),
       grupo_cambio VARCHAR(40),
+      rif_cliente VARCHAR(40),
       id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       nombre_cliente VARCHAR(180) NOT NULL,
       direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
       direccion_texto VARCHAR(240),
       responsable VARCHAR(180) NOT NULL,
+      contacto VARCHAR(180),
+      telefono VARCHAR(20),
       producto JSONB NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
@@ -1418,11 +1421,14 @@ async function ensureCambiosProductosTables() {
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS codigo_cambio VARCHAR(20)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS grupo_cambio VARCHAR(40)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS rif_cliente VARCHAR(40)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS ruta_nombre VARCHAR(120)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS responsable VARCHAR(180)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS contacto VARCHAR(180)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS telefono VARCHAR(20)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS producto JSONB`);
   await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => {});
   await pool.query(`UPDATE cambios_registros SET nombre_cliente = COALESCE(nombre_cliente, cliente_nombre) WHERE nombre_cliente IS NULL`).catch(() => {});
@@ -3346,8 +3352,11 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 180);
+  const rifClienteRaw = normalizeSalidasText(req.body?.rif || req.body?.id_cliente, 40).toUpperCase();
   const direccionRaw = normalizeSalidasText(req.body?.direccion, 240);
   const responsableRaw = normalizeSalidasText(req.body?.responsable, 180);
+  const contactoRaw = normalizeSalidasText(req.body?.contacto, 180);
+  const telefonoRaw = normalizeSalidasText(req.body?.telefono, 20);
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
 
   const detalle = detalleRaw
@@ -3362,6 +3371,9 @@ app.post('/api/almacen09/cambios', async (req, res) => {
 
   if (!clienteRaw || !responsableRaw) {
     return res.status(400).json({ ok: false, error: 'cliente y responsable son obligatorios' });
+  }
+  if (!/^\d{4}-\d{7}$/.test(telefonoRaw)) {
+    return res.status(400).json({ ok: false, error: 'telefono debe tener formato XXXX-XXXXXXX' });
   }
   if (!detalle.length) {
     return res.status(400).json({ ok: false, error: 'detalle debe incluir productos con razon y cantidades validas' });
@@ -3406,23 +3418,29 @@ app.post('/api/almacen09/cambios', async (req, res) => {
         `INSERT INTO cambios_registros (
            id_cliente,
            grupo_cambio,
+           rif_cliente,
            nombre_cliente,
            direccion_id,
            direccion_texto,
            ruta_nombre,
            responsable,
+           contacto,
+           telefono,
            producto
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
          RETURNING id_cambio, created_at`,
         [
           clienteCatalog.id,
           grupoCambio,
+          rifClienteRaw || null,
           clienteCatalog.value || clienteRaw,
           direccionCatalog.id,
           direccionCatalog.value || direccionRaw || null,
           rutaCambio || null,
           responsableRaw,
+          contactoRaw || null,
+          telefonoRaw,
           JSON.stringify([item]),
         ]
       );
@@ -4468,7 +4486,9 @@ app.get('/api/registros', async (req, res) => {
           (cr.id_cambio::text || ':' || producto_item.ord::text) AS "__ROW_KEY",
           'cambios_registros'::text AS "__ROW_SOURCE",
           cr.grupo_cambio AS "__CAMBIO_GROUP",
-          COALESCE(NULLIF(TRIM(ruta_meta.rif), ''), '') AS "__RIF_CLIENTE",
+          COALESCE(NULLIF(TRIM(cr.rif_cliente), ''), NULLIF(TRIM(ruta_meta.rif), ''), '') AS "__RIF_CLIENTE",
+          COALESCE(NULLIF(TRIM(cr.contacto), ''), '') AS "__CONTACTO_CAMBIO",
+          COALESCE(NULLIF(TRIM(cr.telefono), ''), '') AS "__TELEFONO_CAMBIO",
           COALESCE(NULLIF(TRIM(ruta_meta.vendedor), ''), '') AS "__VENDEDOR_CLIENTE",
           TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
           COALESCE(NULLIF(TRIM(cr.codigo_cambio), ''), 'CAM' || LPAD(cr.id_cambio::text, 4, '0')) AS "Codigo de cambio",
@@ -4507,17 +4527,27 @@ app.get('/api/registros', async (req, res) => {
             TRIM(COALESCE(c.id_cliente::text, '')) AS rif,
             TRIM(COALESCE(c.vendedor, '')) AS vendedor
           FROM public.clientes c
-          WHERE LOWER(TRIM(COALESCE(c.descripcion, ''))) = LOWER(TRIM(cr.nombre_cliente))
-            AND (
-              TRIM(COALESCE(cr.direccion_texto, '')) = ''
-              OR LOWER(TRIM(COALESCE(c.direccion, ''))) = LOWER(TRIM(cr.direccion_texto))
+          WHERE (
+              (
+                TRIM(COALESCE(cr.rif_cliente, '')) <> ''
+                AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.id_cliente::text, ''))), '[^A-Z0-9]', '', 'g')
+                  = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.rif_cliente, ''))), '[^A-Z0-9]', '', 'g')
+              )
+              OR (
+                REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.descripcion, ''))), '[^A-Z0-9]', '', 'g')
+                  = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.nombre_cliente, ''))), '[^A-Z0-9]', '', 'g')
+                AND (
+                  TRIM(COALESCE(cr.direccion_texto, '')) = ''
+                  OR REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.direccion, ''))), '[^A-Z0-9]', '', 'g')
+                    = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.direccion_texto, ''))), '[^A-Z0-9]', '', 'g')
+                )
+              )
             )
-            AND TRIM(COALESCE(c.ruta, '')) <> ''
           ORDER BY
-            CASE
-              WHEN LOWER(TRIM(COALESCE(c.direccion, ''))) = LOWER(TRIM(COALESCE(cr.direccion_texto, ''))) THEN 0
-              ELSE 1
-            END,
+            CASE WHEN REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.id_cliente::text, ''))), '[^A-Z0-9]', '', 'g')
+                    = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.rif_cliente, ''))), '[^A-Z0-9]', '', 'g') THEN 0 ELSE 1 END,
+            CASE WHEN REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.direccion, ''))), '[^A-Z0-9]', '', 'g')
+                    = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.direccion_texto, ''))), '[^A-Z0-9]', '', 'g') THEN 0 ELSE 1 END,
             TRIM(COALESCE(c.ruta, '')) ASC
           LIMIT 1
         ) ruta_meta ON true
