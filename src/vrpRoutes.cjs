@@ -714,7 +714,19 @@ function classifyOpenRouteGeocodingResult(payload) {
     const confidence = Number(properties.confidence);
     const accuracy = normalizeText(properties.accuracy || properties.match_type || properties.layer);
     const formattedAddress = normalizeText(properties.label || properties.name || "");
-    const lowConfidence = Number.isFinite(confidence) && confidence > 0 && confidence < 0.55;
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+        return {
+            provider: "openrouteservice",
+            status: "not_found",
+            reason: "OpenRouteService encontro la direccion, pero no devolvio coordenadas validas.",
+            formattedAddress,
+            locationType: accuracy,
+            partialMatch: false,
+            latitude: null,
+            longitude: null
+        };
+    }
+    const lowConfidence = Number.isFinite(confidence) && confidence < 0.55;
     return {
         provider: "openrouteservice",
         status: lowConfidence ? "partial_match" : "valid",
@@ -724,27 +736,94 @@ function classifyOpenRouteGeocodingResult(payload) {
         formattedAddress,
         locationType: accuracy,
         partialMatch: lowConfidence,
-        latitude: Number.isFinite(latitude) ? latitude : null,
-        longitude: Number.isFinite(longitude) ? longitude : null
+        latitude,
+        longitude
     };
+}
+
+function normalizeOpenRouteQuery(value) {
+    return normalizeText(value)
+        .replace(/\s+/g, " ")
+        .replace(/\s+,/g, ",")
+        .replace(/,+/g, ",")
+        .trim();
+}
+
+function expandVenezuelanAddressAbbreviations(value) {
+    return normalizeOpenRouteQuery(String(value || "")
+        .replace(/\bAV\b\.?/gi, "Avenida")
+        .replace(/\bURB\b\.?/gi, "Urbanizacion")
+        .replace(/\bC\.?\s*C\.?\b/gi, "Centro Comercial")
+        .replace(/\bCC\b\.?/gi, "Centro Comercial")
+        .replace(/\bEDIF\b\.?/gi, "Edificio")
+        .replace(/\bPB\b\.?/gi, "Planta Baja")
+        .replace(/\bPARQ\b\.?/gi, "Parroquia")
+        .replace(/\bPPAL\b\.?/gi, "Principal"));
+}
+
+function keepParentheticalMarkersAsText(value) {
+    return normalizeOpenRouteQuery(String(value || "").replace(/\(([^)]+)\)/g, "$1 "));
+}
+
+function removeLeadingParentheticalMarker(value) {
+    return normalizeOpenRouteQuery(String(value || "").replace(/^\s*\([^)]*\)\s*/, ""));
+}
+
+function stripTrailingVenezuela(value) {
+    return normalizeOpenRouteQuery(String(value || "").replace(/,\s*venezuela\s*$/i, ""));
+}
+
+function buildOpenRouteGeocodeQueries(address) {
+    const raw = normalizeOpenRouteQuery(address);
+    const withoutCountry = stripTrailingVenezuela(raw);
+    const variants = [
+        raw,
+        keepParentheticalMarkersAsText(raw),
+        removeLeadingParentheticalMarker(raw),
+        expandVenezuelanAddressAbbreviations(raw),
+        expandVenezuelanAddressAbbreviations(keepParentheticalMarkersAsText(raw)),
+        expandVenezuelanAddressAbbreviations(removeLeadingParentheticalMarker(raw)),
+        `${withoutCountry}, Miranda, Venezuela`,
+        `${withoutCountry}, Caracas, Venezuela`,
+        `${expandVenezuelanAddressAbbreviations(withoutCountry)}, Miranda, Venezuela`,
+        `${expandVenezuelanAddressAbbreviations(withoutCountry)}, Caracas, Venezuela`
+    ];
+    return Array.from(new Set(variants.map(normalizeOpenRouteQuery).filter(Boolean)));
 }
 
 async function requestOpenRouteAddressValidation(address) {
     if (!OPENROUTESERVICE_API_KEY) {
         throw new Error("Falta OPENROUTESERVICE_API_KEY para validar direcciones.");
     }
-    const params = new URLSearchParams({
-        api_key: OPENROUTESERVICE_API_KEY,
-        text: normalizeText(address),
-        size: "1",
-        lang: "es",
-        "boundary.country": "VE"
-    });
-    const response = await fetch(`https://api.openrouteservice.org/geocode/search?${params.toString()}`);
-    if (!response.ok) {
-        throw new Error(`OpenRouteService Geocoding API HTTP ${response.status}. Revisa la API key y la cuota disponible.`);
+    let lastValidation = null;
+    const queries = buildOpenRouteGeocodeQueries(address);
+    for (const text of queries) {
+        const params = new URLSearchParams({
+            api_key: OPENROUTESERVICE_API_KEY,
+            text,
+            size: "1",
+            lang: "es",
+            "boundary.country": "VE",
+            "focus.point.lat": "10.4806",
+            "focus.point.lon": "-66.9036"
+        });
+        const response = await fetch(`https://api.openrouteservice.org/geocode/search?${params.toString()}`);
+        if (!response.ok) {
+            throw new Error(`OpenRouteService Geocoding API HTTP ${response.status}. Revisa la API key y la cuota disponible.`);
+        }
+        lastValidation = classifyOpenRouteGeocodingResult(await response.json());
+        if (lastValidation.status !== "not_found") return lastValidation;
     }
-    return classifyOpenRouteGeocodingResult(await response.json());
+    return lastValidation || {
+        provider: "openrouteservice",
+        status: "not_found",
+        reason: "OpenRouteService no encontro esta direccion.",
+        formattedAddress: "",
+        locationType: "",
+        partialMatch: false,
+        latitude: null,
+        longitude: null
+    };
 }
 
 async function requestAddressValidation(address) {
