@@ -14,6 +14,10 @@ function cleanEnvValue(value) {
 
 const GOOGLE_MAPS_API_KEY = cleanEnvValue(process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "");
 const GOOGLE_MAPS_BROWSER_API_KEY = cleanEnvValue(process.env.GOOGLE_MAPS_BROWSER_API_KEY || "");
+const OPENROUTESERVICE_API_KEY = cleanEnvValue(process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY || "");
+const ROUTING_PROVIDER = cleanEnvValue(
+    process.env.ROUTING_PROVIDER || (OPENROUTESERVICE_API_KEY ? "openrouteservice" : "google")
+).toLowerCase();
 const DISTRIBUTION_ORIGIN_NAME = process.env.DISTRIBUTION_ORIGIN_NAME || "PDT Bello Campo";
 const DISTRIBUTION_ORIGIN = process.env.DISTRIBUTION_ORIGIN || "Edificio Onnis, Avenida Francisco de Miranda, & Avenida Coromoto, Caracas 1060, Miranda, Venezuela";
 const DATABASE_URL = cleanEnvValue(process.env.DATABASE_URL || "");
@@ -29,6 +33,15 @@ const EXACT_OPTIMIZATION_MAX_STOPS = Number.isFinite(configuredExactOptimization
     ? Math.max(1, Math.min(18, Math.trunc(configuredExactOptimizationMaxStops)))
     : 14;
 const TRAFFIC_OPTIMAL_MATRIX_MAX_STOPS = 9;
+
+function getRoutingProvider() {
+    if (["openrouteservice", "ors", "openroute"].includes(ROUTING_PROVIDER)) return "openrouteservice";
+    return "google";
+}
+
+function getRoutingProviderLabel() {
+    return getRoutingProvider() === "openrouteservice" ? "OpenRouteService" : "Google Maps";
+}
 
 function normalizeHeader(value) {
     return String(value || "")
@@ -189,8 +202,7 @@ function normalizeDeliveryAddress(address) {
     if (!value) return "";
     const comparable = normalizeHeader(value);
     if (comparable.includes("venezuela")) return value;
-    if (comparable.includes("caracas")) return `${value}, Venezuela`;
-    return `${value}, Caracas, Venezuela`;
+    return `${value}, Venezuela`;
 }
 
 async function ensureDatabaseReady() {
@@ -240,6 +252,18 @@ async function ensureDatabaseReady() {
     await pool.query(`
         CREATE INDEX IF NOT EXISTS idx_address_validations_address
         ON address_validations (address)
+    `);
+    await pool.query(`
+        ALTER TABLE address_validations
+        ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT ''
+    `);
+    await pool.query(`
+        ALTER TABLE address_validations
+        ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION
+    `);
+    await pool.query(`
+        ALTER TABLE address_validations
+        ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION
     `);
 }
 
@@ -411,6 +435,9 @@ async function getAddressValidationsMap() {
             formatted_address,
             location_type,
             partial_match,
+            provider,
+            latitude,
+            longitude,
             checked_at
         FROM address_validations
     `);
@@ -422,6 +449,9 @@ async function getAddressValidationsMap() {
 function withAddressValidation(client, validation) {
     if (!validation || normalizeText(validation.address) !== normalizeText(client.address)) return client;
     const status = normalizeText(validation.status);
+    const latitude = Number(validation.latitude);
+    const longitude = Number(validation.longitude);
+    const hasLocation = Number.isFinite(latitude) && Number.isFinite(longitude);
     return {
         ...client,
         googleAddressStatus: status,
@@ -430,7 +460,9 @@ function withAddressValidation(client, validation) {
         googleAddressFormatted: normalizeText(validation.formatted_address),
         googleAddressLocationType: normalizeText(validation.location_type),
         googleAddressPartialMatch: Boolean(validation.partial_match),
-        googleAddressCheckedAt: validation.checked_at || null
+        googleAddressCheckedAt: validation.checked_at || null,
+        routingProvider: normalizeText(validation.provider),
+        routingLocation: hasLocation ? { lat: latitude, lng: longitude } : null
     };
 }
 
@@ -470,6 +502,19 @@ function isClientWithErrors(client) {
     const route = normalizeHeader(client.route);
     const missingFields = !client.clientId || !client.name || !client.address || !client.route;
     return missingFields || route.includes("revisar manualmente") || client.googleAddressIssue === true;
+}
+
+function hasValidationCoordinates(validation) {
+    const lat = Number(validation?.latitude);
+    const lng = Number(validation?.longitude);
+    return Number.isFinite(lat) && Number.isFinite(lng);
+}
+
+function validationMatchesRoutingProvider(validation) {
+    if (!validation) return false;
+    if (normalizeText(validation.address) === "") return false;
+    if (getRoutingProvider() !== "openrouteservice") return true;
+    return normalizeText(validation.provider) === "openrouteservice" && hasValidationCoordinates(validation);
 }
 
 async function routeStats(auth = null) {
@@ -647,6 +692,72 @@ async function requestGoogleAddressValidation(address) {
     return classifyGeocodingResult(await response.json());
 }
 
+function classifyOpenRouteGeocodingResult(payload) {
+    const features = Array.isArray(payload?.features) ? payload.features : [];
+    if (!features.length) {
+        return {
+            provider: "openrouteservice",
+            status: "not_found",
+            reason: "OpenRouteService no encontro esta direccion.",
+            formattedAddress: "",
+            locationType: "",
+            partialMatch: false,
+            latitude: null,
+            longitude: null
+        };
+    }
+    const feature = features[0] || {};
+    const properties = feature.properties || {};
+    const coordinates = Array.isArray(feature.geometry?.coordinates) ? feature.geometry.coordinates : [];
+    const longitude = Number(coordinates[0]);
+    const latitude = Number(coordinates[1]);
+    const confidence = Number(properties.confidence);
+    const accuracy = normalizeText(properties.accuracy || properties.match_type || properties.layer);
+    const formattedAddress = normalizeText(properties.label || properties.name || "");
+    const lowConfidence = Number.isFinite(confidence) && confidence > 0 && confidence < 0.55;
+    return {
+        provider: "openrouteservice",
+        status: lowConfidence ? "partial_match" : "valid",
+        reason: lowConfidence
+            ? "OpenRouteService encontro una coincidencia de baja confianza. Revisa calle, edificio y ciudad."
+            : "",
+        formattedAddress,
+        locationType: accuracy,
+        partialMatch: lowConfidence,
+        latitude: Number.isFinite(latitude) ? latitude : null,
+        longitude: Number.isFinite(longitude) ? longitude : null
+    };
+}
+
+async function requestOpenRouteAddressValidation(address) {
+    if (!OPENROUTESERVICE_API_KEY) {
+        throw new Error("Falta OPENROUTESERVICE_API_KEY para validar direcciones.");
+    }
+    const params = new URLSearchParams({
+        api_key: OPENROUTESERVICE_API_KEY,
+        text: normalizeText(address),
+        size: "1",
+        lang: "es",
+        "boundary.country": "VE"
+    });
+    const response = await fetch(`https://api.openrouteservice.org/geocode/search?${params.toString()}`);
+    if (!response.ok) {
+        throw new Error(`OpenRouteService Geocoding API HTTP ${response.status}. Revisa la API key y la cuota disponible.`);
+    }
+    return classifyOpenRouteGeocodingResult(await response.json());
+}
+
+async function requestAddressValidation(address) {
+    if (getRoutingProvider() === "openrouteservice") return requestOpenRouteAddressValidation(address);
+    const validation = await requestGoogleAddressValidation(address);
+    return {
+        ...validation,
+        provider: "google",
+        latitude: null,
+        longitude: null
+    };
+}
+
 async function saveAddressValidation(key, address, validation) {
     await pool.query(
         `INSERT INTO address_validations (
@@ -657,9 +768,12 @@ async function saveAddressValidation(key, address, validation) {
             formatted_address,
             location_type,
             partial_match,
+            provider,
+            latitude,
+            longitude,
             checked_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7::boolean, NOW())
+         VALUES ($1, $2, $3, $4, $5, $6, $7::boolean, $8, $9::double precision, $10::double precision, NOW())
          ON CONFLICT (client_key) DO UPDATE
          SET address = EXCLUDED.address,
              status = EXCLUDED.status,
@@ -667,6 +781,9 @@ async function saveAddressValidation(key, address, validation) {
              formatted_address = EXCLUDED.formatted_address,
              location_type = EXCLUDED.location_type,
              partial_match = EXCLUDED.partial_match,
+             provider = EXCLUDED.provider,
+             latitude = EXCLUDED.latitude,
+             longitude = EXCLUDED.longitude,
              checked_at = NOW()`,
         [
             key,
@@ -675,7 +792,10 @@ async function saveAddressValidation(key, address, validation) {
             validation.reason,
             validation.formattedAddress,
             validation.locationType,
-            Boolean(validation.partialMatch)
+            Boolean(validation.partialMatch),
+            normalizeText(validation.provider || getRoutingProvider()),
+            validation.latitude,
+            validation.longitude
         ]
     );
 }
@@ -685,7 +805,9 @@ async function validateClientAddresses(clients) {
     const byAddress = new Map();
     existing.forEach((validation) => {
         const address = normalizeText(validation.address);
-        if (address && !byAddress.has(address)) byAddress.set(address, validation);
+        if (address && validationMatchesRoutingProvider(validation) && !byAddress.has(address)) {
+            byAddress.set(address, validation);
+        }
     });
     const uniquePendingAddresses = new Map();
 
@@ -693,19 +815,22 @@ async function validateClientAddresses(clients) {
         const address = normalizeText(client.address);
         if (!address) return;
         const cached = existing.get(client.key);
-        if (cached && normalizeText(cached.address) === address) return;
+        if (cached && normalizeText(cached.address) === address && validationMatchesRoutingProvider(cached)) return;
         if (!byAddress.has(address)) uniquePendingAddresses.set(address, null);
     });
 
     for (const address of uniquePendingAddresses.keys()) {
-        const validation = await requestGoogleAddressValidation(address);
+        const validation = await requestAddressValidation(address);
         byAddress.set(address, {
             address,
             status: validation.status,
             reason: validation.reason,
             formatted_address: validation.formattedAddress,
             location_type: validation.locationType,
-            partial_match: validation.partialMatch
+            partial_match: validation.partialMatch,
+            provider: validation.provider || getRoutingProvider(),
+            latitude: validation.latitude,
+            longitude: validation.longitude
         });
     }
 
@@ -713,7 +838,7 @@ async function validateClientAddresses(clients) {
         const address = normalizeText(client.address);
         if (!address) continue;
         const cached = existing.get(client.key);
-        if (cached && normalizeText(cached.address) === address) continue;
+        if (cached && normalizeText(cached.address) === address && validationMatchesRoutingProvider(cached)) continue;
         const reused = byAddress.get(address);
         if (!reused) continue;
         await saveAddressValidation(client.key, address, {
@@ -721,13 +846,33 @@ async function validateClientAddresses(clients) {
             reason: reused.reason,
             formattedAddress: reused.formatted_address,
             locationType: reused.location_type,
-            partialMatch: reused.partial_match
+            partialMatch: reused.partial_match,
+            provider: reused.provider || getRoutingProvider(),
+            latitude: reused.latitude,
+            longitude: reused.longitude
         });
     }
 }
 
 function hasGoogleMapsConfig() {
     return Boolean(GOOGLE_MAPS_API_KEY && GOOGLE_MAPS_BROWSER_API_KEY);
+}
+
+function hasRoutingConfig() {
+    return getRoutingProvider() === "openrouteservice"
+        ? Boolean(OPENROUTESERVICE_API_KEY)
+        : Boolean(GOOGLE_MAPS_API_KEY);
+}
+
+function getRoutingConfigMissing() {
+    if (getRoutingProvider() === "openrouteservice") {
+        return [
+            !OPENROUTESERVICE_API_KEY ? "OPENROUTESERVICE_API_KEY" : ""
+        ].filter(Boolean);
+    }
+    return [
+        !GOOGLE_MAPS_API_KEY ? "GOOGLE_MAPS_SERVER_API_KEY" : ""
+    ].filter(Boolean);
 }
 
 const GOOGLE_MAPS_DELIVERIES_PER_SEGMENT = 10;
@@ -804,7 +949,198 @@ function getMatrixTrafficRoutingPreference(clientCount) {
         : "TRAFFIC_AWARE";
 }
 
+function formatDurationSeconds(secondsValue) {
+    const seconds = Number(secondsValue || 0);
+    if (!Number.isFinite(seconds) || seconds <= 0) return "";
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest ? `${hours} h ${rest} min` : `${hours} h`;
+}
+
+function getClientRoutingLocation(client) {
+    const lat = Number(client?.routingLocation?.lat);
+    const lng = Number(client?.routingLocation?.lng);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+    return null;
+}
+
+function toOpenRouteCoordinate(location) {
+    if (!location) return null;
+    const lat = Number(location.lat);
+    const lng = Number(location.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    return [lng, lat];
+}
+
+function parseOpenRouteDurationSeconds(value) {
+    const seconds = Number(value || 0);
+    return Number.isFinite(seconds) ? seconds : 0;
+}
+
+async function openRouteServiceRequest(path, body) {
+    if (!OPENROUTESERVICE_API_KEY) {
+        throw new Error("Falta OPENROUTESERVICE_API_KEY en variables de entorno.");
+    }
+    const response = await fetch(`https://api.openrouteservice.org/v2/${path}`, {
+        method: "POST",
+        headers: {
+            "Authorization": OPENROUTESERVICE_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json, application/geo+json"
+        },
+        body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+        let detail = "";
+        try {
+            const text = await response.text();
+            if (text) {
+                try {
+                    const payload = JSON.parse(text);
+                    detail = payload?.error?.message ? `: ${payload.error.message}` : `: ${text.slice(0, 240)}`;
+                } catch (_) {
+                    detail = `: ${text.slice(0, 240)}`;
+                }
+            }
+        } catch (_) {
+            detail = "";
+        }
+        throw new Error(`OpenRouteService HTTP ${response.status}${detail}`);
+    }
+
+    return response.json();
+}
+
+async function resolveOpenRouteAddressCoordinate(address) {
+    const validation = await requestOpenRouteAddressValidation(address);
+    if (validation.status === "not_found" || !Number.isFinite(Number(validation.latitude)) || !Number.isFinite(Number(validation.longitude))) {
+        throw new Error(`OpenRouteService no pudo ubicar esta direccion: ${normalizeText(address)}`);
+    }
+    return { lat: Number(validation.latitude), lng: Number(validation.longitude) };
+}
+
+async function computeOpenRouteMatrix(originAddress, clients, originLocation) {
+    const locations = [
+        toOpenRouteCoordinate(originLocation),
+        ...clients.map((client) => toOpenRouteCoordinate(getClientRoutingLocation(client)))
+    ];
+    if (locations.some((location) => !location)) {
+        throw new Error("Faltan coordenadas para uno o mas clientes. Revisa las direcciones antes de calcular la ruta.");
+    }
+
+    const payload = await openRouteServiceRequest("matrix/driving-car", {
+        locations,
+        metrics: ["duration", "distance"],
+        units: "m"
+    });
+    const size = locations.length;
+    const durations = Array.from({ length: size }, (_, row) =>
+        Array.from({ length: size }, (_, col) => (row === col ? 0 : Infinity))
+    );
+    const distances = Array.from({ length: size }, () => Array(size).fill(0));
+
+    if (!Array.isArray(payload?.durations)) {
+        throw new Error("OpenRouteService no devolvio una matriz de tiempos valida.");
+    }
+
+    payload.durations.forEach((row, rowIndex) => {
+        if (!Array.isArray(row)) return;
+        row.forEach((value, colIndex) => {
+            const seconds = Number(value);
+            durations[rowIndex][colIndex] = Number.isFinite(seconds) ? seconds : Infinity;
+        });
+    });
+
+    if (Array.isArray(payload.distances)) {
+        payload.distances.forEach((row, rowIndex) => {
+            if (!Array.isArray(row)) return;
+            row.forEach((value, colIndex) => {
+                const meters = Number(value);
+                distances[rowIndex][colIndex] = Number.isFinite(meters) ? meters : 0;
+            });
+        });
+    }
+
+    return {
+        durations,
+        distances,
+        routingPreference: "openrouteservice_matrix_driving_car",
+        queriedAt: new Date().toISOString()
+    };
+}
+
+async function computeOpenRouteDetails(originAddress, sequence, originLocation) {
+    const coordinates = [
+        toOpenRouteCoordinate(originLocation),
+        ...sequence.map((client) => toOpenRouteCoordinate(getClientRoutingLocation(client)))
+    ];
+    if (coordinates.some((location) => !location)) {
+        throw new Error("Faltan coordenadas para calcular el detalle de la ruta.");
+    }
+    const payload = await openRouteServiceRequest("directions/driving-car/json", {
+        coordinates,
+        language: "es",
+        units: "m",
+        instructions: false
+    });
+    const route = payload?.routes?.[0];
+    if (!route) throw new Error("OpenRouteService no devolvio rutas para esa consulta.");
+    const summary = route.summary || {};
+    return {
+        distanceMeters: Number(summary.distance || 0),
+        durationSeconds: parseOpenRouteDurationSeconds(summary.duration),
+        polyline: normalizeText(route.geometry),
+        legs: Array.isArray(route.segments)
+            ? route.segments.map((segment) => ({
+                distanceMeters: Number(segment?.distance || 0),
+                durationSeconds: parseOpenRouteDurationSeconds(segment?.duration)
+            }))
+            : []
+    };
+}
+
+async function computeOpenRouteOptimizedRoute(originAddress, clients) {
+    if (!OPENROUTESERVICE_API_KEY) {
+        throw new Error("Falta OPENROUTESERVICE_API_KEY en variables de entorno.");
+    }
+    const cleanClients = clients.filter((client) => client.address).slice(0, 24);
+    if (!cleanClients.length) {
+        throw new Error("La ruta necesita al menos 1 cliente con direccion para calcular con OpenRouteService.");
+    }
+    const missingLocations = cleanClients.filter((client) => !getClientRoutingLocation(client));
+    if (missingLocations.length) {
+        throw new Error(`${missingLocations.length} cliente(s) no tienen coordenadas validas. Revisa esos datos antes de despachar.`);
+    }
+
+    const originLocation = await resolveOpenRouteAddressCoordinate(originAddress);
+    const matrix = cleanClients.length > 1
+        ? await computeOpenRouteMatrix(originAddress, cleanClients, originLocation)
+        : null;
+    const optimization = matrix
+        ? optimizeClientOrderByDuration(cleanClients, matrix.durations)
+        : { sequence: cleanClients, method: "openrouteservice_single_stop" };
+    const routeDetails = await computeOpenRouteDetails(originAddress, optimization.sequence, originLocation);
+
+    return buildOpenRouteOptimizedRouteResponse(
+        originAddress,
+        optimization.sequence,
+        routeDetails,
+        matrix,
+        optimization.method
+    );
+}
+
 async function computeOptimizedRoute(originAddress, clients) {
+    if (getRoutingProvider() === "openrouteservice") {
+        return computeOpenRouteOptimizedRoute(originAddress, clients);
+    }
+    return computeGoogleOptimizedRoute(originAddress, clients);
+}
+
+async function computeGoogleOptimizedRoute(originAddress, clients) {
     if (!GOOGLE_MAPS_API_KEY) {
         throw new Error("Falta GOOGLE_MAPS_SERVER_API_KEY o GOOGLE_MAPS_API_KEY en variables de entorno.");
     }
@@ -1082,6 +1418,7 @@ function buildOptimizedRouteResponse(originAddress, sequence, route, matrix, opt
     const legs = Array.isArray(route.legs) ? route.legs : [];
     const googleMapsSegments = makeGoogleMapsSegments(sequence);
     return {
+        provider: "google",
         origin: originAddress,
         totalClients: sequence.length,
         totalDistanceKm: Number(((route.distanceMeters || 0) / 1000).toFixed(2)),
@@ -1111,6 +1448,42 @@ function buildOptimizedRouteResponse(originAddress, sequence, route, matrix, opt
                     lat: Number(latLng.latitude),
                     lng: Number(latLng.longitude)
                 } : null
+            };
+        })
+    };
+}
+
+function buildOpenRouteOptimizedRouteResponse(originAddress, sequence, route, matrix, optimizationMethod) {
+    const legs = Array.isArray(route.legs) ? route.legs : [];
+    const googleMapsSegments = makeGoogleMapsSegments(sequence);
+    return {
+        provider: "openrouteservice",
+        origin: originAddress,
+        totalClients: sequence.length,
+        totalDistanceKm: Number(((route.distanceMeters || 0) / 1000).toFixed(2)),
+        totalDurationText: formatDurationSeconds(route.durationSeconds),
+        totalDurationSeconds: parseOpenRouteDurationSeconds(route.durationSeconds),
+        trafficAware: false,
+        trafficRoutingPreference: "OPENROUTESERVICE_DRIVING_CAR",
+        matrixRoutingPreference: matrix?.routingPreference || "",
+        optimizationMethod,
+        matrixQueriedAt: matrix?.queriedAt || "",
+        queriedAt: new Date().toISOString(),
+        polyline: route.polyline || "",
+        googleMapsUrl: googleMapsSegments[0]?.googleMapsUrl || "",
+        googleMapsSegments,
+        sequence: sequence.map((client, index) => {
+            const leg = legs[index] || {};
+            const location = getClientRoutingLocation(client);
+            return {
+                ...client,
+                stopNumber: index + 1,
+                legDistanceMeters: Number(leg.distanceMeters || 0),
+                legDistanceText: formatMeters(Number(leg.distanceMeters || 0)),
+                legDurationText: formatDurationSeconds(leg.durationSeconds),
+                legDurationSeconds: parseOpenRouteDurationSeconds(leg.durationSeconds),
+                googleMapsNavigationUrl: makeGoogleMapsNavigationUrl(client.address),
+                location
             };
         })
     };
@@ -1193,6 +1566,8 @@ app.get("/api/health", async (_, res) => {
             service: "prueba-empaquetado-vrp-integrado",
             db: "connected",
             source: SOURCE_TABLE,
+            routingProvider: getRoutingProvider(),
+            routingReady: hasRoutingConfig(),
             googleMapsReady: hasGoogleMapsConfig()
         });
     } catch (error) {
@@ -1201,21 +1576,19 @@ app.get("/api/health", async (_, res) => {
 });
 
 app.get("/api/maps-config", (_, res) => {
+    const provider = getRoutingProvider();
     res.json({
         ok: true,
-        enabled: hasGoogleMapsConfig(),
-        browserApiKey: GOOGLE_MAPS_BROWSER_API_KEY,
+        enabled: hasRoutingConfig(),
+        provider,
+        providerLabel: getRoutingProviderLabel(),
+        browserApiKey: provider === "google" ? GOOGLE_MAPS_BROWSER_API_KEY : "",
         origin: DISTRIBUTION_ORIGIN,
         originName: DISTRIBUTION_ORIGIN_NAME,
-        requiredApis: [
-            "Routes API",
-            "Maps JavaScript API",
-            "Geocoding API"
-        ],
-        missing: [
-            !GOOGLE_MAPS_API_KEY ? "GOOGLE_MAPS_SERVER_API_KEY" : "",
-            !GOOGLE_MAPS_BROWSER_API_KEY ? "GOOGLE_MAPS_BROWSER_API_KEY" : ""
-        ].filter(Boolean)
+        requiredApis: provider === "openrouteservice"
+            ? ["OpenRouteService Directions", "OpenRouteService Matrix", "OpenRouteService Geocode"]
+            : ["Routes API", "Geocoding API"],
+        missing: getRoutingConfigMissing()
     });
 });
 
@@ -1340,7 +1713,7 @@ app.post("/api/optimize-route", async (req, res) => {
         if (notFoundClients.length) {
             return res.status(422).json({
                 ok: false,
-                error: `${notFoundClients.length} cliente(s) tienen direcciones que Google Maps no pudo encontrar. Revisa esos datos antes de despachar.`,
+                error: `${notFoundClients.length} cliente(s) tienen direcciones que ${getRoutingProviderLabel()} no pudo encontrar. Revisa esos datos antes de despachar.`,
                 invalidClients: notFoundClients.map((client) => ({
                     key: client.key,
                     clientId: client.clientId,
@@ -1349,6 +1722,22 @@ app.post("/api/optimize-route", async (req, res) => {
                     reason: client.googleAddressReason
                 }))
             });
+        }
+        if (getRoutingProvider() === "openrouteservice") {
+            const clientsWithoutCoordinates = clients.filter((client) => !getClientRoutingLocation(client));
+            if (clientsWithoutCoordinates.length) {
+                return res.status(422).json({
+                    ok: false,
+                    error: `${clientsWithoutCoordinates.length} cliente(s) no tienen coordenadas validas para OpenRouteService. Revisa esas direcciones antes de despachar.`,
+                    invalidClients: clientsWithoutCoordinates.map((client) => ({
+                        key: client.key,
+                        clientId: client.clientId,
+                        name: client.nombre_o_razon_social || client.name,
+                        address: client.address,
+                        reason: client.googleAddressReason || "Sin coordenadas"
+                    }))
+                });
+            }
         }
         const optimized = await optimizeRoute(clients, origin);
         res.json({ ok: true, route, optimized });

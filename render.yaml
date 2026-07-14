@@ -19,3 +19,7 @@ services:
         sync: false
       - key: CORS_ORIGIN
         sync: false
+      - key: ROUTING_PROVIDER
+        value: openrouteservice
+      - key: OPENROUTESERVICE_API_KEY
+        sync: false

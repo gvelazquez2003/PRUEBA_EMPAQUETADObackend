@@ -12,6 +12,8 @@ Copia `.env.example` a `.env` y completa:
 - `NODE_ENV`: `development` o `production`.
 - `ADMIN_KEY`: clave para crear/eliminar productos.
 - `CORS_ORIGIN`: dominios permitidos separados por coma o `*`.
+- `ROUTING_PROVIDER`: usa `openrouteservice` para el módulo de Rutas sin Google Routes API.
+- `OPENROUTESERVICE_API_KEY`: clave de OpenRouteService para geocoding, matriz y direcciones.
 
 ## 2) Ejecutar local
 
@@ -113,6 +115,8 @@ DB_POOL_MAX=5
 NODE_ENV=production
 ADMIN_KEY=CAMBIAR_CLAVE_ADMIN
 CORS_ORIGIN=https://prueba-empaquetad-ofrontend-theta.vercel.app
+ROUTING_PROVIDER=openrouteservice
+OPENROUTESERVICE_API_KEY=CAMBIAR_API_KEY
 ```
 
 El usuario PostgreSQL debe estar asignado a `admin01_neondbfinal` y SPanel debe permitir conexiones desde los rangos IP de salida del servicio Render.
