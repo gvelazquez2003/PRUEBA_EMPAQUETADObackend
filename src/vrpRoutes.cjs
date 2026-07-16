@@ -162,6 +162,14 @@ function coordinateBoundsIssue(address, validation, context = {}) {
 
     const regionalBounds = [
         {
+            label: "Prado / Baruta / este-sur de Caracas",
+            keys: ["prado", "baruta", "santa fe", "la alameda", "caurimare", "bello monte", "santa rosa", "mirador"],
+            minLat: 10.32,
+            maxLat: 10.56,
+            minLng: -67.15,
+            maxLng: -66.68
+        },
+        {
             label: "Chacao / este de Caracas",
             keys: ["chacao", "altamira", "bello campo", "palos grandes", "la castellana", "ruices", "ruic"],
             minLat: 10.40,
@@ -1000,6 +1008,19 @@ function stripTrailingVenezuela(value) {
     return normalizeOpenRouteQuery(String(value || "").replace(/,\s*venezuela\s*$/i, ""));
 }
 
+function extractAddressMarker(value) {
+    const match = /^\s*\(([^)]+)\)/.exec(String(value || ""));
+    return normalizeOpenRouteQuery(match?.[1] || "");
+}
+
+function cleanBusinessSearchName(value) {
+    return normalizeOpenRouteQuery(String(value || "")
+        .replace(/\bC\.?\s*A\.?\b\.?/gi, " ")
+        .replace(/\bS\.?\s*A\.?\b\.?/gi, " ")
+        .replace(/\bCA\b\.?/gi, " ")
+        .replace(/\bSA\b\.?/gi, " "));
+}
+
 function removeAddressUnitNoise(value) {
     return normalizeOpenRouteQuery(String(value || "")
         .replace(/\b(EDIFICIO|EDIF|EDF|ED)\s+[^,]*?(?=\s+(PISO|OFICINA|OF|LOCAL|LOC|NIVEL|PLANTA|PB|URB|URBANIZACION|AVENIDA|CALLE|CARACAS|CHACAO|MUNICIPIO|PARROQUIA|CENTRO COMERCIAL)\b|,|$)/gi, " ")
@@ -1024,6 +1045,8 @@ function normalizeMunicipalityHints(value) {
 
 function inferLocalitySuffix(value) {
     const comparable = normalizeHeader(value);
+    if (comparable.includes("prado")) return "Prados del Este, Caracas, Venezuela";
+    if (comparable.includes("baruta")) return "Baruta, Miranda, Venezuela";
     if (comparable.includes("guatire")) return "Guatire, Miranda, Venezuela";
     if (comparable.includes("guarenas")) return "Guarenas, Miranda, Venezuela";
     if (comparable.includes("chacao")) return "Chacao, Caracas, Venezuela";
@@ -1088,8 +1111,31 @@ function buildOpenRouteGeocodeQueries(address, context = {}) {
     return buildGeocodeQueryVariants(address, context);
 }
 
+function buildNamedGoogleGeocodeQueryVariants(address, context = {}) {
+    const raw = normalizeOpenRouteQuery(address);
+    const name = cleanBusinessSearchName(context.name || context.nombre_o_razon_social);
+    const marker = extractAddressMarker(raw);
+    const noLeadingMarker = removeLeadingParentheticalMarker(raw);
+    const noNoise = removeAddressUnitNoise(expandVenezuelanAddressAbbreviations(raw));
+    const hinted = normalizeMunicipalityHints(noNoise);
+    const suffix = inferLocalitySuffix(`${raw} ${context.route || ""} ${context.routeName || ""} ${name}`);
+    const routeSuffix = inferLocalitySuffix(`${context.route || ""} ${context.routeName || ""} ${name}`);
+    if (!name) return [];
+    return uniqueNormalized([
+        marker ? `${name} ${marker}, ${routeSuffix}` : "",
+        marker ? `${name} ${marker}, ${suffix}` : "",
+        `${name}, ${hinted}, ${routeSuffix}`,
+        `${name}, ${noLeadingMarker}, ${routeSuffix}`,
+        `${name}, ${noNoise}, ${routeSuffix}`,
+        `${name}, ${stripTrailingVenezuela(raw)}, ${routeSuffix}`
+    ]);
+}
+
 function buildGoogleGeocodeQueries(address, context = {}) {
-    return buildGeocodeQueryVariants(address, context).slice(0, GOOGLE_GEOCODING_MAX_VARIANTS);
+    return uniqueNormalized([
+        ...buildNamedGoogleGeocodeQueryVariants(address, context),
+        ...buildGeocodeQueryVariants(address, context)
+    ]).slice(0, GOOGLE_GEOCODING_MAX_VARIANTS);
 }
 
 async function requestOpenRouteAddressValidation(address, context = {}) {
@@ -1384,6 +1430,22 @@ function formatGoogleMapsCoordinate(location) {
     return `${lat.toFixed(6)},${lng.toFixed(6)}`;
 }
 
+function buildGoogleMapsSearchStop(client) {
+    const address = normalizeOpenRouteQuery(client?.address);
+    const name = cleanBusinessSearchName(client?.name || client?.nombre_o_razon_social || client?.clientId);
+    const marker = extractAddressMarker(address);
+    const suffix = inferLocalitySuffix([
+        address,
+        client?.route,
+        client?.routeName,
+        name
+    ].filter(Boolean).join(" "));
+    if (name && marker) return `${name} ${marker}, ${suffix}`;
+    if (name && address) return `${name}, ${removeLeadingParentheticalMarker(address) || suffix}`;
+    if (name) return `${name}, ${suffix}`;
+    return "";
+}
+
 function getGoogleMapsStop(client) {
     const coordinate = formatGoogleMapsCoordinate(
         client?.location
@@ -1392,6 +1454,8 @@ function getGoogleMapsStop(client) {
         || null
     );
     if (coordinate) return coordinate;
+    const searchStop = buildGoogleMapsSearchStop(client);
+    if (searchStop) return searchStop;
     return normalizeText(client?.address);
 }
 
