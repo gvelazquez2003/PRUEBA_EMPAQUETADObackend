@@ -30,6 +30,7 @@ const GOOGLE_GEOCODING_FALLBACK_ENABLED = ["1", "true", "yes", "si", "sí"].incl
 const GOOGLE_GEOCODING_DAILY_LIMIT = parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_DAILY_LIMIT || 250, 250);
 const GOOGLE_GEOCODING_MONTHLY_LIMIT = parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_MONTHLY_LIMIT || 9000, 9000);
 const GOOGLE_GEOCODING_CACHE_DAYS = Math.max(1, parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_CACHE_DAYS || 30, 30));
+const GOOGLE_GEOCODING_MAX_VARIANTS = Math.max(1, Math.min(8, parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_MAX_VARIANTS || 5, 5)));
 const DISTRIBUTION_ORIGIN_NAME = process.env.DISTRIBUTION_ORIGIN_NAME || "PDT Bello Campo";
 const DISTRIBUTION_ORIGIN = process.env.DISTRIBUTION_ORIGIN || "Edificio Onnis, Avenida Francisco de Miranda, & Avenida Coromoto, Caracas 1060, Miranda, Venezuela";
 const DATABASE_URL = cleanEnvValue(process.env.DATABASE_URL || "");
@@ -66,6 +67,26 @@ function normalizeHeader(value) {
 
 function normalizeText(value) {
     return String(value || "").trim();
+}
+
+function stripDiacritics(value) {
+    return String(value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
+}
+
+function uniqueNormalized(values) {
+    const seen = new Set();
+    const result = [];
+    for (const value of values) {
+        const clean = normalizeOpenRouteQuery(value);
+        if (!clean) continue;
+        const key = normalizeHeader(clean);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(clean);
+    }
+    return result;
 }
 
 function normalizeUsername(value) {
@@ -554,7 +575,7 @@ function validationMatchesRoutingProvider(validation) {
     if (provider === "openrouteservice") return hasValidationCoordinates(validation);
     if (isGoogleGeocodingFallbackProvider(provider)) {
         const fresh = isValidationFresh(validation, GOOGLE_GEOCODING_CACHE_DAYS);
-        return fresh && (hasValidationCoordinates(validation) || normalizeText(validation.status) === "not_found");
+        return fresh && hasValidationCoordinates(validation);
     }
     return false;
 }
@@ -747,7 +768,7 @@ function classifyGeocodingResult(payload) {
     };
 }
 
-async function requestGoogleAddressValidation(address, apiKey = GOOGLE_MAPS_API_KEY) {
+async function requestSingleGoogleAddressValidation(address, apiKey = GOOGLE_MAPS_API_KEY) {
     if (!apiKey) {
         throw new Error("Falta una API key de Google Geocoding para validar direcciones.");
     }
@@ -762,6 +783,10 @@ async function requestGoogleAddressValidation(address, apiKey = GOOGLE_MAPS_API_
         throw new Error(`Google Geocoding API HTTP ${response.status}. Activa Geocoding API para la clave de servidor.`);
     }
     return classifyGeocodingResult(await response.json());
+}
+
+async function requestGoogleAddressValidation(address, apiKey = GOOGLE_MAPS_API_KEY) {
+    return requestSingleGoogleAddressValidation(address, apiKey);
 }
 
 function classifyOpenRouteGeocodingResult(payload) {
@@ -815,6 +840,10 @@ function classifyOpenRouteGeocodingResult(payload) {
 
 function normalizeOpenRouteQuery(value) {
     return normalizeText(value)
+        .replace(/([A-Za-zÃÃ‰ÃÃ“ÃšÃ‘Ã¡Ã©Ã­Ã³ÃºÃ±])\.([A-Za-zÃÃ‰ÃÃ“ÃšÃ‘Ã¡Ã©Ã­Ã³ÃºÃ±])/g, "$1. $2")
+        .replace(/([a-zÃ¡Ã©Ã­Ã³ÃºÃ±])([A-ZÃÃ‰ÃÃ“ÃšÃ‘])/g, "$1 $2")
+        .replace(/[;|]/g, ",")
+        .replace(/\s*-\s*/g, " ")
         .replace(/\s+/g, " ")
         .replace(/\s+,/g, ",")
         .replace(/,+/g, ",")
@@ -823,14 +852,23 @@ function normalizeOpenRouteQuery(value) {
 
 function expandVenezuelanAddressAbbreviations(value) {
     return normalizeOpenRouteQuery(String(value || "")
+        .replace(/\bAVDA\b\.?/gi, "Avenida")
+        .replace(/\bAVEN\b\.?/gi, "Avenida")
         .replace(/\bAV\b\.?/gi, "Avenida")
+        .replace(/\bFCO\b\.?/gi, "Francisco")
         .replace(/\bURB\b\.?/gi, "Urbanizacion")
         .replace(/\bC\.?\s*C\.?\b/gi, "Centro Comercial")
         .replace(/\bCC\b\.?/gi, "Centro Comercial")
+        .replace(/\bC\.?\s*COM\b\.?/gi, "Centro Comercial")
+        .replace(/\bEDF\b\.?/gi, "Edificio")
         .replace(/\bEDIF\b\.?/gi, "Edificio")
+        .replace(/\bED\b\.?/gi, "Edificio")
         .replace(/\bPB\b\.?/gi, "Planta Baja")
         .replace(/\bPARQ\b\.?/gi, "Parroquia")
-        .replace(/\bPPAL\b\.?/gi, "Principal"));
+        .replace(/\bPPAL\b\.?/gi, "Principal")
+        .replace(/\bTRANSV\b\.?/gi, "Transversal")
+        .replace(/\bESQ\b\.?/gi, "Esquina")
+        .replace(/\bMCPIO\b\.?/gi, "Municipio"));
 }
 
 function keepParentheticalMarkersAsText(value) {
@@ -845,22 +883,92 @@ function stripTrailingVenezuela(value) {
     return normalizeOpenRouteQuery(String(value || "").replace(/,\s*venezuela\s*$/i, ""));
 }
 
-function buildOpenRouteGeocodeQueries(address) {
+function removeAddressUnitNoise(value) {
+    return normalizeOpenRouteQuery(String(value || "")
+        .replace(/\b(EDIFICIO|EDIF|EDF|ED)\s+[^,]*?(?=\s+(PISO|OFICINA|OF|LOCAL|LOC|NIVEL|PLANTA|PB|URB|URBANIZACION|AVENIDA|CALLE|CARACAS|CHACAO|MUNICIPIO|PARROQUIA|CENTRO COMERCIAL)\b|,|$)/gi, " ")
+        .replace(/\b(PISO|NIVEL)\s+[A-Z0-9-]+/gi, " ")
+        .replace(/\b(OFICINA|OF)\s+[A-Z0-9-]+/gi, " ")
+        .replace(/\b(LOCAL|LOC)\s+[A-Z0-9-]+/gi, " ")
+        .replace(/\b(PB|PLANTA BAJA)\b/gi, " ")
+        .replace(/\b(APTO|APARTAMENTO|GALPON|DEP)\s+[A-Z0-9-]+/gi, " "));
+}
+
+function normalizeMunicipalityHints(value) {
+    const expanded = expandVenezuelanAddressAbbreviations(value);
+    return normalizeOpenRouteQuery(expanded
+        .replace(/\bCARACAS\.?\s*CHACAO\b/gi, "Chacao, Caracas")
+        .replace(/\bMUNICIPIO\s+CHACAO\b/gi, "Chacao")
+        .replace(/\bPARROQUIA\s+CHACAO\b/gi, "Chacao")
+        .replace(/\bMUNICIPIO\s+GUATIRE\b/gi, "Guatire")
+        .replace(/\bMUNICIPIO\s+GUARENAS\b/gi, "Guarenas")
+        .replace(/\bURBANIZACION\b/gi, "")
+        .replace(/\bURB\b/gi, ""));
+}
+
+function inferLocalitySuffix(value) {
+    const comparable = normalizeHeader(value);
+    if (comparable.includes("guatire")) return "Guatire, Miranda, Venezuela";
+    if (comparable.includes("guarenas")) return "Guarenas, Miranda, Venezuela";
+    if (comparable.includes("chacao")) return "Chacao, Caracas, Venezuela";
+    if (comparable.includes("altamira")) return "Altamira, Chacao, Caracas, Venezuela";
+    if (comparable.includes("los palos grandes")) return "Los Palos Grandes, Chacao, Caracas, Venezuela";
+    if (comparable.includes("bello campo")) return "Bello Campo, Chacao, Caracas, Venezuela";
+    if (comparable.includes("la castellana")) return "La Castellana, Chacao, Caracas, Venezuela";
+    if (comparable.includes("el marques")) return "El Marques, Caracas, Venezuela";
+    if (comparable.includes("santa monica")) return "Santa Monica, Caracas, Venezuela";
+    if (comparable.includes("sabana grande")) return "Sabana Grande, Caracas, Venezuela";
+    return "Caracas, Venezuela";
+}
+
+function streetOnlyVariant(value) {
+    const expanded = normalizeMunicipalityHints(value);
+    const withoutNoise = removeAddressUnitNoise(expanded);
+    return normalizeOpenRouteQuery(withoutNoise
+        .replace(/\b(EDIFICIO|CENTRO COMERCIAL|CC|C C)\b[^,]*/gi, " ")
+        .replace(/\b(MANZANA|TORRE)\s+[A-Z0-9-]+/gi, " ")
+        .replace(/\b(CRUCE CON|CON CALLE|ENTRE)\b/gi, ", ")
+        .replace(/\b(MUNICIPIO|PARROQUIA)\b/gi, " "));
+}
+
+function buildGeocodeQueryVariants(address) {
     const raw = normalizeOpenRouteQuery(address);
+    const expanded = expandVenezuelanAddressAbbreviations(raw);
+    const parentheticalAsText = keepParentheticalMarkersAsText(raw);
+    const noLeadingMarker = removeLeadingParentheticalMarker(raw);
+    const noNoise = removeAddressUnitNoise(expanded);
+    const hinted = normalizeMunicipalityHints(noNoise);
+    const streetOnly = streetOnlyVariant(raw);
+    const suffix = inferLocalitySuffix(raw);
     const withoutCountry = stripTrailingVenezuela(raw);
-    const variants = [
+    const noAccent = stripDiacritics(expanded);
+
+    return uniqueNormalized([
         raw,
-        keepParentheticalMarkersAsText(raw),
-        removeLeadingParentheticalMarker(raw),
-        expandVenezuelanAddressAbbreviations(raw),
-        expandVenezuelanAddressAbbreviations(keepParentheticalMarkersAsText(raw)),
-        expandVenezuelanAddressAbbreviations(removeLeadingParentheticalMarker(raw)),
+        expanded,
+        parentheticalAsText,
+        expandVenezuelanAddressAbbreviations(parentheticalAsText),
+        noLeadingMarker,
+        expandVenezuelanAddressAbbreviations(noLeadingMarker),
+        noNoise,
+        hinted,
+        streetOnly,
+        `${streetOnly}, ${suffix}`,
+        `${hinted}, ${suffix}`,
+        `${withoutCountry}, ${suffix}`,
+        `${noAccent}, ${suffix}`,
         `${withoutCountry}, Miranda, Venezuela`,
         `${withoutCountry}, Caracas, Venezuela`,
         `${expandVenezuelanAddressAbbreviations(withoutCountry)}, Miranda, Venezuela`,
         `${expandVenezuelanAddressAbbreviations(withoutCountry)}, Caracas, Venezuela`
-    ];
-    return Array.from(new Set(variants.map(normalizeOpenRouteQuery).filter(Boolean)));
+    ]);
+}
+
+function buildOpenRouteGeocodeQueries(address) {
+    return buildGeocodeQueryVariants(address);
+}
+
+function buildGoogleGeocodeQueries(address) {
+    return buildGeocodeQueryVariants(address).slice(0, GOOGLE_GEOCODING_MAX_VARIANTS);
 }
 
 async function requestOpenRouteAddressValidation(address) {
@@ -943,29 +1051,44 @@ async function getGoogleGeocodingFallbackBlockReason() {
 
 async function requestGoogleGeocodingFallbackValidation(address, openRouteValidation) {
     const baseReason = normalizeText(openRouteValidation?.reason) || "OpenRouteService no encontro esta direccion.";
-    const blockReason = await getGoogleGeocodingFallbackBlockReason();
-    if (blockReason) {
-        return {
-            ...openRouteValidation,
-            reason: `${baseReason} ${blockReason}`
-        };
+    let lastReason = "";
+    let attempts = 0;
+
+    for (const query of buildGoogleGeocodeQueries(address)) {
+        const blockReason = await getGoogleGeocodingFallbackBlockReason();
+        if (blockReason) {
+            return {
+                ...openRouteValidation,
+                reason: `${baseReason} ${blockReason}`
+            };
+        }
+
+        attempts += 1;
+        try {
+            const validation = await requestSingleGoogleAddressValidation(query, GOOGLE_GEOCODING_API_KEY);
+            const success = validation.status !== "not_found" && hasValidationCoordinates(validation);
+            await recordGoogleGeocodingFallbackUsage(query, success);
+            lastReason = validation.reason || lastReason;
+            if (success) {
+                return {
+                    ...validation,
+                    provider: "google_geocoding_fallback",
+                    reason: validation.status === "valid"
+                        ? "Ubicacion resuelta con Google Geocoding como respaldo."
+                        : `Ubicacion aproximada resuelta con Google Geocoding como respaldo: ${validation.reason}`,
+                    geocodingQuery: query
+                };
+            }
+        } catch (error) {
+            await recordGoogleGeocodingFallbackUsage(query, false);
+            lastReason = normalizeText(error.message || error);
+        }
     }
 
-    try {
-        const validation = await requestGoogleAddressValidation(address, GOOGLE_GEOCODING_API_KEY);
-        await recordGoogleGeocodingFallbackUsage(address, validation.status !== "not_found");
-        return {
-            ...validation,
-            provider: "google_geocoding_fallback",
-            reason: validation.reason || "Ubicacion resuelta con Google Geocoding como respaldo."
-        };
-    } catch (error) {
-        await recordGoogleGeocodingFallbackUsage(address, false);
-        return {
-            ...openRouteValidation,
-            reason: `${baseReason} Google Geocoding fallback fallo: ${normalizeText(error.message || error)}`
-        };
-    }
+    return {
+        ...openRouteValidation,
+        reason: `${baseReason} Google Geocoding tampoco encontro coordenadas despues de ${attempts} variante(s). ${lastReason}`.trim()
+    };
 }
 
 async function requestAddressValidation(address) {
@@ -1107,7 +1230,8 @@ function getGoogleGeocodingFallbackConfig() {
         configured: Boolean(GOOGLE_GEOCODING_API_KEY),
         dailyLimit: GOOGLE_GEOCODING_DAILY_LIMIT,
         monthlyLimit: GOOGLE_GEOCODING_MONTHLY_LIMIT,
-        cacheDays: GOOGLE_GEOCODING_CACHE_DAYS
+        cacheDays: GOOGLE_GEOCODING_CACHE_DAYS,
+        maxVariants: GOOGLE_GEOCODING_MAX_VARIANTS
     };
 }
 

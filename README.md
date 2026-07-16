@@ -19,6 +19,7 @@ Copia `.env.example` a `.env` y completa:
 - `GOOGLE_GEOCODING_DAILY_LIMIT`: límite diario interno de llamadas fallback (recomendado `250`).
 - `GOOGLE_GEOCODING_MONTHLY_LIMIT`: límite mensual interno de llamadas fallback (recomendado `9000`).
 - `GOOGLE_GEOCODING_CACHE_DAYS`: días que se reutilizan coordenadas resueltas por Google (recomendado `30`).
+- `GOOGLE_GEOCODING_MAX_VARIANTS`: cantidad máxima de versiones limpias que se prueban por dirección cuando ORS falla (recomendado `5`).
 
 ## 2) Ejecutar local
 
@@ -127,6 +128,7 @@ GOOGLE_GEOCODING_API_KEY=CAMBIAR_API_KEY_GEOCODING
 GOOGLE_GEOCODING_DAILY_LIMIT=250
 GOOGLE_GEOCODING_MONTHLY_LIMIT=9000
 GOOGLE_GEOCODING_CACHE_DAYS=30
+GOOGLE_GEOCODING_MAX_VARIANTS=5
 ```
 
 El usuario PostgreSQL debe estar asignado a `admin01_neondbfinal` y SPanel debe permitir conexiones desde los rangos IP de salida del servicio Render.

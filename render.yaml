@@ -33,3 +33,5 @@ services:
         value: "9000"
       - key: GOOGLE_GEOCODING_CACHE_DAYS
         value: "30"
+      - key: GOOGLE_GEOCODING_MAX_VARIANTS
+        value: "5"
