@@ -1488,6 +1488,94 @@ async function ensureProductosSoftDelete() {
   `).catch(() => {});
 }
 
+async function ensureProductosAuditTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS productos_audit (
+      id_audit BIGSERIAL PRIMARY KEY,
+      operation TEXT NOT NULL,
+      changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      db_user TEXT NOT NULL DEFAULT CURRENT_USER,
+      app_name TEXT NOT NULL DEFAULT CURRENT_SETTING('application_name', TRUE),
+      client_addr TEXT,
+      old_row JSONB,
+      new_row JSONB
+    )
+  `);
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION productos_audit_trigger_fn()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      INSERT INTO productos_audit (
+        operation,
+        db_user,
+        app_name,
+        client_addr,
+        old_row,
+        new_row
+      )
+      VALUES (
+        TG_OP,
+        CURRENT_USER,
+        CURRENT_SETTING('application_name', TRUE),
+        INET_CLIENT_ADDR()::TEXT,
+        CASE WHEN TG_OP IN ('UPDATE', 'DELETE') THEN TO_JSONB(OLD) ELSE NULL END,
+        CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN TO_JSONB(NEW) ELSE NULL END
+      );
+
+      IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trg_productos_audit'
+      ) THEN
+        CREATE TRIGGER trg_productos_audit
+        AFTER INSERT OR UPDATE OR DELETE ON productos
+        FOR EACH ROW
+        EXECUTE FUNCTION productos_audit_trigger_fn();
+      END IF;
+    END $$;
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_productos_audit_changed_at
+    ON productos_audit (changed_at DESC)
+  `);
+}
+
+async function ensureEmpaquetadosDetalleSnapshotColumns() {
+  await pool.query(`
+    ALTER TABLE empaquetados_detalle
+    ADD COLUMN IF NOT EXISTS codigo_producto VARCHAR(30)
+  `);
+  await pool.query(`
+    ALTER TABLE empaquetados_detalle
+    ADD COLUMN IF NOT EXISTS producto TEXT
+  `);
+  await pool.query(`
+    UPDATE empaquetados_detalle ed
+       SET codigo_producto = COALESCE(NULLIF(TRIM(ed.codigo_producto), ''), UPPER(TRIM(p.codigo_producto))),
+           producto = COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion)
+      FROM productos p
+     WHERE p.id_producto = ed.id_producto
+       AND (
+         TRIM(COALESCE(ed.codigo_producto, '')) = ''
+         OR TRIM(COALESCE(ed.producto, '')) = ''
+       )
+  `).catch(() => {});
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_codigo_producto
+    ON empaquetados_detalle (codigo_producto)
+  `).catch(() => {});
+}
+
 async function ensureHistoricoResultadosTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS historico_resultados_consolidado (
@@ -3268,8 +3356,8 @@ async function getAlmacen09StockActualRows(db, options = {}) {
      ),
      stock_validado AS (
        SELECT
-         UPPER(TRIM(p.codigo_producto)) AS codigo_producto,
-         p.descripcion AS producto,
+         UPPER(TRIM(COALESCE(NULLIF(ed.codigo_producto, ''), p.codigo_producto))) AS codigo_producto,
+         COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS producto,
          UPPER(TRIM(ed.numero_lote)) AS numero_lote,
          DATE(ec.fecha_hora) AS fecha_empaquetado,
          SUM(ed.cantidad)::int AS cantidad
@@ -3294,7 +3382,11 @@ async function getAlmacen09StockActualRows(db, options = {}) {
        WHERE ${stockDateWhere}
          AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
          AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-       GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
+       GROUP BY
+         UPPER(TRIM(COALESCE(NULLIF(ed.codigo_producto, ''), p.codigo_producto))),
+         COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion),
+         UPPER(TRIM(ed.numero_lote)),
+         DATE(ec.fecha_hora)
      ),
      salidas AS (
        SELECT
@@ -3912,7 +4004,7 @@ app.post('/productos', async (req, res) => {
     const cleanSobrePiso = Number.isFinite(Number(sobre_piso)) ? Number(sobre_piso) : 0;
 
     const existing = await pool.query(
-      `SELECT id_producto
+      `SELECT id_producto, codigo_producto, descripcion, COALESCE(activo, TRUE) AS activo
          FROM productos
         WHERE UPPER(TRIM(codigo_producto)) = $1
         ORDER BY
@@ -3925,38 +4017,22 @@ app.post('/productos', async (req, res) => {
       [cleanCodigo]
     );
 
-    const result = existing.rowCount
-      ? await pool.query(
-          `UPDATE productos
-              SET codigo_producto = $1,
-                  codigo_barras = $1,
-                  descripcion = $2,
-                  unidad_primaria = $3,
-                  paquetes = $4,
-                  sobre_piso = $5,
-                  activo = TRUE
-            WHERE UPPER(TRIM(codigo_producto)) = $1
-            RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
-          [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso]
-        )
-      : await pool.query(
-          `INSERT INTO productos (codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, cestas, sobre_piso, activo)
-           VALUES ($1, $1, $2, $3, $4, 0, $5, TRUE)
-           RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
-          [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso]
-        );
-    const selectedProduct = result.rows.find((row) => Number(row.id_producto) === Number(existing.rows?.[0]?.id_producto)) || result.rows[0];
-    const barcodeResult = selectedProduct
-      ? await pool.query(
-          `SELECT id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso
-             FROM productos
-            WHERE id_producto = $1
-            ORDER BY id_producto
-            LIMIT 1`,
-          [selectedProduct.id_producto]
-        )
-      : { rows: [] };
-    res.status(201).json({ ok: true, product: barcodeResult.rows[0] || result.rows[0] });
+    if (existing.rowCount) {
+      const product = existing.rows[0];
+      return res.status(409).json({
+        ok: false,
+        error: `El codigo ${cleanCodigo} ya existe para: ${product.descripcion}. Usa otro codigo para crear un producto nuevo.`,
+        product
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO productos (codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, cestas, sobre_piso, activo)
+       VALUES ($1, $1, $2, $3, $4, 0, $5, TRUE)
+       RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
+      [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso]
+    );
+    res.status(201).json({ ok: true, product: result.rows[0] });
   } catch (error) {
     if (error.code === '23505') {
       return res.status(409).json({ ok: false, error: 'Código de producto ya existe' });
@@ -4120,10 +4196,27 @@ app.post('/api/empaquetados', async (req, res) => {
       if (!item.id_producto || !item.cantidad || !item.numero_lote) {
         throw new Error('Cada item requiere id_producto, cantidad y numero_lote');
       }
+      const productSnapshot = await client.query(
+        `SELECT UPPER(TRIM(codigo_producto)) AS codigo_producto, descripcion
+           FROM productos
+          WHERE id_producto = $1
+          LIMIT 1`,
+        [Number(item.id_producto)]
+      );
+      if (!productSnapshot.rowCount) {
+        throw new Error(`Producto invalido: ${item.id_producto}`);
+      }
       await client.query(
-        `INSERT INTO empaquetados_detalle (id_cabecera, id_producto, cantidad, numero_lote)
-         VALUES ($1, $2, $3, $4)`,
-        [idCabecera, Number(item.id_producto), Number(item.cantidad), String(item.numero_lote).trim().toUpperCase()]
+        `INSERT INTO empaquetados_detalle (id_cabecera, id_producto, codigo_producto, producto, cantidad, numero_lote)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          idCabecera,
+          Number(item.id_producto),
+          productSnapshot.rows[0].codigo_producto,
+          productSnapshot.rows[0].descripcion,
+          Number(item.cantidad),
+          String(item.numero_lote).trim().toUpperCase()
+        ]
       );
     }
 
@@ -4818,8 +4911,8 @@ app.get('/api/registros', async (req, res) => {
                 THEN TO_CHAR(${almacenTsVzExpr}, 'DD/MM/YYYY HH24:MI')
               ELSE NULL
             END AS "Fecha Almacen09",
-            p.codigo_producto AS "CODIGO PRODUCTO",
-            p.descripcion AS "PRODUCTO",
+            COALESCE(NULLIF(TRIM(ed.codigo_producto), ''), p.codigo_producto) AS "CODIGO PRODUCTO",
+            COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS "PRODUCTO",
             ed.cantidad AS "CANTIDAD",
             d.nombre AS "ENTREGADO A",
             ec.numero_registro AS "NUMERO REGISTRO",
@@ -4986,7 +5079,11 @@ app.get('/api/registros', async (req, res) => {
              STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
-             STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
+             STRING_AGG(
+               DISTINCT COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion),
+               ' | '
+               ORDER BY COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion)
+             ) AS productos
            FROM (
              SELECT DISTINCT ON (id_detalle) *
              FROM empaquetados_detalle
@@ -5099,7 +5196,7 @@ app.get('/api/registros', async (req, res) => {
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
              ed.numero_lote AS "NUMERO DE LOTE",
-             p.descripcion AS "PRODUCTO",
+             COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS "PRODUCTO",
              ed.cantidad AS "CANTIDAD EMPAQUETADO",
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
              NULL::int AS "CANTIDAD ALMACEN",
@@ -5130,7 +5227,11 @@ app.get('/api/registros', async (req, res) => {
              STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
-             STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
+             STRING_AGG(
+               DISTINCT COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion),
+               ' | '
+               ORDER BY COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion)
+             ) AS productos
            FROM (
              SELECT DISTINCT ON (id_detalle) *
              FROM empaquetados_detalle
@@ -5229,7 +5330,7 @@ app.get('/api/registros', async (req, res) => {
         ed.id_detalle AS "__ROW_ID",
         TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
         TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
-        p.descripcion AS "PRODUCTO",
+        COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS "PRODUCTO",
         ed.cantidad AS "CANTIDAD",
         d.nombre AS "ENTREGADO A",
         ec.numero_registro AS "NUMERO REGISTRO",
@@ -7497,6 +7598,8 @@ async function startServer() {
     ['ensureIdempotencyRequestsTable', ensureIdempotencyRequestsTable],
     ['ensureCambiosProductosTables', ensureCambiosProductosTables],
     ['ensureProductosSoftDelete', ensureProductosSoftDelete],
+    ['ensureProductosAuditTable', ensureProductosAuditTable],
+    ['ensureEmpaquetadosDetalleSnapshotColumns', ensureEmpaquetadosDetalleSnapshotColumns],
     ['ensureHistoricoResultadosTable', ensureHistoricoResultadosTable],
     ['ensureControlInventarioTable', ensureControlInventarioTable],
     ['ensureMermaTables', ensureMermaTables],
