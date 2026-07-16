@@ -23,3 +23,13 @@ services:
         value: openrouteservice
       - key: OPENROUTESERVICE_API_KEY
         sync: false
+      - key: GOOGLE_GEOCODING_FALLBACK_ENABLED
+        value: "false"
+      - key: GOOGLE_GEOCODING_API_KEY
+        sync: false
+      - key: GOOGLE_GEOCODING_DAILY_LIMIT
+        value: "250"
+      - key: GOOGLE_GEOCODING_MONTHLY_LIMIT
+        value: "9000"
+      - key: GOOGLE_GEOCODING_CACHE_DAYS
+        value: "30"

@@ -12,12 +12,24 @@ function cleanEnvValue(value) {
     return cleaned;
 }
 
+function parsePositiveIntEnv(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback;
+}
+
 const GOOGLE_MAPS_API_KEY = cleanEnvValue(process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "");
 const GOOGLE_MAPS_BROWSER_API_KEY = cleanEnvValue(process.env.GOOGLE_MAPS_BROWSER_API_KEY || "");
+const GOOGLE_GEOCODING_API_KEY = cleanEnvValue(process.env.GOOGLE_GEOCODING_API_KEY || process.env.GOOGLE_GEOCODING_FALLBACK_API_KEY || "");
 const OPENROUTESERVICE_API_KEY = cleanEnvValue(process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY || "");
 const ROUTING_PROVIDER = cleanEnvValue(
     process.env.ROUTING_PROVIDER || (OPENROUTESERVICE_API_KEY ? "openrouteservice" : "google")
 ).toLowerCase();
+const GOOGLE_GEOCODING_FALLBACK_ENABLED = ["1", "true", "yes", "si", "sí"].includes(
+    normalizeHeader(process.env.GOOGLE_GEOCODING_FALLBACK_ENABLED || "")
+);
+const GOOGLE_GEOCODING_DAILY_LIMIT = parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_DAILY_LIMIT || 250, 250);
+const GOOGLE_GEOCODING_MONTHLY_LIMIT = parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_MONTHLY_LIMIT || 9000, 9000);
+const GOOGLE_GEOCODING_CACHE_DAYS = Math.max(1, parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_CACHE_DAYS || 30, 30));
 const DISTRIBUTION_ORIGIN_NAME = process.env.DISTRIBUTION_ORIGIN_NAME || "PDT Bello Campo";
 const DISTRIBUTION_ORIGIN = process.env.DISTRIBUTION_ORIGIN || "Edificio Onnis, Avenida Francisco de Miranda, & Avenida Coromoto, Caracas 1060, Miranda, Venezuela";
 const DATABASE_URL = cleanEnvValue(process.env.DATABASE_URL || "");
@@ -265,6 +277,19 @@ async function ensureDatabaseReady() {
         ALTER TABLE address_validations
         ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION
     `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS routing_geocoding_usage (
+            id BIGSERIAL PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT '',
+            address TEXT NOT NULL DEFAULT '',
+            success BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_routing_geocoding_usage_provider_created
+        ON routing_geocoding_usage (provider, created_at)
+    `);
 }
 
 async function getSourceColumns() {
@@ -510,11 +535,28 @@ function hasValidationCoordinates(validation) {
     return Number.isFinite(lat) && Number.isFinite(lng);
 }
 
+function isGoogleGeocodingFallbackProvider(provider) {
+    return normalizeHeader(provider).replace(/-/g, "_") === "google_geocoding_fallback";
+}
+
+function isValidationFresh(validation, maxAgeDays) {
+    const checkedAt = new Date(validation?.checked_at || 0).getTime();
+    if (!Number.isFinite(checkedAt) || checkedAt <= 0) return false;
+    const maxAgeMs = Math.max(1, Number(maxAgeDays || 1)) * 24 * 60 * 60 * 1000;
+    return Date.now() - checkedAt <= maxAgeMs;
+}
+
 function validationMatchesRoutingProvider(validation) {
     if (!validation) return false;
     if (normalizeText(validation.address) === "") return false;
     if (getRoutingProvider() !== "openrouteservice") return true;
-    return normalizeText(validation.provider) === "openrouteservice" && hasValidationCoordinates(validation);
+    const provider = normalizeText(validation.provider);
+    if (provider === "openrouteservice") return hasValidationCoordinates(validation);
+    if (isGoogleGeocodingFallbackProvider(provider)) {
+        const fresh = isValidationFresh(validation, GOOGLE_GEOCODING_CACHE_DAYS);
+        return fresh && (hasValidationCoordinates(validation) || normalizeText(validation.status) === "not_found");
+    }
+    return false;
 }
 
 async function routeStats(auth = null) {
@@ -626,11 +668,14 @@ async function saveDeliveryStatus(key, delivered, deliveredBaskets, partial, par
 function classifyGeocodingResult(payload) {
     if (payload?.status === "ZERO_RESULTS") {
         return {
+            provider: "google",
             status: "not_found",
             reason: "Google Maps no encontro esta direccion.",
             formattedAddress: "",
             locationType: "",
-            partialMatch: false
+            partialMatch: false,
+            latitude: null,
+            longitude: null
         };
     }
     if (payload?.status !== "OK") {
@@ -638,50 +683,77 @@ function classifyGeocodingResult(payload) {
     }
     if (!Array.isArray(payload.results) || !payload.results.length) {
         return {
+            provider: "google",
             status: "not_found",
             reason: "Google Maps no encontro esta direccion.",
             formattedAddress: "",
             locationType: "",
-            partialMatch: false
+            partialMatch: false,
+            latitude: null,
+            longitude: null
         };
     }
 
     const result = payload.results[0] || {};
     const locationType = normalizeText(result.geometry?.location_type);
+    const latitude = Number(result.geometry?.location?.lat);
+    const longitude = Number(result.geometry?.location?.lng);
+    const hasCoordinates = Number.isFinite(latitude) && Number.isFinite(longitude);
+    if (!hasCoordinates) {
+        return {
+            provider: "google",
+            status: "not_found",
+            reason: "Google Maps encontro la direccion, pero no devolvio coordenadas validas.",
+            formattedAddress: normalizeText(result.formatted_address),
+            locationType,
+            partialMatch: false,
+            latitude: null,
+            longitude: null
+        };
+    }
     if (result.partial_match === true) {
         return {
+            provider: "google",
             status: "partial_match",
             reason: "Google Maps solo encontro una coincidencia parcial. Revisa calle, edificio y ciudad.",
             formattedAddress: normalizeText(result.formatted_address),
             locationType,
-            partialMatch: true
+            partialMatch: true,
+            latitude,
+            longitude
         };
     }
     if (["APPROXIMATE", "GEOMETRIC_CENTER"].includes(locationType)) {
         return {
+            provider: "google",
             status: "low_precision",
             reason: "Google Maps ubico una zona aproximada, no un pin suficientemente preciso.",
             formattedAddress: normalizeText(result.formatted_address),
             locationType,
-            partialMatch: false
+            partialMatch: false,
+            latitude,
+            longitude
         };
     }
     return {
+        provider: "google",
         status: "valid",
         reason: "",
         formattedAddress: normalizeText(result.formatted_address),
         locationType,
-        partialMatch: false
+        partialMatch: false,
+        latitude,
+        longitude
     };
 }
 
-async function requestGoogleAddressValidation(address) {
-    if (!GOOGLE_MAPS_API_KEY) {
-        throw new Error("Falta GOOGLE_MAPS_SERVER_API_KEY o GOOGLE_MAPS_API_KEY para validar direcciones.");
+async function requestGoogleAddressValidation(address, apiKey = GOOGLE_MAPS_API_KEY) {
+    if (!apiKey) {
+        throw new Error("Falta una API key de Google Geocoding para validar direcciones.");
     }
     const params = new URLSearchParams({
         address: normalizeText(address),
-        key: GOOGLE_MAPS_API_KEY,
+        key: apiKey,
         language: "es",
         region: "ve"
     });
@@ -826,14 +898,88 @@ async function requestOpenRouteAddressValidation(address) {
     };
 }
 
+async function getGoogleGeocodingFallbackUsage() {
+    const result = await pool.query(`
+        SELECT
+            COUNT(*) FILTER (WHERE created_at >= date_trunc('day', NOW()))::int AS daily,
+            COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW()))::int AS monthly
+        FROM routing_geocoding_usage
+        WHERE provider = 'google_geocoding_fallback'
+    `);
+    const row = result.rows[0] || {};
+    return {
+        daily: Number(row.daily || 0),
+        monthly: Number(row.monthly || 0)
+    };
+}
+
+async function recordGoogleGeocodingFallbackUsage(address, success) {
+    try {
+        await pool.query(
+            `INSERT INTO routing_geocoding_usage (provider, address, success)
+             VALUES ('google_geocoding_fallback', $1, $2::boolean)`,
+            [normalizeText(address), Boolean(success)]
+        );
+    } catch (error) {
+        console.error("No se pudo registrar uso de Google Geocoding fallback:", error.message || error);
+    }
+}
+
+async function getGoogleGeocodingFallbackBlockReason() {
+    if (!GOOGLE_GEOCODING_FALLBACK_ENABLED) return "Fallback Google Geocoding desactivado.";
+    if (!GOOGLE_GEOCODING_API_KEY) return "Falta GOOGLE_GEOCODING_API_KEY para usar Google como respaldo.";
+    if (GOOGLE_GEOCODING_DAILY_LIMIT <= 0 || GOOGLE_GEOCODING_MONTHLY_LIMIT <= 0) {
+        return "Los limites de Google Geocoding fallback estan en 0.";
+    }
+    const usage = await getGoogleGeocodingFallbackUsage();
+    if (usage.daily >= GOOGLE_GEOCODING_DAILY_LIMIT) {
+        return `Limite diario de Google Geocoding alcanzado (${usage.daily}/${GOOGLE_GEOCODING_DAILY_LIMIT}).`;
+    }
+    if (usage.monthly >= GOOGLE_GEOCODING_MONTHLY_LIMIT) {
+        return `Limite mensual de Google Geocoding alcanzado (${usage.monthly}/${GOOGLE_GEOCODING_MONTHLY_LIMIT}).`;
+    }
+    return "";
+}
+
+async function requestGoogleGeocodingFallbackValidation(address, openRouteValidation) {
+    const baseReason = normalizeText(openRouteValidation?.reason) || "OpenRouteService no encontro esta direccion.";
+    const blockReason = await getGoogleGeocodingFallbackBlockReason();
+    if (blockReason) {
+        return {
+            ...openRouteValidation,
+            reason: `${baseReason} ${blockReason}`
+        };
+    }
+
+    try {
+        const validation = await requestGoogleAddressValidation(address, GOOGLE_GEOCODING_API_KEY);
+        await recordGoogleGeocodingFallbackUsage(address, validation.status !== "not_found");
+        return {
+            ...validation,
+            provider: "google_geocoding_fallback",
+            reason: validation.reason || "Ubicacion resuelta con Google Geocoding como respaldo."
+        };
+    } catch (error) {
+        await recordGoogleGeocodingFallbackUsage(address, false);
+        return {
+            ...openRouteValidation,
+            reason: `${baseReason} Google Geocoding fallback fallo: ${normalizeText(error.message || error)}`
+        };
+    }
+}
+
 async function requestAddressValidation(address) {
-    if (getRoutingProvider() === "openrouteservice") return requestOpenRouteAddressValidation(address);
+    if (getRoutingProvider() === "openrouteservice") {
+        const validation = await requestOpenRouteAddressValidation(address);
+        if (validation.status !== "not_found" && hasValidationCoordinates(validation)) return validation;
+        return requestGoogleGeocodingFallbackValidation(address, validation);
+    }
     const validation = await requestGoogleAddressValidation(address);
     return {
         ...validation,
         provider: "google",
-        latitude: null,
-        longitude: null
+        latitude: validation.latitude,
+        longitude: validation.longitude
     };
 }
 
@@ -946,12 +1092,23 @@ function hasRoutingConfig() {
 function getRoutingConfigMissing() {
     if (getRoutingProvider() === "openrouteservice") {
         return [
-            !OPENROUTESERVICE_API_KEY ? "OPENROUTESERVICE_API_KEY" : ""
+            !OPENROUTESERVICE_API_KEY ? "OPENROUTESERVICE_API_KEY" : "",
+            GOOGLE_GEOCODING_FALLBACK_ENABLED && !GOOGLE_GEOCODING_API_KEY ? "GOOGLE_GEOCODING_API_KEY" : ""
         ].filter(Boolean);
     }
     return [
         !GOOGLE_MAPS_API_KEY ? "GOOGLE_MAPS_SERVER_API_KEY" : ""
     ].filter(Boolean);
+}
+
+function getGoogleGeocodingFallbackConfig() {
+    return {
+        enabled: GOOGLE_GEOCODING_FALLBACK_ENABLED,
+        configured: Boolean(GOOGLE_GEOCODING_API_KEY),
+        dailyLimit: GOOGLE_GEOCODING_DAILY_LIMIT,
+        monthlyLimit: GOOGLE_GEOCODING_MONTHLY_LIMIT,
+        cacheDays: GOOGLE_GEOCODING_CACHE_DAYS
+    };
 }
 
 const GOOGLE_MAPS_DELIVERIES_PER_SEGMENT = 10;
@@ -1094,7 +1251,7 @@ async function openRouteServiceRequest(path, body) {
 }
 
 async function resolveOpenRouteAddressCoordinate(address) {
-    const validation = await requestOpenRouteAddressValidation(address);
+    const validation = await requestAddressValidation(address);
     if (validation.status === "not_found" || !Number.isFinite(Number(validation.latitude)) || !Number.isFinite(Number(validation.longitude))) {
         throw new Error(`OpenRouteService no pudo ubicar esta direccion: ${normalizeText(address)}`);
     }
@@ -1647,7 +1804,8 @@ app.get("/api/health", async (_, res) => {
             source: SOURCE_TABLE,
             routingProvider: getRoutingProvider(),
             routingReady: hasRoutingConfig(),
-            googleMapsReady: hasGoogleMapsConfig()
+            googleMapsReady: hasGoogleMapsConfig(),
+            googleGeocodingFallback: getGoogleGeocodingFallbackConfig()
         });
     } catch (error) {
         res.status(500).json({ ok: false, error: String(error.message || error) });
@@ -1665,8 +1823,14 @@ app.get("/api/maps-config", (_, res) => {
         origin: DISTRIBUTION_ORIGIN,
         originName: DISTRIBUTION_ORIGIN_NAME,
         requiredApis: provider === "openrouteservice"
-            ? ["OpenRouteService Directions", "OpenRouteService Matrix", "OpenRouteService Geocode"]
+            ? [
+                "OpenRouteService Directions",
+                "OpenRouteService Matrix",
+                "OpenRouteService Geocode",
+                ...(GOOGLE_GEOCODING_FALLBACK_ENABLED ? ["Google Geocoding API fallback"] : [])
+            ]
             : ["Routes API", "Geocoding API"],
+        googleGeocodingFallback: getGoogleGeocodingFallbackConfig(),
         missing: getRoutingConfigMissing()
     });
 });

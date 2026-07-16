@@ -14,6 +14,11 @@ Copia `.env.example` a `.env` y completa:
 - `CORS_ORIGIN`: dominios permitidos separados por coma o `*`.
 - `ROUTING_PROVIDER`: usa `openrouteservice` para el módulo de Rutas sin Google Routes API.
 - `OPENROUTESERVICE_API_KEY`: clave de OpenRouteService para geocoding, matriz y direcciones.
+- `GOOGLE_GEOCODING_FALLBACK_ENABLED`: `true` activa Google Geocoding solo como respaldo cuando OpenRouteService no ubica una dirección.
+- `GOOGLE_GEOCODING_API_KEY`: clave restringida a Geocoding API. No debe exponerse en frontend.
+- `GOOGLE_GEOCODING_DAILY_LIMIT`: límite diario interno de llamadas fallback (recomendado `250`).
+- `GOOGLE_GEOCODING_MONTHLY_LIMIT`: límite mensual interno de llamadas fallback (recomendado `9000`).
+- `GOOGLE_GEOCODING_CACHE_DAYS`: días que se reutilizan coordenadas resueltas por Google (recomendado `30`).
 
 ## 2) Ejecutar local
 
@@ -117,6 +122,11 @@ ADMIN_KEY=CAMBIAR_CLAVE_ADMIN
 CORS_ORIGIN=https://prueba-empaquetad-ofrontend-theta.vercel.app
 ROUTING_PROVIDER=openrouteservice
 OPENROUTESERVICE_API_KEY=CAMBIAR_API_KEY
+GOOGLE_GEOCODING_FALLBACK_ENABLED=true
+GOOGLE_GEOCODING_API_KEY=CAMBIAR_API_KEY_GEOCODING
+GOOGLE_GEOCODING_DAILY_LIMIT=250
+GOOGLE_GEOCODING_MONTHLY_LIMIT=9000
+GOOGLE_GEOCODING_CACHE_DAYS=30
 ```
 
 El usuario PostgreSQL debe estar asignado a `admin01_neondbfinal` y SPanel debe permitir conexiones desde los rangos IP de salida del servicio Render.

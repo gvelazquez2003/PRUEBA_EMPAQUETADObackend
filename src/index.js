@@ -50,6 +50,7 @@ const MERMA_MOTIVOS = [
   'Burbuja/Mancha en la Corona',
   'Alveolado/Cavidad',
   'Crudo',
+  'QUEMADO',
   'Color',
   'Fermentado',
   'Pan Pequeno',
