@@ -2710,6 +2710,14 @@ async function upsertClienteSucursalMeta(client, payload) {
 async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_activo_codigo ON productos(activo, codigo_producto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_codigo_upper ON productos(UPPER(TRIM(codigo_producto)))');
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_producto_unique
+    ON productos (codigo_producto)`).catch((error) => {
+      console.warn('[startup] No se pudo crear indice unico de productos.codigo_producto:', error.message);
+    });
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_upper_unique
+    ON productos (UPPER(TRIM(codigo_producto)))`).catch((error) => {
+      console.warn('[startup] No se pudo crear indice unico normalizado de productos.codigo_producto:', error.message);
+    });
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_barras_unique
     ON productos (UPPER(TRIM(codigo_barras)))
     WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => {});
@@ -3770,9 +3778,17 @@ app.get('/productos', async (req, res) => {
         paquetes AS paquetes_por_cesta,
         sobre_piso
       FROM (
-        SELECT DISTINCT ON (id_producto) *
+        SELECT DISTINCT ON (UPPER(TRIM(codigo_producto))) *
         FROM productos
-        ORDER BY id_producto
+        WHERE TRIM(COALESCE(codigo_producto, '')) <> ''
+        ORDER BY
+          UPPER(TRIM(codigo_producto)),
+          COALESCE(activo, TRUE) DESC,
+          COALESCE(cestas, 0) DESC,
+          COALESCE(sobre_piso, 0) DESC,
+          COALESCE(paquetes, 0) DESC,
+          id_producto ASC,
+          ctid ASC
       ) productos_unicos
       ${whereSql}
       ORDER BY codigo_producto ASC
@@ -3792,9 +3808,17 @@ app.get('/productos', async (req, res) => {
       const countResult = await pool.query(
         `SELECT COUNT(*)::INT AS total
          FROM (
-           SELECT DISTINCT ON (id_producto) *
+           SELECT DISTINCT ON (UPPER(TRIM(codigo_producto))) *
            FROM productos
-           ORDER BY id_producto
+           WHERE TRIM(COALESCE(codigo_producto, '')) <> ''
+           ORDER BY
+             UPPER(TRIM(codigo_producto)),
+             COALESCE(activo, TRUE) DESC,
+             COALESCE(cestas, 0) DESC,
+             COALESCE(sobre_piso, 0) DESC,
+             COALESCE(paquetes, 0) DESC,
+             id_producto ASC,
+             ctid ASC
          ) productos_unicos
          ${whereSql}`,
         params
@@ -3831,9 +3855,17 @@ app.get('/api/control-inventario/producto-barcode', async (req, res) => {
          descripcion,
          codigo_barras
        FROM (
-         SELECT DISTINCT ON (id_producto) *
+         SELECT DISTINCT ON (UPPER(TRIM(codigo_producto))) *
          FROM productos
-         ORDER BY id_producto
+         WHERE TRIM(COALESCE(codigo_producto, '')) <> ''
+         ORDER BY
+           UPPER(TRIM(codigo_producto)),
+           COALESCE(activo, TRUE) DESC,
+           COALESCE(cestas, 0) DESC,
+           COALESCE(sobre_piso, 0) DESC,
+           COALESCE(paquetes, 0) DESC,
+           id_producto ASC,
+           ctid ASC
        ) productos_unicos
        WHERE COALESCE(activo, TRUE) = TRUE
          AND (
@@ -3883,7 +3915,12 @@ app.post('/productos', async (req, res) => {
       `SELECT id_producto
          FROM productos
         WHERE UPPER(TRIM(codigo_producto)) = $1
-        ORDER BY id_producto
+        ORDER BY
+          COALESCE(activo, TRUE) DESC,
+          COALESCE(cestas, 0) DESC,
+          COALESCE(sobre_piso, 0) DESC,
+          COALESCE(paquetes, 0) DESC,
+          id_producto ASC
         LIMIT 1`,
       [cleanCodigo]
     );
@@ -3892,28 +3929,33 @@ app.post('/productos', async (req, res) => {
       ? await pool.query(
           `UPDATE productos
               SET codigo_producto = $1,
+                  codigo_barras = $1,
                   descripcion = $2,
                   unidad_primaria = $3,
                   paquetes = $4,
                   sobre_piso = $5,
                   activo = TRUE
-            WHERE id_producto = $6
-            RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso`,
-          [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso, existing.rows[0].id_producto]
+            WHERE UPPER(TRIM(codigo_producto)) = $1
+            RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
+          [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso]
         )
       : await pool.query(
-          `INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso, activo)
-           VALUES ($1, $2, $3, $4, $5, TRUE)
-           RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso`,
+          `INSERT INTO productos (codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, cestas, sobre_piso, activo)
+           VALUES ($1, $1, $2, $3, $4, 0, $5, TRUE)
+           RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
           [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso]
         );
-    const barcodeResult = await pool.query(
-      `UPDATE productos
-          SET codigo_barras = UPPER(TRIM(codigo_producto))
-        WHERE id_producto = $1
-        RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
-      [result.rows[0].id_producto]
-    );
+    const selectedProduct = result.rows.find((row) => Number(row.id_producto) === Number(existing.rows?.[0]?.id_producto)) || result.rows[0];
+    const barcodeResult = selectedProduct
+      ? await pool.query(
+          `SELECT id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso
+             FROM productos
+            WHERE id_producto = $1
+            ORDER BY id_producto
+            LIMIT 1`,
+          [selectedProduct.id_producto]
+        )
+      : { rows: [] };
     res.status(201).json({ ok: true, product: barcodeResult.rows[0] || result.rows[0] });
   } catch (error) {
     if (error.code === '23505') {
@@ -3934,7 +3976,11 @@ app.delete('/productos/:codigo', async (req, res) => {
     await client.query('BEGIN');
 
     const productResult = await client.query(
-      'SELECT id_producto, codigo_producto, COALESCE(activo, TRUE) AS activo FROM productos WHERE LOWER(codigo_producto) = LOWER($1) LIMIT 1',
+      `SELECT id_producto, codigo_producto, COALESCE(activo, TRUE) AS activo
+         FROM productos
+        WHERE UPPER(TRIM(codigo_producto)) = UPPER(TRIM($1))
+        ORDER BY COALESCE(activo, TRUE) DESC, id_producto ASC
+        LIMIT 1`,
       [codigo]
     );
     if (!productResult.rowCount) {
@@ -3942,11 +3988,13 @@ app.delete('/productos/:codigo', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Producto no encontrado' });
     }
 
-    const idProducto = productResult.rows[0].id_producto;
     const wasActive = Boolean(productResult.rows[0].activo);
     const updateResult = await client.query(
-      'UPDATE productos SET activo = FALSE WHERE id_producto = $1 RETURNING id_producto, codigo_producto',
-      [idProducto]
+      `UPDATE productos
+          SET activo = FALSE
+        WHERE UPPER(TRIM(codigo_producto)) = UPPER(TRIM($1))
+        RETURNING id_producto, codigo_producto`,
+      [codigo]
     );
 
     await client.query('COMMIT');
@@ -3995,52 +4043,16 @@ app.post('/productos/purge-catalog', async (req, res) => {
       [keepCodes]
     );
 
-    const candidates = await client.query(
-      `SELECT
-         p.id_producto,
-         p.codigo_producto,
-         EXISTS(SELECT 1 FROM empaquetados_detalle ed WHERE ed.id_producto = p.id_producto) AS used_empaquetados,
-         EXISTS(SELECT 1 FROM control_inventario_guardia cg WHERE cg.id_producto = p.id_producto) AS used_control,
-         EXISTS(SELECT 1 FROM almacen09_salidas_detalle sd WHERE sd.id_producto = p.id_producto) AS used_salidas
-       FROM productos p
-       WHERE UPPER(TRIM(p.codigo_producto)) <> ALL($1::text[])
-       ORDER BY p.codigo_producto ASC`,
+    const archived = await client.query(
+      `UPDATE productos
+          SET activo = FALSE
+        WHERE UPPER(TRIM(codigo_producto)) <> ALL($1::text[])
+          AND COALESCE(activo, TRUE) = TRUE`,
       [keepCodes]
     );
-
-    const deletableIds = [];
+    const deletedCount = 0;
+    const archivedCount = Number(archived.rowCount || 0);
     const blockedRows = [];
-
-    for (const row of candidates.rows) {
-      const hasRefs = Boolean(row.used_empaquetados) || Boolean(row.used_control) || Boolean(row.used_salidas);
-      if (hasRefs) {
-        blockedRows.push(row);
-      } else {
-        deletableIds.push(Number(row.id_producto));
-      }
-    }
-
-    let deletedCount = 0;
-    if (deletableIds.length) {
-      const deleted = await client.query(
-        `DELETE FROM productos
-         WHERE id_producto = ANY($1::int[])`,
-        [deletableIds]
-      );
-      deletedCount = Number(deleted.rowCount || 0);
-    }
-
-    let archivedCount = 0;
-    if (blockedRows.length) {
-      const blockedIds = blockedRows.map((row) => Number(row.id_producto));
-      const archived = await client.query(
-        `UPDATE productos
-         SET activo = FALSE
-         WHERE id_producto = ANY($1::int[])`,
-        [blockedIds]
-      );
-      archivedCount = Number(archived.rowCount || 0);
-    }
 
     const finalCountResult = await client.query(
       `SELECT COUNT(*)::int AS total
