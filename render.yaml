@@ -23,6 +23,14 @@ services:
         value: openrouteservice
       - key: OPENROUTESERVICE_API_KEY
         sync: false
+      - key: ROUTING_REFERENCE_LAT
+        value: "10.492"
+      - key: ROUTING_REFERENCE_LNG
+        value: "-66.856"
+      - key: ROUTING_MAX_GEOCODE_DISTANCE_KM
+        value: "250"
+      - key: ORS_ROUTING_SNAP_RADII
+        value: "350,1000,2500,5000"
       - key: GOOGLE_GEOCODING_FALLBACK_ENABLED
         value: "false"
       - key: GOOGLE_GEOCODING_API_KEY

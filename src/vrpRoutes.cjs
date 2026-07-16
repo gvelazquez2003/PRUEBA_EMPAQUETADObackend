@@ -17,6 +17,24 @@ function parsePositiveIntEnv(value, fallback) {
     return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback;
 }
 
+function parsePositiveNumberEnv(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
+}
+
+function parseNumberEnv(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseNumberListEnv(value, fallback) {
+    const parsed = String(value || "")
+        .split(",")
+        .map((item) => Number(item.trim()))
+        .filter((item) => Number.isFinite(item) && item > 0);
+    return parsed.length ? [...new Set(parsed)] : fallback;
+}
+
 const GOOGLE_MAPS_API_KEY = cleanEnvValue(process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "");
 const GOOGLE_MAPS_BROWSER_API_KEY = cleanEnvValue(process.env.GOOGLE_MAPS_BROWSER_API_KEY || "");
 const GOOGLE_GEOCODING_API_KEY = cleanEnvValue(process.env.GOOGLE_GEOCODING_API_KEY || process.env.GOOGLE_GEOCODING_FALLBACK_API_KEY || "");
@@ -31,6 +49,10 @@ const GOOGLE_GEOCODING_DAILY_LIMIT = parsePositiveIntEnv(process.env.GOOGLE_GEOC
 const GOOGLE_GEOCODING_MONTHLY_LIMIT = parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_MONTHLY_LIMIT || 9000, 9000);
 const GOOGLE_GEOCODING_CACHE_DAYS = Math.max(1, parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_CACHE_DAYS || 30, 30));
 const GOOGLE_GEOCODING_MAX_VARIANTS = Math.max(1, Math.min(8, parsePositiveIntEnv(process.env.GOOGLE_GEOCODING_MAX_VARIANTS || 5, 5)));
+const ROUTING_REFERENCE_LAT = parseNumberEnv(process.env.ROUTING_REFERENCE_LAT || 10.492, 10.492);
+const ROUTING_REFERENCE_LNG = parseNumberEnv(process.env.ROUTING_REFERENCE_LNG || -66.856, -66.856);
+const ROUTING_MAX_GEOCODE_DISTANCE_KM = parsePositiveNumberEnv(process.env.ROUTING_MAX_GEOCODE_DISTANCE_KM || 250, 250);
+const ORS_ROUTING_SNAP_RADII = parseNumberListEnv(process.env.ORS_ROUTING_SNAP_RADII || "350,1000,2500,5000", [350, 1000, 2500, 5000]);
 const DISTRIBUTION_ORIGIN_NAME = process.env.DISTRIBUTION_ORIGIN_NAME || "PDT Bello Campo";
 const DISTRIBUTION_ORIGIN = process.env.DISTRIBUTION_ORIGIN || "Edificio Onnis, Avenida Francisco de Miranda, & Avenida Coromoto, Caracas 1060, Miranda, Venezuela";
 const DATABASE_URL = cleanEnvValue(process.env.DATABASE_URL || "");
@@ -87,6 +109,100 @@ function uniqueNormalized(values) {
         result.push(clean);
     }
     return result;
+}
+
+function coordinateDistanceKm(a, b) {
+    const lat1 = Number(a?.lat);
+    const lng1 = Number(a?.lng);
+    const lat2 = Number(b?.lat);
+    const lng2 = Number(b?.lng);
+    if (![lat1, lng1, lat2, lng2].every(Number.isFinite)) return 0;
+    const toRadians = (degrees) => degrees * Math.PI / 180;
+    const radiusKm = 6371;
+    const deltaLat = toRadians(lat2 - lat1);
+    const deltaLng = toRadians(lng2 - lng1);
+    const sinLat = Math.sin(deltaLat / 2);
+    const sinLng = Math.sin(deltaLng / 2);
+    const haversine = sinLat * sinLat
+        + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * sinLng * sinLng;
+    return radiusKm * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
+function coordinateInsideBox(location, box) {
+    const lat = Number(location?.lat);
+    const lng = Number(location?.lng);
+    return Number.isFinite(lat)
+        && Number.isFinite(lng)
+        && lat >= box.minLat
+        && lat <= box.maxLat
+        && lng >= box.minLng
+        && lng <= box.maxLng;
+}
+
+function coordinateBoundsIssue(address, validation, context = {}) {
+    if (!hasValidationCoordinates(validation)) return "";
+    const lat = Number(validation.latitude);
+    const lng = Number(validation.longitude);
+    const location = { lat, lng };
+    const reference = { lat: ROUTING_REFERENCE_LAT, lng: ROUTING_REFERENCE_LNG };
+    const combined = normalizeHeader([
+        address,
+        context.route,
+        context.routeName,
+        context.name,
+        context.clientId
+    ].filter(Boolean).join(" "));
+
+    if (ROUTING_MAX_GEOCODE_DISTANCE_KM > 0) {
+        const distanceKm = coordinateDistanceKm(reference, location);
+        if (distanceKm > ROUTING_MAX_GEOCODE_DISTANCE_KM) {
+            return `La coordenada encontrada (${lat.toFixed(6)}, ${lng.toFixed(6)}) queda a ${Math.round(distanceKm)} km de ${DISTRIBUTION_ORIGIN_NAME}; parece una coincidencia de otra zona.`;
+        }
+    }
+
+    const regionalBounds = [
+        {
+            label: "Chacao / este de Caracas",
+            keys: ["chacao", "altamira", "bello campo", "palos grandes", "la castellana", "ruices", "ruic"],
+            minLat: 10.40,
+            maxLat: 10.56,
+            minLng: -67.05,
+            maxLng: -66.70
+        },
+        {
+            label: "Guarenas",
+            keys: ["guarenas"],
+            minLat: 10.35,
+            maxLat: 10.58,
+            minLng: -66.82,
+            maxLng: -66.42
+        },
+        {
+            label: "Guatire",
+            keys: ["guatire"],
+            minLat: 10.40,
+            maxLat: 10.62,
+            minLng: -66.72,
+            maxLng: -66.32
+        },
+        {
+            label: "Caracas / Miranda",
+            keys: ["caracas", "miranda"],
+            minLat: 9.80,
+            maxLat: 10.85,
+            minLng: -67.45,
+            maxLng: -66.15
+        }
+    ];
+
+    for (const box of regionalBounds) {
+        if (!box.keys.some((key) => combined.includes(key))) continue;
+        if (!coordinateInsideBox(location, box)) {
+            return `La coordenada encontrada (${lat.toFixed(6)}, ${lng.toFixed(6)}) no cae dentro de ${box.label}; se descartara para evitar rutas falsas.`;
+        }
+    }
+
+    return "";
 }
 
 function normalizeUsername(value) {
@@ -570,6 +686,7 @@ function isValidationFresh(validation, maxAgeDays) {
 function validationMatchesRoutingProvider(validation) {
     if (!validation) return false;
     if (normalizeText(validation.address) === "") return false;
+    if (coordinateBoundsIssue(validation.address, validation)) return false;
     if (getRoutingProvider() !== "openrouteservice") return true;
     const provider = normalizeText(validation.provider);
     if (provider === "openrouteservice") return hasValidationCoordinates(validation);
@@ -930,7 +1047,7 @@ function streetOnlyVariant(value) {
         .replace(/\b(MUNICIPIO|PARROQUIA)\b/gi, " "));
 }
 
-function buildGeocodeQueryVariants(address) {
+function buildGeocodeQueryVariants(address, context = {}) {
     const raw = normalizeOpenRouteQuery(address);
     const expanded = expandVenezuelanAddressAbbreviations(raw);
     const parentheticalAsText = keepParentheticalMarkersAsText(raw);
@@ -938,9 +1055,11 @@ function buildGeocodeQueryVariants(address) {
     const noNoise = removeAddressUnitNoise(expanded);
     const hinted = normalizeMunicipalityHints(noNoise);
     const streetOnly = streetOnlyVariant(raw);
-    const suffix = inferLocalitySuffix(raw);
+    const contextText = [context.route, context.routeName, context.name].filter(Boolean).join(" ");
+    const suffix = inferLocalitySuffix(`${raw} ${contextText}`);
     const withoutCountry = stripTrailingVenezuela(raw);
     const noAccent = stripDiacritics(expanded);
+    const routeSuffix = inferLocalitySuffix(contextText);
 
     return uniqueNormalized([
         raw,
@@ -954,6 +1073,8 @@ function buildGeocodeQueryVariants(address) {
         streetOnly,
         `${streetOnly}, ${suffix}`,
         `${hinted}, ${suffix}`,
+        `${streetOnly}, ${routeSuffix}`,
+        `${hinted}, ${routeSuffix}`,
         `${withoutCountry}, ${suffix}`,
         `${noAccent}, ${suffix}`,
         `${withoutCountry}, Miranda, Venezuela`,
@@ -963,20 +1084,20 @@ function buildGeocodeQueryVariants(address) {
     ]);
 }
 
-function buildOpenRouteGeocodeQueries(address) {
-    return buildGeocodeQueryVariants(address);
+function buildOpenRouteGeocodeQueries(address, context = {}) {
+    return buildGeocodeQueryVariants(address, context);
 }
 
-function buildGoogleGeocodeQueries(address) {
-    return buildGeocodeQueryVariants(address).slice(0, GOOGLE_GEOCODING_MAX_VARIANTS);
+function buildGoogleGeocodeQueries(address, context = {}) {
+    return buildGeocodeQueryVariants(address, context).slice(0, GOOGLE_GEOCODING_MAX_VARIANTS);
 }
 
-async function requestOpenRouteAddressValidation(address) {
+async function requestOpenRouteAddressValidation(address, context = {}) {
     if (!OPENROUTESERVICE_API_KEY) {
         throw new Error("Falta OPENROUTESERVICE_API_KEY para validar direcciones.");
     }
     let lastValidation = null;
-    const queries = buildOpenRouteGeocodeQueries(address);
+    const queries = buildOpenRouteGeocodeQueries(address, context);
     for (const text of queries) {
         const params = new URLSearchParams({
             api_key: OPENROUTESERVICE_API_KEY,
@@ -992,6 +1113,17 @@ async function requestOpenRouteAddressValidation(address) {
             throw new Error(`OpenRouteService Geocoding API HTTP ${response.status}. Revisa la API key y la cuota disponible.`);
         }
         lastValidation = classifyOpenRouteGeocodingResult(await response.json());
+        const boundsIssue = coordinateBoundsIssue(address, lastValidation, context);
+        if (boundsIssue) {
+            lastValidation = {
+                ...lastValidation,
+                status: "not_found",
+                reason: boundsIssue,
+                latitude: null,
+                longitude: null
+            };
+            continue;
+        }
         if (lastValidation.status !== "not_found") return lastValidation;
     }
     return lastValidation || {
@@ -1049,12 +1181,12 @@ async function getGoogleGeocodingFallbackBlockReason() {
     return "";
 }
 
-async function requestGoogleGeocodingFallbackValidation(address, openRouteValidation) {
+async function requestGoogleGeocodingFallbackValidation(address, openRouteValidation, context = {}) {
     const baseReason = normalizeText(openRouteValidation?.reason) || "OpenRouteService no encontro esta direccion.";
     let lastReason = "";
     let attempts = 0;
 
-    for (const query of buildGoogleGeocodeQueries(address)) {
+    for (const query of buildGoogleGeocodeQueries(address, context)) {
         const blockReason = await getGoogleGeocodingFallbackBlockReason();
         if (blockReason) {
             return {
@@ -1066,9 +1198,10 @@ async function requestGoogleGeocodingFallbackValidation(address, openRouteValida
         attempts += 1;
         try {
             const validation = await requestSingleGoogleAddressValidation(query, GOOGLE_GEOCODING_API_KEY);
-            const success = validation.status !== "not_found" && hasValidationCoordinates(validation);
+            const boundsIssue = coordinateBoundsIssue(address, validation, context);
+            const success = validation.status !== "not_found" && hasValidationCoordinates(validation) && !boundsIssue;
             await recordGoogleGeocodingFallbackUsage(query, success);
-            lastReason = validation.reason || lastReason;
+            lastReason = boundsIssue || validation.reason || lastReason;
             if (success) {
                 return {
                     ...validation,
@@ -1091,11 +1224,11 @@ async function requestGoogleGeocodingFallbackValidation(address, openRouteValida
     };
 }
 
-async function requestAddressValidation(address) {
+async function requestAddressValidation(address, context = {}) {
     if (getRoutingProvider() === "openrouteservice") {
-        const validation = await requestOpenRouteAddressValidation(address);
+        const validation = await requestOpenRouteAddressValidation(address, context);
         if (validation.status !== "not_found" && hasValidationCoordinates(validation)) return validation;
-        return requestGoogleGeocodingFallbackValidation(address, validation);
+        return requestGoogleGeocodingFallbackValidation(address, validation, context);
     }
     const validation = await requestGoogleAddressValidation(address);
     return {
@@ -1164,11 +1297,18 @@ async function validateClientAddresses(clients) {
         if (!address) return;
         const cached = existing.get(client.key);
         if (cached && normalizeText(cached.address) === address && validationMatchesRoutingProvider(cached)) return;
-        if (!byAddress.has(address)) uniquePendingAddresses.set(address, null);
+        if (!byAddress.has(address) && !uniquePendingAddresses.has(address)) {
+            uniquePendingAddresses.set(address, {
+                route: client.route,
+                routeName: client.routeName,
+                name: client.name || client.nombre_o_razon_social,
+                clientId: client.clientId
+            });
+        }
     });
 
-    for (const address of uniquePendingAddresses.keys()) {
-        const validation = await requestAddressValidation(address);
+    for (const [address, context] of uniquePendingAddresses.entries()) {
+        const validation = await requestAddressValidation(address, context);
         byAddress.set(address, {
             address,
             status: validation.status,
@@ -1440,12 +1580,25 @@ async function computeOpenRouteDetails(originAddress, sequence, originLocation) 
     if (coordinates.some((location) => !location)) {
         throw new Error("Faltan coordenadas para calcular el detalle de la ruta.");
     }
-    const payload = await openRouteServiceRequest("directions/driving-car/json", {
-        coordinates,
-        language: "es",
-        units: "m",
-        instructions: false
-    });
+    let payload = null;
+    let lastError = null;
+    for (const radius of ORS_ROUTING_SNAP_RADII) {
+        try {
+            payload = await openRouteServiceRequest("directions/driving-car/json", {
+                coordinates,
+                radiuses: coordinates.map(() => radius),
+                language: "es",
+                units: "m",
+                instructions: false
+            });
+            break;
+        } catch (error) {
+            lastError = error;
+            const message = String(error.message || error);
+            if (!/routable point|specified coordinate|could not find/i.test(message)) break;
+        }
+    }
+    if (!payload && lastError) throw lastError;
     const route = payload?.routes?.[0];
     if (!route) throw new Error("OpenRouteService no devolvio rutas para esa consulta.");
     const summary = route.summary || {};

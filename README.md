@@ -14,6 +14,9 @@ Copia `.env.example` a `.env` y completa:
 - `CORS_ORIGIN`: dominios permitidos separados por coma o `*`.
 - `ROUTING_PROVIDER`: usa `openrouteservice` para el módulo de Rutas sin Google Routes API.
 - `OPENROUTESERVICE_API_KEY`: clave de OpenRouteService para geocoding, matriz y direcciones.
+- `ROUTING_REFERENCE_LAT` / `ROUTING_REFERENCE_LNG`: punto central operativo para descartar coordenadas absurdamente lejanas (por defecto Bello Campo).
+- `ROUTING_MAX_GEOCODE_DISTANCE_KM`: distancia maxima permitida desde el punto central para aceptar coordenadas automaticas (recomendado `250`).
+- `ORS_ROUTING_SNAP_RADII`: radios de reintento para que ORS conecte coordenadas cercanas a una via (recomendado `350,1000,2500,5000`).
 - `GOOGLE_GEOCODING_FALLBACK_ENABLED`: `true` activa Google Geocoding solo como respaldo cuando OpenRouteService no ubica una dirección.
 - `GOOGLE_GEOCODING_API_KEY`: clave restringida a Geocoding API. No debe exponerse en frontend.
 - `GOOGLE_GEOCODING_DAILY_LIMIT`: límite diario interno de llamadas fallback (recomendado `250`).
@@ -123,6 +126,10 @@ ADMIN_KEY=CAMBIAR_CLAVE_ADMIN
 CORS_ORIGIN=https://prueba-empaquetad-ofrontend-theta.vercel.app
 ROUTING_PROVIDER=openrouteservice
 OPENROUTESERVICE_API_KEY=CAMBIAR_API_KEY
+ROUTING_REFERENCE_LAT=10.492
+ROUTING_REFERENCE_LNG=-66.856
+ROUTING_MAX_GEOCODE_DISTANCE_KM=250
+ORS_ROUTING_SNAP_RADII=350,1000,2500,5000
 GOOGLE_GEOCODING_FALLBACK_ENABLED=true
 GOOGLE_GEOCODING_API_KEY=CAMBIAR_API_KEY_GEOCODING
 GOOGLE_GEOCODING_DAILY_LIMIT=250
