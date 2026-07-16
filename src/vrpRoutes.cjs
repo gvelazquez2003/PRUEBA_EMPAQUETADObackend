@@ -1377,8 +1377,26 @@ function getGoogleGeocodingFallbackConfig() {
 
 const GOOGLE_MAPS_DELIVERIES_PER_SEGMENT = 10;
 
+function formatGoogleMapsCoordinate(location) {
+    const lat = Number(location?.lat ?? location?.latitude);
+    const lng = Number(location?.lng ?? location?.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "";
+    return `${lat.toFixed(6)},${lng.toFixed(6)}`;
+}
+
+function getGoogleMapsStop(client) {
+    const coordinate = formatGoogleMapsCoordinate(
+        client?.location
+        || client?.routingLocation
+        || client?.googleAddressLocation
+        || null
+    );
+    if (coordinate) return coordinate;
+    return normalizeText(client?.address);
+}
+
 function makeGoogleMapsDirectionsUrl(sequence) {
-    const stops = sequence.map((client) => client.address).filter(Boolean);
+    const stops = sequence.map(getGoogleMapsStop).filter(Boolean);
     const destination = stops[stops.length - 1] || "";
     const waypoints = stops.slice(0, -1);
     const params = new URLSearchParams({
@@ -1392,10 +1410,11 @@ function makeGoogleMapsDirectionsUrl(sequence) {
     return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
 
-function makeGoogleMapsNavigationUrl(address) {
+function makeGoogleMapsNavigationUrl(address, location = null) {
+    const destination = formatGoogleMapsCoordinate(location) || normalizeText(address);
     const params = new URLSearchParams({
         api: "1",
-        destination: normalizeText(address),
+        destination,
         travelmode: "driving",
         dir_action: "navigate"
     });
@@ -1929,11 +1948,31 @@ async function computeRouteDetails(originAddress, sequence) {
 
 function buildOptimizedRouteResponse(originAddress, sequence, route, matrix, optimizationMethod) {
     const legs = Array.isArray(route.legs) ? route.legs : [];
-    const googleMapsSegments = makeGoogleMapsSegments(sequence);
+    const enrichedSequence = sequence.map((client, index) => {
+        const leg = legs[index] || {};
+        const latLng = leg.endLocation?.latLng;
+        const location = latLng
+            ? {
+                lat: Number(latLng.latitude),
+                lng: Number(latLng.longitude)
+            }
+            : getClientRoutingLocation(client);
+        return {
+            ...client,
+            stopNumber: index + 1,
+            legDistanceMeters: Number(leg.distanceMeters || 0),
+            legDistanceText: formatMeters(Number(leg.distanceMeters || 0)),
+            legDurationText: formatDuration(leg.duration),
+            legDurationSeconds: parseDurationSeconds(leg.duration),
+            googleMapsNavigationUrl: makeGoogleMapsNavigationUrl(client.address, location),
+            location
+        };
+    });
+    const googleMapsSegments = makeGoogleMapsSegments(enrichedSequence);
     return {
         provider: "google",
         origin: originAddress,
-        totalClients: sequence.length,
+        totalClients: enrichedSequence.length,
         totalDistanceKm: Number(((route.distanceMeters || 0) / 1000).toFixed(2)),
         totalDurationText: formatDuration(route.duration),
         totalDurationSeconds: parseDurationSeconds(route.duration),
@@ -1946,33 +1985,31 @@ function buildOptimizedRouteResponse(originAddress, sequence, route, matrix, opt
         polyline: route.polyline?.encodedPolyline || "",
         googleMapsUrl: googleMapsSegments[0]?.googleMapsUrl || "",
         googleMapsSegments,
-        sequence: sequence.map((client, index) => {
-            const leg = legs[index] || {};
-            const latLng = leg.endLocation?.latLng;
-            return {
-                ...client,
-                stopNumber: index + 1,
-                legDistanceMeters: Number(leg.distanceMeters || 0),
-                legDistanceText: formatMeters(Number(leg.distanceMeters || 0)),
-                legDurationText: formatDuration(leg.duration),
-                legDurationSeconds: parseDurationSeconds(leg.duration),
-                googleMapsNavigationUrl: makeGoogleMapsNavigationUrl(client.address),
-                location: latLng ? {
-                    lat: Number(latLng.latitude),
-                    lng: Number(latLng.longitude)
-                } : null
-            };
-        })
+        sequence: enrichedSequence
     };
 }
 
 function buildOpenRouteOptimizedRouteResponse(originAddress, sequence, route, matrix, optimizationMethod) {
     const legs = Array.isArray(route.legs) ? route.legs : [];
-    const googleMapsSegments = makeGoogleMapsSegments(sequence);
+    const enrichedSequence = sequence.map((client, index) => {
+        const leg = legs[index] || {};
+        const location = getClientRoutingLocation(client);
+        return {
+            ...client,
+            stopNumber: index + 1,
+            legDistanceMeters: Number(leg.distanceMeters || 0),
+            legDistanceText: formatMeters(Number(leg.distanceMeters || 0)),
+            legDurationText: formatDurationSeconds(leg.durationSeconds),
+            legDurationSeconds: parseOpenRouteDurationSeconds(leg.durationSeconds),
+            googleMapsNavigationUrl: makeGoogleMapsNavigationUrl(client.address, location),
+            location
+        };
+    });
+    const googleMapsSegments = makeGoogleMapsSegments(enrichedSequence);
     return {
         provider: "openrouteservice",
         origin: originAddress,
-        totalClients: sequence.length,
+        totalClients: enrichedSequence.length,
         totalDistanceKm: Number(((route.distanceMeters || 0) / 1000).toFixed(2)),
         totalDurationText: formatDurationSeconds(route.durationSeconds),
         totalDurationSeconds: parseOpenRouteDurationSeconds(route.durationSeconds),
@@ -1985,20 +2022,7 @@ function buildOpenRouteOptimizedRouteResponse(originAddress, sequence, route, ma
         polyline: route.polyline || "",
         googleMapsUrl: googleMapsSegments[0]?.googleMapsUrl || "",
         googleMapsSegments,
-        sequence: sequence.map((client, index) => {
-            const leg = legs[index] || {};
-            const location = getClientRoutingLocation(client);
-            return {
-                ...client,
-                stopNumber: index + 1,
-                legDistanceMeters: Number(leg.distanceMeters || 0),
-                legDistanceText: formatMeters(Number(leg.distanceMeters || 0)),
-                legDurationText: formatDurationSeconds(leg.durationSeconds),
-                legDurationSeconds: parseOpenRouteDurationSeconds(leg.durationSeconds),
-                googleMapsNavigationUrl: makeGoogleMapsNavigationUrl(client.address),
-                location
-            };
-        })
+        sequence: enrichedSequence
     };
 }
 
