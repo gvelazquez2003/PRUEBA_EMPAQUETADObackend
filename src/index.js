@@ -333,6 +333,9 @@ function canReadRegistrosTipo(auth, tipo) {
   if (role === APP_ROLES.FACTURACION) {
     return cleanTipo === 'cambios' || cleanTipo === 'hojas-ruta';
   }
+  if (role === APP_ROLES.VENDEDOR) {
+    return cleanTipo === 'cambios';
+  }
   return false;
 }
 
@@ -3165,7 +3168,7 @@ app.get('/api/almacen09/cambios/ruta', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas/contexto-cliente', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.query?.cliente, 160);
@@ -6495,7 +6498,7 @@ app.post('/api/almacen09/errores-conteo/delete', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas/next-control', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   try {
@@ -6507,7 +6510,7 @@ app.get('/api/almacen09/salidas-facturas/next-control', async (req, res) => {
 });
 
 app.post('/api/almacen09/salidas-facturas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const numeroFacturaRaw = String(req.body?.numero_factura || '').trim();
@@ -6867,7 +6870,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 500);
@@ -7013,7 +7016,7 @@ app.patch('/auth/profile', async (req, res) => {
 });
 
 app.get('/api/hoja-ruta/rutas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR, APP_ROLES.CONDUCTOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.CONDUCTOR]);
   if (!auth) return;
 
   try {
@@ -7041,7 +7044,7 @@ app.get('/api/hoja-ruta/rutas', async (req, res) => {
 });
 
 app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const ruta = normalizeSalidasText(req.body?.ruta, 120);
@@ -7161,7 +7164,7 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
 });
 
 app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const id = Number(req.params?.id);
@@ -7755,7 +7758,7 @@ app.get('/api/resultados/rutas-completadas', async (req, res) => {
 });
 
 app.get('/api/hoja-ruta', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR, APP_ROLES.CONDUCTOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.CONDUCTOR]);
   if (!auth) return;
 
   const ruta = normalizeSalidasText(req.query?.ruta, 120);
