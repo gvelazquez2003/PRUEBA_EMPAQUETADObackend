@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import crypto from 'crypto';
+import { createRequire } from 'module';
 
 dotenv.config();
 
@@ -49,6 +50,7 @@ const MERMA_MOTIVOS = [
   'Burbuja/Mancha en la Corona',
   'Alveolado/Cavidad',
   'Crudo',
+  'QUEMADO',
   'Color',
   'Fermentado',
   'Pan Pequeno',
@@ -165,6 +167,11 @@ const pool = new Pool({
   max: Number(process.env.DB_POOL_MAX || 5),
   connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
 });
+
+const require = createRequire(import.meta.url);
+globalThis.__PDT_VRP_APP = app;
+globalThis.__PDT_VRP_POOL = pool;
+const integratedVrpRoutes = require('./vrpRoutes.cjs');
 
 const IDEMPOTENT_WRITE_PATHS = new Set([
   '/api/empaquetados',
@@ -317,6 +324,26 @@ function appendVendedorAccessFilter(whereParts, params, auth, columnSql = 'vende
     LOWER(TRIM(COALESCE(${columnSql}, ''))) = LOWER(TRIM($${rawIndex}))
     OR ${vendedorSqlLookupExpression(columnSql)} = $${lookupIndex}
   )`);
+}
+
+function canReadRegistrosTipo(auth, tipo) {
+  const role = normalizeAuthRole(auth?.role);
+  const cleanTipo = String(tipo || '').trim().toLowerCase();
+  if (role === APP_ROLES.ADMIN) return true;
+  if (role === APP_ROLES.FACTURACION) {
+    return cleanTipo === 'cambios' || cleanTipo === 'hojas-ruta';
+  }
+  return false;
+}
+
+function canDeleteResultadoSource(auth, source) {
+  const role = normalizeAuthRole(auth?.role);
+  const cleanSource = String(source || '').trim().toLowerCase();
+  if (role === APP_ROLES.ADMIN) return true;
+  if (role === APP_ROLES.FACTURACION) {
+    return cleanSource === 'cambios_registros' || cleanSource === 'hojas_ruta_exportadas';
+  }
+  return false;
 }
 
 function isValidAuthUsername(username) {
@@ -1366,11 +1393,15 @@ async function ensureCambiosProductosTables() {
     CREATE TABLE IF NOT EXISTS cambios_registros (
       id_cambio BIGSERIAL PRIMARY KEY,
       codigo_cambio VARCHAR(20),
+      grupo_cambio VARCHAR(40),
+      rif_cliente VARCHAR(40),
       id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       nombre_cliente VARCHAR(180) NOT NULL,
       direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL,
       direccion_texto VARCHAR(240),
       responsable VARCHAR(180) NOT NULL,
+      contacto VARCHAR(180),
+      telefono VARCHAR(20),
       producto JSONB NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
@@ -1410,11 +1441,15 @@ async function ensureCambiosProductosTables() {
 
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS codigo_cambio VARCHAR(20)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS grupo_cambio VARCHAR(40)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS rif_cliente VARCHAR(40)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS nombre_cliente VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_id BIGINT REFERENCES almacen09_direcciones(id_direccion) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS direccion_texto VARCHAR(240)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS ruta_nombre VARCHAR(120)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS responsable VARCHAR(180)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS contacto VARCHAR(180)`);
+  await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS telefono VARCHAR(20)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS producto JSONB`);
   await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => {});
   await pool.query(`UPDATE cambios_registros SET nombre_cliente = COALESCE(nombre_cliente, cliente_nombre) WHERE nombre_cliente IS NULL`).catch(() => {});
@@ -1435,6 +1470,7 @@ async function ensureCambiosProductosTables() {
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto_unique ON cambios_razones(razon_texto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_created_at ON cambios_registros(created_at DESC)');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_registros_codigo_unique ON cambios_registros(codigo_cambio)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_grupo ON cambios_registros(grupo_cambio)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_cambios_registros_ruta ON cambios_registros(ruta_nombre)');
 
   const razonesEjemplo = [
@@ -1469,6 +1505,94 @@ async function ensureProductosSoftDelete() {
        SET codigo_barras = UPPER(TRIM(codigo_producto))
      WHERE UPPER(TRIM(COALESCE(codigo_barras, ''))) <> UPPER(TRIM(COALESCE(codigo_producto, '')))
        AND TRIM(COALESCE(codigo_producto, '')) <> ''
+  `).catch(() => {});
+}
+
+async function ensureProductosAuditTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS productos_audit (
+      id_audit BIGSERIAL PRIMARY KEY,
+      operation TEXT NOT NULL,
+      changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      db_user TEXT NOT NULL DEFAULT CURRENT_USER,
+      app_name TEXT NOT NULL DEFAULT CURRENT_SETTING('application_name', TRUE),
+      client_addr TEXT,
+      old_row JSONB,
+      new_row JSONB
+    )
+  `);
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION productos_audit_trigger_fn()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      INSERT INTO productos_audit (
+        operation,
+        db_user,
+        app_name,
+        client_addr,
+        old_row,
+        new_row
+      )
+      VALUES (
+        TG_OP,
+        CURRENT_USER,
+        CURRENT_SETTING('application_name', TRUE),
+        INET_CLIENT_ADDR()::TEXT,
+        CASE WHEN TG_OP IN ('UPDATE', 'DELETE') THEN TO_JSONB(OLD) ELSE NULL END,
+        CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN TO_JSONB(NEW) ELSE NULL END
+      );
+
+      IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trg_productos_audit'
+      ) THEN
+        CREATE TRIGGER trg_productos_audit
+        AFTER INSERT OR UPDATE OR DELETE ON productos
+        FOR EACH ROW
+        EXECUTE FUNCTION productos_audit_trigger_fn();
+      END IF;
+    END $$;
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_productos_audit_changed_at
+    ON productos_audit (changed_at DESC)
+  `);
+}
+
+async function ensureEmpaquetadosDetalleSnapshotColumns() {
+  await pool.query(`
+    ALTER TABLE empaquetados_detalle
+    ADD COLUMN IF NOT EXISTS codigo_producto VARCHAR(30)
+  `);
+  await pool.query(`
+    ALTER TABLE empaquetados_detalle
+    ADD COLUMN IF NOT EXISTS producto TEXT
+  `);
+  await pool.query(`
+    UPDATE empaquetados_detalle ed
+       SET codigo_producto = COALESCE(NULLIF(TRIM(ed.codigo_producto), ''), UPPER(TRIM(p.codigo_producto))),
+           producto = COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion)
+      FROM productos p
+     WHERE p.id_producto = ed.id_producto
+       AND (
+         TRIM(COALESCE(ed.codigo_producto, '')) = ''
+         OR TRIM(COALESCE(ed.producto, '')) = ''
+       )
+  `).catch(() => {});
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_codigo_producto
+    ON empaquetados_detalle (codigo_producto)
   `).catch(() => {});
 }
 
@@ -1630,6 +1754,7 @@ async function ensureSalidas09Tables() {
       documento VARCHAR(30) NOT NULL DEFAULT 'factura',
       numero_factura VARCHAR(80) NOT NULL,
       fecha_emision TIMESTAMP NOT NULL,
+      fecha_vencimiento DATE,
       cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL,
       cliente_nombre VARCHAR(160),
       vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL,
@@ -1665,6 +1790,7 @@ async function ensureSalidas09Tables() {
 
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS numero_control BIGINT');
   await pool.query(`ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS documento VARCHAR(30) NOT NULL DEFAULT 'factura'`);
+  await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_id BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS cliente_nombre VARCHAR(160)');
   await pool.query('ALTER TABLE salidas_facturas ADD COLUMN IF NOT EXISTS vendedor_id BIGINT REFERENCES almacen09_vendedores(id_vendedor) ON DELETE SET NULL');
@@ -1727,6 +1853,26 @@ async function ensureSalidas09Tables() {
   `);
 
   await pool.query('ALTER TABLE almacen09_salidas_detalle ADD COLUMN IF NOT EXISTS id_cambio BIGINT');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conciliacion_pagos (
+      id_pago BIGSERIAL PRIMARY KEY,
+      id_factura BIGINT NOT NULL REFERENCES salidas_facturas(id_factura) ON DELETE CASCADE,
+      fecha_pago DATE NOT NULL,
+      registrado_por VARCHAR(80),
+      observacion TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_conciliacion_pagos_factura
+    ON conciliacion_pagos (id_factura)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_conciliacion_pagos_fecha
+    ON conciliacion_pagos (fecha_pago DESC)
+  `);
 
   // Restore natural-key uniqueness required by the catalog upserts after SQL imports.
   await pool.query(`
@@ -1963,6 +2109,34 @@ async function ensureSalidas09Tables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_hojas_ruta_exportadas_ruta
     ON hojas_ruta_exportadas (LOWER(TRIM(ruta_nombre)))
+  `);
+}
+
+async function ensureRouteDeliveryTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS delivery_status (
+      client_key TEXT PRIMARY KEY,
+      delivered BOOLEAN NOT NULL DEFAULT FALSE,
+      delivered_baskets INT NOT NULL DEFAULT 0,
+      delivered_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS delivered_baskets INT NOT NULL DEFAULT 0
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS partial BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS partial_detail JSONB
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_delivery_status_updated_at
+    ON delivery_status (updated_at DESC)
   `);
 }
 
@@ -2203,6 +2377,89 @@ function normalizeClienteDireccionMeta(row) {
     transporte: normalizeSalidasText(row?.transporte, 120),
     vendedor: normalizeSalidasText(row?.vendedor, 160),
   };
+}
+
+function cleanClienteCatalogDescription(value) {
+  return normalizeSalidasText(value, 200)
+    .toUpperCase()
+    .replace(/\b(?:N[°º]?\s*(?:DE\s*)?FACTURA|NRO\.?\s*FACTURA|NUM(?:ERO)?\.?\s*FACTURA|NOTA\s+ENTREGA|FACTURA)\s*:?\s*\d+[\s\S]*$/i, '')
+    .replace(/\b(?:RIF|DIRECCION|DIREC\.?|DIR\.?|FEC\.?|CONDIC|VENDEDOR|TRANSPORTE)\b[\s\S]*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeClienteCatalogPayload(payload) {
+  const idCliente = normalizeSalidasText(payload?.id_cliente || payload?.rif, 40).toUpperCase();
+  return {
+    id_cliente: idCliente,
+    descripcion: cleanClienteCatalogDescription(payload?.descripcion || payload?.cliente),
+    tipo_cliente: normalizeSalidasText(payload?.tipo_cliente, 80).toUpperCase(),
+    direccion: normalizeSalidasText(payload?.direccion, 500).toUpperCase(),
+    ruta: normalizeSalidasText(payload?.ruta, 120).toUpperCase(),
+    transporte: normalizeSalidasText(payload?.transporte, 120).toUpperCase(),
+    zona: normalizeSalidasText(payload?.zona, 120).toUpperCase(),
+    vendedor: normalizeSalidasText(payload?.vendedor, 160).toUpperCase(),
+  };
+}
+
+function normalizeClienteAuditKey(value) {
+  return stripDiacritics(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 80);
+}
+
+function hasInvoiceNoiseInClienteText(value) {
+  const clean = stripDiacritics(value).toUpperCase();
+  return /\b(N[°º]?\s*(?:DE\s*)?FACTURA|NRO\.?\s*FACTURA|NUM(?:ERO)?\.?\s*FACTURA|NOTA\s+ENTREGA|DESCRIPCION|CODIGO|SUBTOTAL|TOTAL\s+(?:FACTURA|CON|GENERAL)?|BASE\s+IMPONIBLE|I\.?\s*V\.?\s*A\.?)\b/.test(clean);
+}
+
+function getClienteAuditIssues(row, idDuplicateCount) {
+  const issues = [];
+  const idKey = normalizeClienteAuditKey(row.id_cliente);
+  const descripcion = normalizeSalidasText(row.descripcion, 500);
+  const direccion = normalizeSalidasText(row.direccion, 800);
+  const ruta = normalizeSalidasText(row.ruta, 160);
+  const cleanDescripcion = stripDiacritics(descripcion).toUpperCase();
+  const cleanDireccion = stripDiacritics(direccion).toUpperCase();
+  const cleanRuta = stripDiacritics(ruta).toUpperCase();
+  const emptyValues = new Set(['', '0', '-', 'N/A', 'NA', 'S/D', 'SD', 'SIN DIRECCION', 'SIN DIRECCION FISCAL']);
+
+  if (!idKey || idKey === '0') {
+    issues.push({ code: 'id_invalido', label: 'ID/RIF vacio o 0' });
+  } else if (idDuplicateCount > 1) {
+    issues.push({ code: 'id_repetido', label: 'ID/RIF repetido' });
+  }
+
+  if (emptyValues.has(cleanDescripcion) || hasInvoiceNoiseInClienteText(descripcion) || cleanDescripcion.length > 180) {
+    issues.push({ code: 'descripcion_error', label: 'Descripcion con texto de factura' });
+  }
+
+  if (emptyValues.has(cleanDireccion) || hasInvoiceNoiseInClienteText(direccion)) {
+    issues.push({ code: 'direccion_error', label: 'Direccion vacia o contaminada' });
+  }
+
+  if (!cleanRuta || cleanRuta.includes('REVISAR MANUALMENTE')) {
+    issues.push({ code: 'ruta_error', label: 'Ruta por revisar manualmente' });
+  }
+
+  return issues;
+}
+
+async function getClienteCatalogOptions(columnName, fallbackValues = []) {
+  const allowedColumns = new Set(['tipo_cliente', 'ruta', 'transporte', 'zona', 'vendedor']);
+  if (!allowedColumns.has(columnName)) return fallbackValues;
+  const result = await pool.query(
+    `SELECT TRIM(COALESCE(${columnName}, '')) AS value
+       FROM public.clientes
+      WHERE TRIM(COALESCE(${columnName}, '')) <> ''
+      GROUP BY TRIM(COALESCE(${columnName}, ''))
+      ORDER BY TRIM(COALESCE(${columnName}, '')) ASC`
+  );
+  const values = [...fallbackValues, ...result.rows.map((row) => normalizeSalidasText(row?.value, 160))]
+    .map((value) => normalizeSalidasText(value, 160).toUpperCase())
+    .filter(Boolean);
+  return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
 }
 
 function normalizeDireccionMatchKey(value) {
@@ -2614,6 +2871,14 @@ async function upsertClienteSucursalMeta(client, payload) {
 async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_activo_codigo ON productos(activo, codigo_producto)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_codigo_upper ON productos(UPPER(TRIM(codigo_producto)))');
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_producto_unique
+    ON productos (codigo_producto)`).catch((error) => {
+      console.warn('[startup] No se pudo crear indice unico de productos.codigo_producto:', error.message);
+    });
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_upper_unique
+    ON productos (UPPER(TRIM(codigo_producto)))`).catch((error) => {
+      console.warn('[startup] No se pudo crear indice unico normalizado de productos.codigo_producto:', error.message);
+    });
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_barras_unique
     ON productos (UPPER(TRIM(codigo_barras)))
     WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => {});
@@ -2627,6 +2892,12 @@ async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_lote_upper ON empaquetados_detalle(UPPER(TRIM(numero_lote)))');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura)');
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS descripcion TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS tipo_cliente TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS direccion TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS ruta TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS transporte TEXT').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS zona TEXT').catch(() => {});
   await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS vendedor TEXT').catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_zona ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(zona)))').catch(() => {});
   await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_direccion ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(direccion)))').catch(() => {});
@@ -2976,6 +3247,499 @@ app.get('/api/almacen09/vendedores', async (req, res) => {
   }
 });
 
+app.get('/api/clientes-catalogo/opciones', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  try {
+    const [tipos, rutas, transportes, zonas, vendedores] = await Promise.all([
+      getClienteCatalogOptions('tipo_cliente', ['CADENAS', 'FOOD SERVICES', 'TIENDAS', 'FOOD TRUCK']),
+      getClienteCatalogOptions('ruta'),
+      getClienteCatalogOptions('transporte', ['DESPACHO', 'RETIRO']),
+      getClienteCatalogOptions('zona'),
+      getClienteCatalogOptions('vendedor'),
+    ]);
+    return res.json({
+      ok: true,
+      opciones: {
+        tipo_cliente: tipos,
+        ruta: rutas,
+        transporte: transportes,
+        zona: zonas,
+        vendedor: vendedores,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/clientes-errores', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede ver esta auditoria.' });
+  }
+
+  const filters = {
+    q: stripDiacritics(req.query?.q || '').toUpperCase().trim(),
+    transporte: normalizeSalidasText(req.query?.transporte, 120).toUpperCase(),
+    tipo_cliente: normalizeSalidasText(req.query?.tipo_cliente, 120).toUpperCase(),
+    ruta: normalizeSalidasText(req.query?.ruta, 160).toUpperCase(),
+    zona: normalizeSalidasText(req.query?.zona, 160).toUpperCase(),
+    error: normalizeSalidasText(req.query?.error, 80).toLowerCase(),
+  };
+  const limit = Math.min(Math.max(Number(req.query?.limit || 80), 1), 300);
+  const offset = Math.max(Number(req.query?.offset || 0), 0);
+  const issueLabels = {
+    id_invalido: 'ID/RIF vacio o 0',
+    id_repetido: 'ID/RIF repetido',
+    descripcion_error: 'Descripcion con texto de factura',
+    direccion_error: 'Direccion vacia o contaminada',
+    ruta_error: 'Ruta por revisar manualmente',
+  };
+
+  const uniqueSorted = (values) => Array.from(new Set(values.map((value) => normalizeSalidasText(value, 160).toUpperCase()).filter(Boolean)))
+    .sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         ctid::text AS row_key,
+         CAST(id_cliente AS TEXT) AS id_cliente,
+         TRIM(COALESCE(descripcion, '')) AS descripcion,
+         TRIM(COALESCE(tipo_cliente, '')) AS tipo_cliente,
+         TRIM(COALESCE(direccion, '')) AS direccion,
+         TRIM(COALESCE(ruta, '')) AS ruta,
+         TRIM(COALESCE(transporte, '')) AS transporte,
+         TRIM(COALESCE(zona, '')) AS zona,
+         TRIM(COALESCE(vendedor, '')) AS vendedor
+       FROM public.clientes
+       ORDER BY TRIM(COALESCE(descripcion, '')) ASC, CAST(id_cliente AS TEXT) ASC`
+    );
+
+    const idCounts = new Map();
+    result.rows.forEach((row) => {
+      const key = normalizeClienteAuditKey(row.id_cliente);
+      if (!key) return;
+      idCounts.set(key, (idCounts.get(key) || 0) + 1);
+    });
+
+    const audited = result.rows
+      .map((row) => {
+        const idKey = normalizeClienteAuditKey(row.id_cliente);
+        const issues = getClienteAuditIssues(row, idCounts.get(idKey) || 0);
+        return {
+          row_key: row.row_key,
+          id_cliente: normalizeSalidasText(row.id_cliente, 80),
+          descripcion: normalizeSalidasText(row.descripcion, 240),
+          tipo_cliente: normalizeSalidasText(row.tipo_cliente, 120),
+          direccion: normalizeSalidasText(row.direccion, 800),
+          ruta: normalizeSalidasText(row.ruta, 160),
+          transporte: normalizeSalidasText(row.transporte, 120),
+          zona: normalizeSalidasText(row.zona, 160),
+          vendedor: normalizeSalidasText(row.vendedor, 160),
+          error_codes: issues.map((issue) => issue.code),
+          errores: issues.map((issue) => issue.label).join(' | '),
+          error_count: issues.length,
+        };
+      })
+      .filter((row) => row.error_count > 0);
+
+    const options = {
+      transporte: uniqueSorted(audited.map((row) => row.transporte)),
+      tipo_cliente: uniqueSorted(audited.map((row) => row.tipo_cliente)),
+      ruta: uniqueSorted(audited.map((row) => row.ruta)),
+      zona: uniqueSorted(audited.map((row) => row.zona)),
+      errores: Object.entries(issueLabels)
+        .filter(([code]) => audited.some((row) => row.error_codes.includes(code)))
+        .map(([code, label]) => ({ code, label })),
+    };
+
+    const filtered = audited.filter((row) => {
+      if (filters.transporte && normalizeSalidasText(row.transporte, 120).toUpperCase() !== filters.transporte) return false;
+      if (filters.tipo_cliente && normalizeSalidasText(row.tipo_cliente, 120).toUpperCase() !== filters.tipo_cliente) return false;
+      if (filters.ruta && normalizeSalidasText(row.ruta, 160).toUpperCase() !== filters.ruta) return false;
+      if (filters.zona && normalizeSalidasText(row.zona, 160).toUpperCase() !== filters.zona) return false;
+      if (filters.error && !row.error_codes.includes(filters.error)) return false;
+      if (filters.q) {
+        const haystack = stripDiacritics([
+          row.id_cliente,
+          row.descripcion,
+          row.tipo_cliente,
+          row.direccion,
+          row.ruta,
+          row.transporte,
+          row.zona,
+          row.vendedor,
+          row.errores,
+        ].join(' ')).toUpperCase();
+        if (!haystack.includes(filters.q)) return false;
+      }
+      return true;
+    });
+
+    filtered.sort((a, b) => {
+      const errorDiff = Number(b.error_count || 0) - Number(a.error_count || 0);
+      if (errorDiff !== 0) return errorDiff;
+      return String(a.descripcion || '').localeCompare(String(b.descripcion || ''), 'es', { sensitivity: 'base' });
+    });
+
+    const counters = {
+      total: filtered.length,
+      id_invalido: 0,
+      id_repetido: 0,
+      descripcion_error: 0,
+      direccion_error: 0,
+      ruta_error: 0,
+    };
+    filtered.forEach((row) => {
+      row.error_codes.forEach((code) => {
+        if (Object.prototype.hasOwnProperty.call(counters, code)) counters[code] += 1;
+      });
+    });
+
+    const rows = filtered.slice(offset, offset + limit);
+    return res.json({
+      ok: true,
+      rows,
+      total: filtered.length,
+      hasMore: offset + rows.length < filtered.length,
+      counters,
+      options,
+      limit,
+      offset,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/clientes-admin/buscar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede editar clientes.' });
+  }
+
+  const rawField = normalizeSalidasText(req.query?.field, 60).toLowerCase();
+  const q = normalizeSalidasText(req.query?.q, 220);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 60), 1), 200);
+  const fieldMap = {
+    id_cliente: 'CAST(id_cliente AS TEXT)',
+    descripcion: "COALESCE(descripcion, '')",
+    tipo_cliente: "COALESCE(tipo_cliente, '')",
+    direccion: "COALESCE(direccion, '')",
+    ruta: "COALESCE(ruta, '')",
+    transporte: "COALESCE(transporte, '')",
+    zona: "COALESCE(zona, '')",
+    vendedor: "COALESCE(vendedor, '')",
+  };
+  const field = Object.prototype.hasOwnProperty.call(fieldMap, rawField) ? rawField : 'todos';
+
+  try {
+    const params = [];
+    const whereParts = [];
+    if (q) {
+      params.push(`%${q}%`);
+      if (field === 'todos') {
+        whereParts.push(`(
+          CAST(id_cliente AS TEXT) ILIKE $${params.length}
+          OR COALESCE(descripcion, '') ILIKE $${params.length}
+          OR COALESCE(tipo_cliente, '') ILIKE $${params.length}
+          OR COALESCE(direccion, '') ILIKE $${params.length}
+          OR COALESCE(ruta, '') ILIKE $${params.length}
+          OR COALESCE(transporte, '') ILIKE $${params.length}
+          OR COALESCE(zona, '') ILIKE $${params.length}
+          OR COALESCE(vendedor, '') ILIKE $${params.length}
+        )`);
+      } else {
+        whereParts.push(`${fieldMap[field]} ILIKE $${params.length}`);
+      }
+    }
+    params.push(limit);
+
+    const [rowsResult, tipos, rutas, transportes, zonas, vendedores] = await Promise.all([
+      pool.query(
+        `SELECT
+           ctid::text AS row_key,
+           CAST(id_cliente AS TEXT) AS id_cliente,
+           TRIM(COALESCE(descripcion, '')) AS descripcion,
+           TRIM(COALESCE(tipo_cliente, '')) AS tipo_cliente,
+           TRIM(COALESCE(direccion, '')) AS direccion,
+           TRIM(COALESCE(ruta, '')) AS ruta,
+           TRIM(COALESCE(transporte, '')) AS transporte,
+           TRIM(COALESCE(zona, '')) AS zona,
+           TRIM(COALESCE(vendedor, '')) AS vendedor
+         FROM public.clientes
+         ${whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : ''}
+         ORDER BY TRIM(COALESCE(descripcion, '')) ASC, CAST(id_cliente AS TEXT) ASC
+         LIMIT $${params.length}`,
+        params
+      ),
+      getClienteCatalogOptions('tipo_cliente', ['CADENAS', 'FOOD SERVICES', 'TIENDAS', 'FOOD TRUCK']),
+      getClienteCatalogOptions('ruta'),
+      getClienteCatalogOptions('transporte', ['DESPACHO', 'RETIRO']),
+      getClienteCatalogOptions('zona'),
+      getClienteCatalogOptions('vendedor'),
+    ]);
+
+    return res.json({
+      ok: true,
+      rows: rowsResult.rows,
+      options: {
+        tipo_cliente: tipos,
+        ruta: rutas,
+        transporte: transportes,
+        zona: zonas,
+        vendedor: vendedores,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/clientes-admin/actualizar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede editar clientes.' });
+  }
+
+  const rowKey = normalizeSalidasText(req.body?.row_key, 40);
+  const payload = normalizeClienteCatalogPayload(req.body || {});
+  const missing = [];
+  if (!rowKey) missing.push('cliente seleccionado');
+  if (!payload.id_cliente) missing.push('RIF/C.I.');
+  if (!payload.descripcion) missing.push('cliente');
+  if (!payload.tipo_cliente) missing.push('tipo de cliente');
+  if (!payload.direccion) missing.push('direccion');
+  if (!payload.ruta) missing.push('ruta');
+  if (!payload.transporte) missing.push('transporte');
+  if (!payload.zona) missing.push('zona');
+  if (!payload.vendedor) missing.push('vendedor');
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: `Faltan campos: ${missing.join(', ')}` });
+  }
+
+  try {
+    const current = await pool.query(
+      `SELECT ctid::text AS row_key, CAST(id_cliente AS TEXT) AS id_cliente
+         FROM public.clientes
+        WHERE ctid = $1::tid
+        LIMIT 1`,
+      [rowKey]
+    );
+    if (!current.rowCount) {
+      return res.status(404).json({ ok: false, error: 'No se encontro el cliente seleccionado. Recarga la busqueda.' });
+    }
+
+    const oldIdKey = normalizeClienteAuditKey(current.rows[0].id_cliente);
+    const newIdKey = normalizeClienteAuditKey(payload.id_cliente);
+    if (newIdKey && newIdKey !== oldIdKey) {
+      const duplicated = await pool.query(
+        `SELECT 1
+           FROM public.clientes
+          WHERE ctid <> $2::tid
+            AND REGEXP_REPLACE(UPPER(TRIM(CAST(id_cliente AS TEXT))), '[^A-Z0-9]', '', 'g') = $1
+          LIMIT 1`,
+        [newIdKey, rowKey]
+      );
+      if (duplicated.rowCount) {
+        return res.status(409).json({ ok: false, error: 'Ese RIF/C.I. ya existe en otro cliente. El ID no puede repetirse.' });
+      }
+    }
+
+    const updated = await pool.query(
+      `UPDATE public.clientes
+          SET id_cliente = $1,
+              descripcion = $2,
+              tipo_cliente = $3,
+              direccion = $4,
+              ruta = $5,
+              transporte = $6,
+              zona = $7,
+              vendedor = $8
+        WHERE ctid = $9::tid
+        RETURNING
+          ctid::text AS row_key,
+          CAST(id_cliente AS TEXT) AS id_cliente,
+          descripcion,
+          tipo_cliente,
+          direccion,
+          ruta,
+          transporte,
+          zona,
+          vendedor`,
+      [
+        payload.id_cliente,
+        payload.descripcion,
+        payload.tipo_cliente,
+        payload.direccion,
+        payload.ruta,
+        payload.transporte,
+        payload.zona,
+        payload.vendedor,
+        rowKey,
+      ]
+    );
+
+    return res.json({ ok: true, row: updated.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/clientes-admin/eliminar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede eliminar clientes.' });
+  }
+
+  const rowKey = normalizeSalidasText(req.body?.row_key, 40);
+  if (!rowKey) {
+    return res.status(400).json({ ok: false, error: 'Selecciona un cliente antes de eliminar.' });
+  }
+
+  try {
+    const deleted = await pool.query(
+      `DELETE FROM public.clientes
+        WHERE ctid = $1::tid
+        RETURNING
+          CAST(id_cliente AS TEXT) AS id_cliente,
+          descripcion,
+          tipo_cliente,
+          direccion,
+          ruta,
+          transporte,
+          zona,
+          vendedor`,
+      [rowKey]
+    );
+
+    if (!deleted.rowCount) {
+      return res.status(404).json({ ok: false, error: 'No se encontro el cliente seleccionado. Recarga la busqueda.' });
+    }
+
+    return res.json({ ok: true, deleted: true, row: deleted.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/clientes-catalogo', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const payload = normalizeClienteCatalogPayload(req.body || {});
+  const missing = [];
+  if (!payload.id_cliente) missing.push('RIF/C.I.');
+  if (!payload.descripcion) missing.push('cliente');
+  if (!payload.tipo_cliente) missing.push('tipo de cliente');
+  if (!payload.direccion) missing.push('direccion');
+  if (!payload.ruta) missing.push('ruta');
+  if (!payload.transporte) missing.push('transporte');
+  if (!payload.zona) missing.push('zona');
+  if (!payload.vendedor) missing.push('vendedor');
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: `Faltan campos: ${missing.join(', ')}` });
+  }
+
+  try {
+    const duplicated = await pool.query(
+      `SELECT ctid
+         FROM public.clientes
+        WHERE LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($2))
+          AND (
+            REGEXP_REPLACE(UPPER(TRIM(CAST(id_cliente AS TEXT))), '[^A-Z0-9]', '', 'g') = REGEXP_REPLACE(UPPER(TRIM($1)), '[^A-Z0-9]', '', 'g')
+            OR LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($3))
+          )
+        ORDER BY
+          CASE
+            WHEN REGEXP_REPLACE(UPPER(TRIM(CAST(id_cliente AS TEXT))), '[^A-Z0-9]', '', 'g') = REGEXP_REPLACE(UPPER(TRIM($1)), '[^A-Z0-9]', '', 'g') THEN 0
+            ELSE 1
+          END
+        LIMIT 1`,
+      [payload.id_cliente, payload.direccion, payload.descripcion]
+    );
+    if (duplicated.rowCount) {
+      const updated = await pool.query(
+        `UPDATE public.clientes
+            SET descripcion = $1,
+                tipo_cliente = $2,
+                direccion = $3,
+                ruta = $4,
+                transporte = $5,
+                zona = $6,
+                vendedor = $7
+          WHERE ctid = $8::tid
+          RETURNING
+            CAST(id_cliente AS TEXT) AS id_cliente,
+            descripcion,
+            tipo_cliente,
+            direccion,
+            ruta,
+            transporte,
+            zona,
+            vendedor`,
+        [
+          payload.descripcion,
+          payload.tipo_cliente,
+          payload.direccion,
+          payload.ruta,
+          payload.transporte,
+          payload.zona,
+          payload.vendedor,
+          String(duplicated.rows[0].ctid),
+        ]
+      );
+      return res.json({ ok: true, updated: true, row: updated.rows[0] });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO public.clientes (
+         id_cliente,
+         descripcion,
+         tipo_cliente,
+         direccion,
+         ruta,
+         transporte,
+         zona,
+         vendedor
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING
+         CAST(id_cliente AS TEXT) AS id_cliente,
+         descripcion,
+         tipo_cliente,
+         direccion,
+         ruta,
+         transporte,
+         zona,
+         vendedor`,
+      [
+        payload.id_cliente,
+        payload.descripcion,
+        payload.tipo_cliente,
+        payload.direccion,
+        payload.ruta,
+        payload.transporte,
+        payload.zona,
+        payload.vendedor,
+      ]
+    );
+    return res.status(201).json({ ok: true, row: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/api/almacen09/cambios/razones', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
@@ -3062,8 +3826,8 @@ async function getAlmacen09StockActualRows(db, options = {}) {
      ),
      stock_validado AS (
        SELECT
-         UPPER(TRIM(p.codigo_producto)) AS codigo_producto,
-         p.descripcion AS producto,
+         UPPER(TRIM(COALESCE(NULLIF(ed.codigo_producto, ''), p.codigo_producto))) AS codigo_producto,
+         COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS producto,
          UPPER(TRIM(ed.numero_lote)) AS numero_lote,
          DATE(ec.fecha_hora) AS fecha_empaquetado,
          SUM(ed.cantidad)::int AS cantidad
@@ -3088,7 +3852,11 @@ async function getAlmacen09StockActualRows(db, options = {}) {
        WHERE ${stockDateWhere}
          AND TRIM(COALESCE(ed.numero_lote, '')) <> ''
          AND UPPER(TRIM(COALESCE(d.nombre, ''))) <> 'K FOOD'
-       GROUP BY UPPER(TRIM(p.codigo_producto)), p.descripcion, UPPER(TRIM(ed.numero_lote)), DATE(ec.fecha_hora)
+       GROUP BY
+         UPPER(TRIM(COALESCE(NULLIF(ed.codigo_producto, ''), p.codigo_producto))),
+         COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion),
+         UPPER(TRIM(ed.numero_lote)),
+         DATE(ec.fecha_hora)
      ),
      salidas AS (
        SELECT
@@ -3155,8 +3923,11 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 180);
+  const rifClienteRaw = normalizeSalidasText(req.body?.rif || req.body?.id_cliente, 40).toUpperCase();
   const direccionRaw = normalizeSalidasText(req.body?.direccion, 240);
   const responsableRaw = normalizeSalidasText(req.body?.responsable, 180);
+  const contactoRaw = normalizeSalidasText(req.body?.contacto, 180);
+  const telefonoRaw = normalizeSalidasText(req.body?.telefono, 20);
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
 
   const detalle = detalleRaw
@@ -3171,6 +3942,9 @@ app.post('/api/almacen09/cambios', async (req, res) => {
 
   if (!clienteRaw || !responsableRaw) {
     return res.status(400).json({ ok: false, error: 'cliente y responsable son obligatorios' });
+  }
+  if (!/^\d{4}-\d{7}$/.test(telefonoRaw)) {
+    return res.status(400).json({ ok: false, error: 'telefono debe tener formato XXXX-XXXXXXX' });
   }
   if (!detalle.length) {
     return res.status(400).json({ ok: false, error: 'detalle debe incluir productos con razon y cantidades validas' });
@@ -3209,26 +3983,35 @@ app.post('/api/almacen09/cambios', async (req, res) => {
     }
 
     const cambiosInsertados = [];
+    const grupoCambio = crypto.randomUUID();
     for (const item of detalle) {
       const insertResult = await client.query(
         `INSERT INTO cambios_registros (
            id_cliente,
+           grupo_cambio,
+           rif_cliente,
            nombre_cliente,
            direccion_id,
            direccion_texto,
            ruta_nombre,
            responsable,
+           contacto,
+           telefono,
            producto
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
          RETURNING id_cambio, created_at`,
         [
           clienteCatalog.id,
+          grupoCambio,
+          rifClienteRaw || null,
           clienteCatalog.value || clienteRaw,
           direccionCatalog.id,
           direccionCatalog.value || direccionRaw || null,
           rutaCambio || null,
           responsableRaw,
+          contactoRaw || null,
+          telefonoRaw,
           JSON.stringify([item]),
         ]
       );
@@ -3243,6 +4026,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
       cambiosInsertados.push({
         id_cambio: Number(inserted.id_cambio || 0),
         codigo_cambio: codigoCambio,
+        grupo_cambio: grupoCambio,
         created_at: inserted.created_at || null,
         producto: item,
       });
@@ -3556,9 +4340,17 @@ app.get('/productos', async (req, res) => {
         paquetes AS paquetes_por_cesta,
         sobre_piso
       FROM (
-        SELECT DISTINCT ON (id_producto) *
+        SELECT DISTINCT ON (UPPER(TRIM(codigo_producto))) *
         FROM productos
-        ORDER BY id_producto
+        WHERE TRIM(COALESCE(codigo_producto, '')) <> ''
+        ORDER BY
+          UPPER(TRIM(codigo_producto)),
+          COALESCE(activo, TRUE) DESC,
+          COALESCE(cestas, 0) DESC,
+          COALESCE(sobre_piso, 0) DESC,
+          COALESCE(paquetes, 0) DESC,
+          id_producto ASC,
+          ctid ASC
       ) productos_unicos
       ${whereSql}
       ORDER BY codigo_producto ASC
@@ -3578,9 +4370,17 @@ app.get('/productos', async (req, res) => {
       const countResult = await pool.query(
         `SELECT COUNT(*)::INT AS total
          FROM (
-           SELECT DISTINCT ON (id_producto) *
+           SELECT DISTINCT ON (UPPER(TRIM(codigo_producto))) *
            FROM productos
-           ORDER BY id_producto
+           WHERE TRIM(COALESCE(codigo_producto, '')) <> ''
+           ORDER BY
+             UPPER(TRIM(codigo_producto)),
+             COALESCE(activo, TRUE) DESC,
+             COALESCE(cestas, 0) DESC,
+             COALESCE(sobre_piso, 0) DESC,
+             COALESCE(paquetes, 0) DESC,
+             id_producto ASC,
+             ctid ASC
          ) productos_unicos
          ${whereSql}`,
         params
@@ -3617,9 +4417,17 @@ app.get('/api/control-inventario/producto-barcode', async (req, res) => {
          descripcion,
          codigo_barras
        FROM (
-         SELECT DISTINCT ON (id_producto) *
+         SELECT DISTINCT ON (UPPER(TRIM(codigo_producto))) *
          FROM productos
-         ORDER BY id_producto
+         WHERE TRIM(COALESCE(codigo_producto, '')) <> ''
+         ORDER BY
+           UPPER(TRIM(codigo_producto)),
+           COALESCE(activo, TRUE) DESC,
+           COALESCE(cestas, 0) DESC,
+           COALESCE(sobre_piso, 0) DESC,
+           COALESCE(paquetes, 0) DESC,
+           id_producto ASC,
+           ctid ASC
        ) productos_unicos
        WHERE COALESCE(activo, TRUE) = TRUE
          AND (
@@ -3659,32 +4467,42 @@ app.post('/productos', async (req, res) => {
   }
 
   try {
+    const cleanCodigo = String(codigo).trim().toUpperCase();
+    const cleanDescripcion = String(descripcion).trim().toUpperCase();
+    const cleanUnidad = String(unidad || 'PAQ').trim().toUpperCase();
+    const cleanPaquetes = Number.isFinite(Number(paquetes)) ? Number(paquetes) : 0;
+    const cleanSobrePiso = Number.isFinite(Number(sobre_piso)) ? Number(sobre_piso) : 0;
+
+    const existing = await pool.query(
+      `SELECT id_producto, codigo_producto, descripcion, COALESCE(activo, TRUE) AS activo
+         FROM productos
+        WHERE UPPER(TRIM(codigo_producto)) = $1
+        ORDER BY
+          COALESCE(activo, TRUE) DESC,
+          COALESCE(cestas, 0) DESC,
+          COALESCE(sobre_piso, 0) DESC,
+          COALESCE(paquetes, 0) DESC,
+          id_producto ASC
+        LIMIT 1`,
+      [cleanCodigo]
+    );
+
+    if (existing.rowCount) {
+      const product = existing.rows[0];
+      return res.status(409).json({
+        ok: false,
+        error: `El codigo ${cleanCodigo} ya existe para: ${product.descripcion}. Usa otro codigo para crear un producto nuevo.`,
+        product
+      });
+    }
+
     const result = await pool.query(
-      `INSERT INTO productos (codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso, activo)
-       VALUES ($1, $2, $3, $4, $5, TRUE)
-       ON CONFLICT (codigo_producto) DO UPDATE
-       SET descripcion = EXCLUDED.descripcion,
-           unidad_primaria = EXCLUDED.unidad_primaria,
-           paquetes = EXCLUDED.paquetes,
-           sobre_piso = EXCLUDED.sobre_piso,
-           activo = TRUE
-       RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, paquetes, sobre_piso`,
-      [
-        String(codigo).trim().toUpperCase(),
-        String(descripcion).trim().toUpperCase(),
-        String(unidad || 'PAQ').trim().toUpperCase(),
-        Number.isFinite(Number(paquetes)) ? Number(paquetes) : 0,
-         Number.isFinite(Number(sobre_piso)) ? Number(sobre_piso) : 0,
-      ]
+      `INSERT INTO productos (codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, cestas, sobre_piso, activo)
+       VALUES ($1, $1, $2, $3, $4, 0, $5, TRUE)
+       RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
+      [cleanCodigo, cleanDescripcion, cleanUnidad, cleanPaquetes, cleanSobrePiso]
     );
-    const barcodeResult = await pool.query(
-      `UPDATE productos
-          SET codigo_barras = UPPER(TRIM(codigo_producto))
-        WHERE id_producto = $1
-        RETURNING id_producto, codigo_producto, codigo_barras, descripcion, unidad_primaria, paquetes, sobre_piso`,
-      [result.rows[0].id_producto]
-    );
-    res.status(201).json({ ok: true, product: barcodeResult.rows[0] || result.rows[0] });
+    res.status(201).json({ ok: true, product: result.rows[0] });
   } catch (error) {
     if (error.code === '23505') {
       return res.status(409).json({ ok: false, error: 'Código de producto ya existe' });
@@ -3704,7 +4522,11 @@ app.delete('/productos/:codigo', async (req, res) => {
     await client.query('BEGIN');
 
     const productResult = await client.query(
-      'SELECT id_producto, codigo_producto, COALESCE(activo, TRUE) AS activo FROM productos WHERE LOWER(codigo_producto) = LOWER($1) LIMIT 1',
+      `SELECT id_producto, codigo_producto, COALESCE(activo, TRUE) AS activo
+         FROM productos
+        WHERE UPPER(TRIM(codigo_producto)) = UPPER(TRIM($1))
+        ORDER BY COALESCE(activo, TRUE) DESC, id_producto ASC
+        LIMIT 1`,
       [codigo]
     );
     if (!productResult.rowCount) {
@@ -3712,11 +4534,13 @@ app.delete('/productos/:codigo', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Producto no encontrado' });
     }
 
-    const idProducto = productResult.rows[0].id_producto;
     const wasActive = Boolean(productResult.rows[0].activo);
     const updateResult = await client.query(
-      'UPDATE productos SET activo = FALSE WHERE id_producto = $1 RETURNING id_producto, codigo_producto',
-      [idProducto]
+      `UPDATE productos
+          SET activo = FALSE
+        WHERE UPPER(TRIM(codigo_producto)) = UPPER(TRIM($1))
+        RETURNING id_producto, codigo_producto`,
+      [codigo]
     );
 
     await client.query('COMMIT');
@@ -3765,52 +4589,16 @@ app.post('/productos/purge-catalog', async (req, res) => {
       [keepCodes]
     );
 
-    const candidates = await client.query(
-      `SELECT
-         p.id_producto,
-         p.codigo_producto,
-         EXISTS(SELECT 1 FROM empaquetados_detalle ed WHERE ed.id_producto = p.id_producto) AS used_empaquetados,
-         EXISTS(SELECT 1 FROM control_inventario_guardia cg WHERE cg.id_producto = p.id_producto) AS used_control,
-         EXISTS(SELECT 1 FROM almacen09_salidas_detalle sd WHERE sd.id_producto = p.id_producto) AS used_salidas
-       FROM productos p
-       WHERE UPPER(TRIM(p.codigo_producto)) <> ALL($1::text[])
-       ORDER BY p.codigo_producto ASC`,
+    const archived = await client.query(
+      `UPDATE productos
+          SET activo = FALSE
+        WHERE UPPER(TRIM(codigo_producto)) <> ALL($1::text[])
+          AND COALESCE(activo, TRUE) = TRUE`,
       [keepCodes]
     );
-
-    const deletableIds = [];
+    const deletedCount = 0;
+    const archivedCount = Number(archived.rowCount || 0);
     const blockedRows = [];
-
-    for (const row of candidates.rows) {
-      const hasRefs = Boolean(row.used_empaquetados) || Boolean(row.used_control) || Boolean(row.used_salidas);
-      if (hasRefs) {
-        blockedRows.push(row);
-      } else {
-        deletableIds.push(Number(row.id_producto));
-      }
-    }
-
-    let deletedCount = 0;
-    if (deletableIds.length) {
-      const deleted = await client.query(
-        `DELETE FROM productos
-         WHERE id_producto = ANY($1::int[])`,
-        [deletableIds]
-      );
-      deletedCount = Number(deleted.rowCount || 0);
-    }
-
-    let archivedCount = 0;
-    if (blockedRows.length) {
-      const blockedIds = blockedRows.map((row) => Number(row.id_producto));
-      const archived = await client.query(
-        `UPDATE productos
-         SET activo = FALSE
-         WHERE id_producto = ANY($1::int[])`,
-        [blockedIds]
-      );
-      archivedCount = Number(archived.rowCount || 0);
-    }
 
     const finalCountResult = await client.query(
       `SELECT COUNT(*)::int AS total
@@ -3878,10 +4666,27 @@ app.post('/api/empaquetados', async (req, res) => {
       if (!item.id_producto || !item.cantidad || !item.numero_lote) {
         throw new Error('Cada item requiere id_producto, cantidad y numero_lote');
       }
+      const productSnapshot = await client.query(
+        `SELECT UPPER(TRIM(codigo_producto)) AS codigo_producto, descripcion
+           FROM productos
+          WHERE id_producto = $1
+          LIMIT 1`,
+        [Number(item.id_producto)]
+      );
+      if (!productSnapshot.rowCount) {
+        throw new Error(`Producto invalido: ${item.id_producto}`);
+      }
       await client.query(
-        `INSERT INTO empaquetados_detalle (id_cabecera, id_producto, cantidad, numero_lote)
-         VALUES ($1, $2, $3, $4)`,
-        [idCabecera, Number(item.id_producto), Number(item.cantidad), String(item.numero_lote).trim().toUpperCase()]
+        `INSERT INTO empaquetados_detalle (id_cabecera, id_producto, codigo_producto, producto, cantidad, numero_lote)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          idCabecera,
+          Number(item.id_producto),
+          productSnapshot.rows[0].codigo_producto,
+          productSnapshot.rows[0].descripcion,
+          Number(item.cantidad),
+          String(item.numero_lote).trim().toUpperCase()
+        ]
       );
     }
 
@@ -4090,6 +4895,12 @@ app.post('/api/control-inventario', async (req, res) => {
 
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'Consolidado').trim().toLowerCase();
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+  if (!canReadRegistrosTipo(auth, tipo)) {
+    return res.status(403).json({ ok: false, error: 'No autorizado para consultar esta seccion de resultados' });
+  }
+
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 500);
   const offset = Math.max(Number(req.query.offset || 0), 0);
   const desde = String(req.query.desde || '').trim();
@@ -4256,6 +5067,11 @@ app.get('/api/registros', async (req, res) => {
           cr.id_cambio AS "__ROW_ID",
           (cr.id_cambio::text || ':' || producto_item.ord::text) AS "__ROW_KEY",
           'cambios_registros'::text AS "__ROW_SOURCE",
+          cr.grupo_cambio AS "__CAMBIO_GROUP",
+          COALESCE(NULLIF(TRIM(cr.rif_cliente), ''), NULLIF(TRIM(ruta_meta.rif), ''), '') AS "__RIF_CLIENTE",
+          COALESCE(NULLIF(TRIM(cr.contacto), ''), '') AS "__CONTACTO_CAMBIO",
+          COALESCE(NULLIF(TRIM(cr.telefono), ''), '') AS "__TELEFONO_CAMBIO",
+          COALESCE(NULLIF(TRIM(ruta_meta.vendedor), ''), '') AS "__VENDEDOR_CLIENTE",
           TO_CHAR(${cambioTsVzExpr}, 'YYYY-MM-DD') AS "FECHA",
           COALESCE(NULLIF(TRIM(cr.codigo_cambio), ''), 'CAM' || LPAD(cr.id_cambio::text, 4, '0')) AS "Codigo de cambio",
           TO_CHAR(${cambioTsVzExpr}, 'DD/MM/YYYY HH24:MI') AS "Fecha de registro",
@@ -4288,19 +5104,32 @@ app.get('/api/registros', async (req, res) => {
           END
         ) WITH ORDINALITY AS producto_item(value, ord)
         LEFT JOIN LATERAL (
-          SELECT TRIM(COALESCE(c.ruta, '')) AS ruta
+          SELECT
+            TRIM(COALESCE(c.ruta, '')) AS ruta,
+            TRIM(COALESCE(c.id_cliente::text, '')) AS rif,
+            TRIM(COALESCE(c.vendedor, '')) AS vendedor
           FROM public.clientes c
-          WHERE LOWER(TRIM(COALESCE(c.descripcion, ''))) = LOWER(TRIM(cr.nombre_cliente))
-            AND (
-              TRIM(COALESCE(cr.direccion_texto, '')) = ''
-              OR LOWER(TRIM(COALESCE(c.direccion, ''))) = LOWER(TRIM(cr.direccion_texto))
+          WHERE (
+              (
+                TRIM(COALESCE(cr.rif_cliente, '')) <> ''
+                AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.id_cliente::text, ''))), '[^A-Z0-9]', '', 'g')
+                  = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.rif_cliente, ''))), '[^A-Z0-9]', '', 'g')
+              )
+              OR (
+                REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.descripcion, ''))), '[^A-Z0-9]', '', 'g')
+                  = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.nombre_cliente, ''))), '[^A-Z0-9]', '', 'g')
+                AND (
+                  TRIM(COALESCE(cr.direccion_texto, '')) = ''
+                  OR REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.direccion, ''))), '[^A-Z0-9]', '', 'g')
+                    = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.direccion_texto, ''))), '[^A-Z0-9]', '', 'g')
+                )
+              )
             )
-            AND TRIM(COALESCE(c.ruta, '')) <> ''
           ORDER BY
-            CASE
-              WHEN LOWER(TRIM(COALESCE(c.direccion, ''))) = LOWER(TRIM(COALESCE(cr.direccion_texto, ''))) THEN 0
-              ELSE 1
-            END,
+            CASE WHEN REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.id_cliente::text, ''))), '[^A-Z0-9]', '', 'g')
+                    = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.rif_cliente, ''))), '[^A-Z0-9]', '', 'g') THEN 0 ELSE 1 END,
+            CASE WHEN REGEXP_REPLACE(UPPER(TRIM(COALESCE(c.direccion, ''))), '[^A-Z0-9]', '', 'g')
+                    = REGEXP_REPLACE(UPPER(TRIM(COALESCE(cr.direccion_texto, ''))), '[^A-Z0-9]', '', 'g') THEN 0 ELSE 1 END,
             TRIM(COALESCE(c.ruta, '')) ASC
           LIMIT 1
         ) ruta_meta ON true
@@ -4558,8 +5387,8 @@ app.get('/api/registros', async (req, res) => {
                 THEN TO_CHAR(${almacenTsVzExpr}, 'DD/MM/YYYY HH24:MI')
               ELSE NULL
             END AS "Fecha Almacen09",
-            p.codigo_producto AS "CODIGO PRODUCTO",
-            p.descripcion AS "PRODUCTO",
+            COALESCE(NULLIF(TRIM(ed.codigo_producto), ''), p.codigo_producto) AS "CODIGO PRODUCTO",
+            COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS "PRODUCTO",
             ed.cantidad AS "CANTIDAD",
             d.nombre AS "ENTREGADO A",
             ec.numero_registro AS "NUMERO REGISTRO",
@@ -4726,7 +5555,11 @@ app.get('/api/registros', async (req, res) => {
              STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
-             STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
+             STRING_AGG(
+               DISTINCT COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion),
+               ' | '
+               ORDER BY COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion)
+             ) AS productos
            FROM (
              SELECT DISTINCT ON (id_detalle) *
              FROM empaquetados_detalle
@@ -4839,7 +5672,7 @@ app.get('/api/registros', async (req, res) => {
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
              ed.numero_lote AS "NUMERO DE LOTE",
-             p.descripcion AS "PRODUCTO",
+             COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS "PRODUCTO",
              ed.cantidad AS "CANTIDAD EMPAQUETADO",
              TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI') AS "FECHA EMPAQUETADO",
              NULL::int AS "CANTIDAD ALMACEN",
@@ -4870,7 +5703,11 @@ app.get('/api/registros', async (req, res) => {
              STRING_AGG(DISTINCT UPPER(TRIM(ed.numero_lote)), ' | ' ORDER BY UPPER(TRIM(ed.numero_lote))) AS lote_referencia,
              SUM(ed.cantidad)::int AS cantidad_empaquetado,
              MAX(ec.fecha_hora) AS fecha_empaquetado,
-             STRING_AGG(DISTINCT p.descripcion, ' | ' ORDER BY p.descripcion) AS productos
+             STRING_AGG(
+               DISTINCT COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion),
+               ' | '
+               ORDER BY COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion)
+             ) AS productos
            FROM (
              SELECT DISTINCT ON (id_detalle) *
              FROM empaquetados_detalle
@@ -4969,7 +5806,7 @@ app.get('/api/registros', async (req, res) => {
         ed.id_detalle AS "__ROW_ID",
         TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD HH24:MI:SS') AS "Marca temporal",
         TO_CHAR(ec.fecha_hora, 'YYYY-MM-DD') AS "FECHA",
-        p.descripcion AS "PRODUCTO",
+        COALESCE(NULLIF(TRIM(ed.producto), ''), p.descripcion) AS "PRODUCTO",
         ed.cantidad AS "CANTIDAD",
         d.nombre AS "ENTREGADO A",
         ec.numero_registro AS "NUMERO REGISTRO",
@@ -5015,26 +5852,41 @@ app.get('/api/registros', async (req, res) => {
 });
 
 app.post('/api/registros/delete', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const tipo = String(req.body?.tipo || '').trim().toLowerCase();
 
   const rowsRaw = Array.isArray(req.body?.rows) ? req.body.rows : [];
-  const rows = rowsRaw
+  const knownDeleteSources = new Set([
+    'empaquetados_detalle',
+    'historico_resultados_consolidado',
+    'mermas_detalle',
+    'control_inventario_guardia',
+    'cambios_registros',
+    'hojas_ruta_exportadas',
+  ]);
+  const normalizedRows = rowsRaw
     .map((row) => ({
       source: String(row?.source || '').trim().toLowerCase(),
       id: String(row?.id ?? '').trim(),
     }))
     .filter((row) => {
       if (!/^\d+$/.test(row.id) || row.id === '0') return false;
-      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle' || row.source === 'control_inventario_guardia' || row.source === 'cambios_registros' || row.source === 'hojas_ruta_exportadas';
+      return knownDeleteSources.has(row.source);
     });
+  const deniedRows = normalizedRows.filter((row) => !canDeleteResultadoSource(auth, row.source));
+  if (deniedRows.length) {
+    return res.status(403).json({ ok: false, error: 'No autorizado para borrar uno o mas registros seleccionados' });
+  }
+  const rows = normalizedRows.filter((row) => canDeleteResultadoSource(auth, row.source));
 
   const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  const legacyIds = legacyIdsRaw
-    .map((id) => Number(id))
-    .filter((id) => Number.isInteger(id) && id > 0);
+  const legacyIds = normalizeAuthRole(auth.role) === APP_ROLES.ADMIN
+    ? legacyIdsRaw
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    : [];
 
   const detalleIdsSet = new Set(legacyIds);
   const historicoIdsSet = new Set();
@@ -5663,6 +6515,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const documento = normalizeSalidasDocumento(req.body?.documento);
   const isFacturaDocumento = documento === SALIDAS_DOCUMENT_TYPES.FACTURA;
   const fechaEmisionRaw = String(req.body?.fecha_emision || '').trim();
+  const fechaVencimientoRaw = String(req.body?.fecha_vencimiento || req.body?.fecha_venc || '').trim();
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 160);
   const clienteRifRaw = normalizeSalidasText(req.body?.rif || req.body?.id_cliente, 40);
@@ -5678,6 +6531,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   const fechaEmision = /^\d{4}-\d{2}-\d{2}$/.test(fechaEmisionRaw)
     ? `${fechaEmisionRaw} 00:00:00`
     : fechaEmisionRaw;
+  const fechaVencimiento = /^\d{4}-\d{2}-\d{2}$/.test(fechaVencimientoRaw)
+    ? fechaVencimientoRaw
+    : '';
   const numeroControlProvided = Number.parseInt(numeroControlRaw, 10);
   const numeroControlManual = isFacturaDocumento && Number.isFinite(numeroControlProvided) && numeroControlProvided > 0
     ? Math.floor(numeroControlProvided)
@@ -5691,6 +6547,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
   }
   if (!clienteRaw || !zonaInputRaw || !direccionInputRaw || !fechaEmision) {
     return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios de la cabecera (cliente, zona, direccion y fecha)' });
+  }
+  if (fechaVencimientoRaw && !fechaVencimiento) {
+    return res.status(400).json({ ok: false, error: 'fecha_vencimiento debe tener formato YYYY-MM-DD' });
   }
 
   const detalle = detalleRaw
@@ -5917,6 +6776,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
          documento,
          numero_factura,
          fecha_emision,
+         fecha_vencimiento,
          cliente_id,
          cliente_nombre,
          vendedor_id,
@@ -5931,13 +6791,14 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
          direccion_texto,
          estado
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, 'emitida')
-       RETURNING id_factura, numero_control, documento, numero_factura, fecha_emision`,
+       VALUES ($1, $2, $3, $4, NULLIF($5, '')::date, $6, $7, $8, $9, $10, $11, $12, $13, NULL, NULL, $14, $15, 'emitida')
+       RETURNING id_factura, numero_control, documento, numero_factura, fecha_emision, fecha_vencimiento`,
       [
         numeroControl,
         documento,
         numeroFactura,
         fechaEmision,
+        fechaVencimiento,
         cliente.id,
         cliente.value,
         vendedor.id,
@@ -5986,6 +6847,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
         documento: facturaInsert.rows[0].documento,
         numero_factura: facturaInsert.rows[0].numero_factura,
         fecha_emision: facturaInsert.rows[0].fecha_emision,
+        fecha_vencimiento: facturaInsert.rows[0].fecha_vencimiento,
         lineas: detalle.length,
         cliente: cliente.value,
         vendedor: vendedor.value,
@@ -6005,6 +6867,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
   const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 500);
   const offset = Math.max(Number(req.query?.offset || 0), 0);
   const mes = String(req.query?.mes || '').trim();
@@ -6031,6 +6896,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
       params.push(documento);
       whereParts.push(`sf.documento = $${params.length}`);
     }
+    appendVendedorAccessFilter(whereParts, params, auth, 'sf.vendedor_nombre');
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const result = await pool.query(
       `SELECT
@@ -6039,6 +6905,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sf.documento,
          sf.numero_factura,
          TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD HH24:MI:SS') AS fecha_emision,
+         TO_CHAR(sf.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
          sf.cliente_id,
          sf.cliente_nombre,
          sf.vendedor_id,
@@ -6343,6 +7210,550 @@ app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
   }
 });
 
+function normalizeRouteResultText(value) {
+  return String(value || '').trim();
+}
+
+function makeRouteResultRouteKey(sheetId) {
+  return `hoja:${normalizeRouteResultText(sheetId)}`;
+}
+
+function formatRouteResultDate(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return normalizeRouteResultText(value);
+  return date.toISOString().slice(0, 10);
+}
+
+function makeRouteResultDisplayName(sheet) {
+  const routeName = normalizeRouteResultText(sheet.ruta_nombre) || 'SIN RUTA';
+  const date = formatRouteResultDate(sheet.fecha_entrega);
+  return date ? `${routeName} - ${date}` : routeName;
+}
+
+function normalizeRouteResultAddress(address) {
+  const value = normalizeRouteResultText(address);
+  if (!value) return '';
+  const comparable = normalizeSalidasLookupKey(value, 500);
+  if (comparable.includes('venezuela')) return value;
+  if (comparable.includes('caracas')) return `${value}, Venezuela`;
+  return `${value}, Caracas, Venezuela`;
+}
+
+function makeRouteResultClientKey(clientId, route, address) {
+  return [normalizeRouteResultText(clientId), normalizeRouteResultText(route), normalizeRouteResultText(address)].join('::');
+}
+
+function normalizeRouteResultFacturas(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+}
+
+function flattenRouteResultClients(sheet) {
+  const clients = [];
+  const routeKey = makeRouteResultRouteKey(sheet.id_hoja);
+  const routeName = normalizeRouteResultText(sheet.ruta_nombre) || 'SIN RUTA';
+  const routeDisplayName = makeRouteResultDisplayName(sheet);
+  const facturas = normalizeRouteResultFacturas(sheet.facturas);
+
+  facturas.forEach((invoice, index) => {
+    const clientId = normalizeRouteResultText(invoice?.numero_control || invoice?.id_factura || index + 1);
+    const address = normalizeRouteResultAddress(invoice?.direccion_texto);
+    const name = normalizeRouteResultText(invoice?.cliente_nombre);
+    const invoiceKey = `${sheet.id_hoja}:${clientId}:${normalizeRouteResultText(invoice?.numero_factura || invoice?.id_factura || index + 1)}`;
+    const key = makeRouteResultClientKey(invoiceKey, routeKey, address);
+    clients.push({
+      key,
+      sheetId: String(sheet.id_hoja),
+      rowNumber: index + 1,
+      clientId,
+      invoiceId: normalizeRouteResultText(invoice?.id_factura),
+      invoiceNumber: normalizeRouteResultText(invoice?.numero_factura),
+      controlNumber: normalizeRouteResultText(invoice?.numero_control),
+      name,
+      nombre_o_razon_social: name,
+      address,
+      originalAddress: normalizeRouteResultText(invoice?.direccion_texto),
+      route: routeKey,
+      routeName,
+      routeDisplayName,
+      zone: normalizeRouteResultText(invoice?.zona_nombre),
+      transport: normalizeRouteResultText(invoice?.transporte_nombre || sheet.numero_camion),
+      driver: normalizeRouteResultText(sheet.conductor),
+      truck: normalizeRouteResultText(sheet.numero_camion),
+      deliveryDate: formatRouteResultDate(sheet.fecha_entrega),
+      invoiceIssueDate: formatRouteResultDate(invoice?.fecha_emision),
+      invoiceDueDate: formatRouteResultDate(invoice?.fecha_vencimiento),
+      totalDispatches: Number(sheet.total_despachos || facturas.length || 0),
+      totalBaskets: Number(sheet.total_cestas || 0),
+      baskets: Number(invoice?.total_cestas || invoice?.cestas || invoice?.cantidad_cestas || 0),
+      delivered: invoice?.entregado === true,
+      detail: Array.isArray(invoice?.detalle) ? invoice.detalle : [],
+    });
+  });
+
+  return clients;
+}
+
+async function getRouteDeliveryStatusMap(clientKeys) {
+  const keys = Array.from(new Set((clientKeys || []).map((key) => String(key || '').trim()).filter(Boolean)));
+  const map = new Map();
+  if (!keys.length) return map;
+  const result = await pool.query(
+    `SELECT client_key, delivered, delivered_baskets, delivered_at, partial, partial_detail, updated_at
+     FROM delivery_status
+     WHERE client_key = ANY($1::text[])`,
+    [keys]
+  );
+  result.rows.forEach((row) => map.set(row.client_key, row));
+  return map;
+}
+
+function applyRouteDeliveryStatus(client, status) {
+  const delivered = status ? Boolean(status.delivered) : Boolean(client.delivered);
+  const partial = status ? Boolean(status.partial) && !delivered : false;
+  const partialDetail = Array.isArray(status?.partial_detail) ? status.partial_detail : [];
+  return {
+    ...client,
+    delivered,
+    partial,
+    deliveredBaskets: status ? Number(status.delivered_baskets || 0) : null,
+    deliveredAt: status?.delivered_at || null,
+    partialDetail,
+  };
+}
+
+function buildCompletedRouteResult(sheet, deliveryStatusMap) {
+  const clients = flattenRouteResultClients(sheet).map((client) =>
+    applyRouteDeliveryStatus(client, deliveryStatusMap.get(client.key))
+  );
+  const totalClients = clients.length;
+  const deliveredClients = clients.filter((client) => client.delivered).length;
+  const partialClients = clients.filter((client) => client.partial && !client.delivered).length;
+  const completedClients = deliveredClients + partialClients;
+  const pendingClients = Math.max(0, totalClients - completedClients);
+  if (totalClients <= 0 || pendingClients > 0) return null;
+
+  return {
+    id_hoja: Number(sheet.id_hoja || 0),
+    route: makeRouteResultRouteKey(sheet.id_hoja),
+    routeName: normalizeRouteResultText(sheet.ruta_nombre) || 'SIN RUTA',
+    displayName: makeRouteResultDisplayName(sheet),
+    deliveryDate: formatRouteResultDate(sheet.fecha_entrega),
+    createdAt: sheet.created_at || null,
+    driver: normalizeRouteResultText(sheet.conductor),
+    truck: normalizeRouteResultText(sheet.numero_camion),
+    totalClients,
+    deliveredClients,
+    partialClients,
+    completedClients,
+    pendingClients,
+    progressPercent: 100,
+    completed: true,
+    totalDispatches: Number(sheet.total_despachos || totalClients || 0),
+    totalBaskets: Number(sheet.total_cestas || 0),
+    fileName: normalizeRouteResultText(sheet.nombre_archivo),
+    clients,
+  };
+}
+
+function getTodayCaracasIsoDate() {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Caracas',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+  } catch (_) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+function dateOnlyToUtcMs(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const [year, month, day] = raw.split('-').map((part) => Number(part));
+  if (![year, month, day].every(Number.isInteger)) return null;
+  return Date.UTC(year, month - 1, day);
+}
+
+function diffDaysDateOnly(fromDate, toDate) {
+  const fromMs = dateOnlyToUtcMs(fromDate);
+  const toMs = dateOnlyToUtcMs(toDate);
+  if (fromMs === null || toMs === null) return null;
+  return Math.round((toMs - fromMs) / 86400000);
+}
+
+function getConciliacionEstado(fechaVencimiento, pago, todayIso = getTodayCaracasIsoDate()) {
+  const due = normalizeRouteResultText(fechaVencimiento);
+  const fechaPago = normalizeRouteResultText(pago?.fecha_pago);
+  if (fechaPago) {
+    return due && fechaPago > due ? 'pagada_tarde' : 'pagada';
+  }
+  if (!due) return 'sin_vencimiento';
+  const days = diffDaysDateOnly(todayIso, due);
+  if (days === null) return 'sin_vencimiento';
+  if (days < 0) return 'vencida';
+  if (days <= 3) return 'por_vencer';
+  return 'pendiente';
+}
+
+function getDeliveredProductsForConciliacion(client) {
+  const detail = Array.isArray(client?.detail) ? client.detail : [];
+  if (!detail.length) return [];
+  if (client?.delivered) {
+    return detail
+      .map((item) => ({
+        codigo: normalizeRouteResultText(item?.codigo_producto || item?.codigo),
+        producto: normalizeRouteResultText(item?.producto || item?.descripcion),
+        cantidad: Math.max(0, Math.trunc(Number(item?.cantidad || 0))),
+      }))
+      .filter((item) => item.codigo && item.producto && item.cantidad > 0);
+  }
+
+  if (!client?.partial) return [];
+  const partialDetail = Array.isArray(client.partialDetail) ? client.partialDetail : [];
+  const deliveredByName = new Map();
+  partialDetail.forEach((item) => {
+    const key = normalizeSalidasLookupKey(item?.producto, 240);
+    const qty = Math.max(0, Math.trunc(Number(item?.cantidadEntregada || 0)));
+    if (key && qty > 0) deliveredByName.set(key, qty);
+  });
+
+  return detail
+    .map((item) => {
+      const producto = normalizeRouteResultText(item?.producto || item?.descripcion);
+      const expected = Math.max(0, Math.trunc(Number(item?.cantidad || 0)));
+      const delivered = deliveredByName.get(normalizeSalidasLookupKey(producto, 240)) || 0;
+      return {
+        codigo: normalizeRouteResultText(item?.codigo_producto || item?.codigo),
+        producto,
+        cantidad: Math.min(expected || delivered, delivered),
+      };
+    })
+    .filter((item) => item.codigo && item.producto && item.cantidad > 0);
+}
+
+async function buildConciliacionRows(auth) {
+  const facturasWhere = [`LOWER(TRIM(COALESCE(sf.transporte_nombre, ''))) <> 'retiro'`];
+  const facturasParams = [];
+  if (normalizeAuthRole(auth?.role) === APP_ROLES.VENDEDOR) {
+    appendVendedorAccessFilter(facturasWhere, facturasParams, auth, 'sf.vendedor_nombre');
+  }
+
+  const facturasResult = await pool.query(
+    `SELECT
+       sf.id_factura,
+       sf.numero_control,
+       sf.documento,
+       sf.numero_factura,
+       TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+       TO_CHAR(sf.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
+       sf.cliente_nombre,
+       sf.vendedor_nombre,
+       sf.zona_nombre,
+       sf.ruta_nombre,
+       sf.direccion_texto
+     FROM (
+       SELECT DISTINCT ON (id_factura) *
+       FROM salidas_facturas
+       ORDER BY id_factura
+     ) sf
+     WHERE ${facturasWhere.join(' AND ')}`,
+    facturasParams
+  );
+  const facturaMap = new Map();
+  facturasResult.rows.forEach((row) => facturaMap.set(Number(row.id_factura), row));
+  if (!facturaMap.size) return [];
+
+  const sheetsResult = await pool.query(
+    `SELECT
+       id_hoja,
+       ruta_nombre,
+       fecha_entrega,
+       conductor,
+       numero_camion,
+       total_despachos,
+       total_cestas,
+       usuario,
+       nombre_archivo,
+       created_at,
+       COALESCE(facturas, '[]'::jsonb) AS facturas
+     FROM (
+       SELECT DISTINCT ON (id_hoja) *
+       FROM hojas_ruta_exportadas
+       ORDER BY id_hoja, created_at DESC
+     ) hr
+     WHERE COALESCE(jsonb_array_length(COALESCE(hr.facturas, '[]'::jsonb)), 0) > 0
+     ORDER BY hr.fecha_entrega DESC, hr.id_hoja DESC`
+  );
+
+  const clients = [];
+  sheetsResult.rows.forEach((sheet) => {
+    flattenRouteResultClients(sheet).forEach((client) => {
+      const idFactura = Number(client.invoiceId || 0);
+      if (!facturaMap.has(idFactura)) return;
+      clients.push(client);
+    });
+  });
+  if (!clients.length) return [];
+
+  const deliveryStatusMap = await getRouteDeliveryStatusMap(clients.map((client) => client.key));
+  const deliveredByFactura = new Map();
+  clients.forEach((client) => {
+    const withStatus = applyRouteDeliveryStatus(client, deliveryStatusMap.get(client.key));
+    if (!withStatus.delivered && !withStatus.partial) return;
+    const productos = getDeliveredProductsForConciliacion(withStatus);
+    if (!productos.length) return;
+    const idFactura = Number(withStatus.invoiceId || 0);
+    if (!idFactura || deliveredByFactura.has(idFactura)) return;
+    deliveredByFactura.set(idFactura, { client: withStatus, productos });
+  });
+  if (!deliveredByFactura.size) return [];
+
+  const ids = Array.from(deliveredByFactura.keys());
+  const pagosResult = await pool.query(
+    `SELECT
+       id_pago,
+       id_factura,
+       TO_CHAR(fecha_pago, 'YYYY-MM-DD') AS fecha_pago,
+       registrado_por,
+       COALESCE(observacion, '') AS observacion,
+       created_at,
+       updated_at
+     FROM conciliacion_pagos
+     WHERE id_factura = ANY($1::bigint[])`,
+    [ids]
+  );
+  const pagoMap = new Map();
+  pagosResult.rows.forEach((row) => pagoMap.set(Number(row.id_factura), row));
+
+  const todayIso = getTodayCaracasIsoDate();
+  return ids.map((idFactura) => {
+    const factura = facturaMap.get(idFactura);
+    const delivered = deliveredByFactura.get(idFactura);
+    const pago = pagoMap.get(idFactura) || null;
+    const fechaVencimiento = normalizeRouteResultText(factura?.fecha_vencimiento || delivered.client.invoiceDueDate);
+    const fechaEmision = normalizeRouteResultText(factura?.fecha_emision || delivered.client.invoiceIssueDate);
+    const diasParaVencer = fechaVencimiento ? diffDaysDateOnly(todayIso, fechaVencimiento) : null;
+    const diasCredito = fechaEmision && fechaVencimiento ? diffDaysDateOnly(fechaEmision, fechaVencimiento) : null;
+    return {
+      id_factura: idFactura,
+      documento: normalizeRouteResultText(factura.documento),
+      numero_factura: normalizeRouteResultText(factura.numero_factura),
+      numero_control: factura.numero_control === null ? null : Number(factura.numero_control),
+      cliente_nombre: normalizeRouteResultText(factura.cliente_nombre || delivered.client.name),
+      vendedor_nombre: normalizeRouteResultText(factura.vendedor_nombre),
+      zona_nombre: normalizeRouteResultText(factura.zona_nombre || delivered.client.zone),
+      ruta_nombre: normalizeRouteResultText(factura.ruta_nombre || delivered.client.routeName),
+      direccion_texto: normalizeRouteResultText(factura.direccion_texto || delivered.client.originalAddress),
+      fecha_emision: fechaEmision,
+      fecha_vencimiento: fechaVencimiento,
+      fecha_entrega: normalizeRouteResultText(delivered.client.deliveryDate),
+      estado_entrega: delivered.client.delivered ? 'entregado' : 'entrega_incompleta',
+      productos: delivered.productos,
+      total_productos_entregados: delivered.productos.reduce((sum, item) => sum + Number(item.cantidad || 0), 0),
+      pago,
+      estado_pago: getConciliacionEstado(fechaVencimiento, pago, todayIso),
+      dias_para_vencer: diasParaVencer,
+      dias_credito: diasCredito,
+    };
+  }).sort((a, b) => {
+    const order = { vencida: 0, por_vencer: 1, pendiente: 2, sin_vencimiento: 3, pagada_tarde: 4, pagada: 5 };
+    const byStatus = (order[a.estado_pago] ?? 9) - (order[b.estado_pago] ?? 9);
+    if (byStatus) return byStatus;
+    return String(a.fecha_vencimiento || '9999-12-31').localeCompare(String(b.fecha_vencimiento || '9999-12-31'));
+  });
+}
+
+app.get('/api/conciliacion-pagos', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  try {
+    const estado = normalizeSalidasText(req.query?.estado, 40);
+    const q = normalizeSalidasLookupKey(req.query?.q, 160);
+    const rows = await buildConciliacionRows(auth);
+    const filtered = rows.filter((row) => {
+      if (estado && row.estado_pago !== estado) return false;
+      if (!q) return true;
+      const haystack = normalizeSalidasLookupKey([
+        row.numero_factura,
+        row.numero_control,
+        row.cliente_nombre,
+        row.vendedor_nombre,
+        row.ruta_nombre,
+        row.direccion_texto,
+      ].join(' '), 800);
+      return haystack.includes(q);
+    });
+    return res.json({
+      ok: true,
+      rows: filtered,
+      total: filtered.length,
+      today: getTodayCaracasIsoDate(),
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.put('/api/conciliacion-pagos/:id_factura', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  const idFactura = Number(req.params?.id_factura);
+  const fechaPago = String(req.body?.fecha_pago || '').trim();
+  const observacion = normalizeSalidasText(req.body?.observacion, 500);
+  if (!Number.isInteger(idFactura) || idFactura <= 0) {
+    return res.status(400).json({ ok: false, error: 'Factura invalida.' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fechaPago)) {
+    return res.status(400).json({ ok: false, error: 'fecha_pago debe tener formato YYYY-MM-DD' });
+  }
+
+  try {
+    const rows = await buildConciliacionRows(auth);
+    const target = rows.find((row) => Number(row.id_factura) === idFactura);
+    if (!target) {
+      return res.status(404).json({ ok: false, error: 'Factura no entregada o no disponible para este usuario.' });
+    }
+    if (!target.fecha_vencimiento) {
+      return res.status(409).json({ ok: false, error: 'Esta factura no tiene fecha de vencimiento registrada.' });
+    }
+    if (fechaPago > target.fecha_vencimiento) {
+      return res.status(409).json({ ok: false, error: 'La fecha de pago no puede ser posterior al vencimiento.' });
+    }
+    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR && getTodayCaracasIsoDate() > target.fecha_vencimiento) {
+      return res.status(409).json({ ok: false, error: 'Esta factura ya vencio. Solicita conciliacion administrativa.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO conciliacion_pagos (
+         id_factura,
+         fecha_pago,
+         registrado_por,
+         observacion,
+         updated_at
+       )
+       VALUES ($1, $2::date, $3, $4, NOW())
+       ON CONFLICT (id_factura) DO UPDATE
+         SET fecha_pago = EXCLUDED.fecha_pago,
+             registrado_por = EXCLUDED.registrado_por,
+             observacion = EXCLUDED.observacion,
+             updated_at = NOW()
+       RETURNING id_pago, id_factura, TO_CHAR(fecha_pago, 'YYYY-MM-DD') AS fecha_pago, registrado_por, COALESCE(observacion, '') AS observacion`,
+      [idFactura, fechaPago, normalizeAuthUsername(auth.username), observacion]
+    );
+
+    return res.json({ ok: true, pago: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/resultados/rutas-completadas', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
+  const offset = Math.max(Number(req.query.offset || 0), 0);
+  const desde = String(req.query.desde || '').trim();
+  const hasta = String(req.query.hasta || '').trim();
+  const mes = String(req.query.mes || '').trim();
+  const anio = String(req.query.anio || '').trim();
+  const ruta = normalizeSalidasText(req.query.ruta, 120);
+  const hasDesde = /^\d{4}-\d{2}-\d{2}$/.test(desde);
+  const hasHasta = /^\d{4}-\d{2}-\d{2}$/.test(hasta);
+  const hasMesNumero = /^(0[1-9]|1[0-2])$/.test(mes);
+  const hasAnio = /^\d{4}$/.test(anio);
+
+  try {
+    const whereParts = [`COALESCE(jsonb_array_length(COALESCE(hr.facturas, '[]'::jsonb)), 0) > 0`];
+    const params = [];
+
+    if (hasDesde) {
+      params.push(desde);
+      whereParts.push(`hr.fecha_entrega >= $${params.length}::date`);
+    }
+    if (hasHasta) {
+      params.push(hasta);
+      whereParts.push(`hr.fecha_entrega <= $${params.length}::date`);
+    }
+    if (hasMesNumero) {
+      params.push(mes);
+      whereParts.push(`TO_CHAR(hr.fecha_entrega, 'MM') = $${params.length}`);
+    }
+    if (hasAnio) {
+      params.push(anio);
+      whereParts.push(`TO_CHAR(hr.fecha_entrega, 'YYYY') = $${params.length}`);
+    }
+    if (ruta) {
+      params.push(`%${ruta}%`);
+      whereParts.push(`COALESCE(hr.ruta_nombre, '') ILIKE $${params.length}`);
+    }
+    if (normalizeAuthRole(auth.role) === APP_ROLES.VENDEDOR) {
+      params.push(normalizeAuthUsername(auth.username));
+      whereParts.push(`REGEXP_REPLACE(UPPER(TRIM(COALESCE(hr.usuario, ''))), '[^A-Z0-9]', '', 'g') = $${params.length}`);
+    }
+
+    const result = await pool.query(
+      `SELECT
+         hr.id_hoja,
+         hr.ruta_nombre,
+         hr.fecha_entrega,
+         hr.conductor,
+         hr.numero_camion,
+         hr.total_despachos,
+         hr.total_cestas,
+         hr.usuario,
+         hr.nombre_archivo,
+         hr.created_at,
+         COALESCE(hr.facturas, '[]'::jsonb) AS facturas
+       FROM (
+         SELECT DISTINCT ON (id_hoja) *
+         FROM hojas_ruta_exportadas
+         ORDER BY id_hoja, created_at DESC
+       ) hr
+       WHERE ${whereParts.join(' AND ')}
+       ORDER BY hr.fecha_entrega DESC, hr.id_hoja DESC`,
+      params
+    );
+
+    const allClientKeys = [];
+    result.rows.forEach((sheet) => {
+      flattenRouteResultClients(sheet).forEach((client) => allClientKeys.push(client.key));
+    });
+    const deliveryStatusMap = await getRouteDeliveryStatusMap(allClientKeys);
+    const completedRoutes = result.rows
+      .map((sheet) => buildCompletedRouteResult(sheet, deliveryStatusMap))
+      .filter(Boolean);
+    const rows = completedRoutes.slice(offset, offset + limit);
+
+    return res.json({
+      ok: true,
+      rows,
+      total: completedRoutes.length,
+      hasMore: offset + limit < completedRoutes.length,
+      offset,
+      limit,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/api/hoja-ruta', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR, APP_ROLES.CONDUCTOR]);
   if (!auth) return;
@@ -6411,6 +7822,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
          sf.numero_control,
          sf.numero_factura,
          TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+         TO_CHAR(sf.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
          sf.cliente_nombre,
          sf.vendedor_nombre,
          sf.zona_nombre,
@@ -6458,6 +7870,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
           numero_control: row.numero_control,
           numero_factura: row.numero_factura,
           fecha_emision: row.fecha_emision,
+          fecha_vencimiento: row.fecha_vencimiento,
           cliente_nombre: row.cliente_nombre,
           vendedor_nombre: row.vendedor_nombre,
           zona_nombre: row.zona_nombre,
@@ -6493,7 +7906,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
 });
 
 app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const detalleIds = Array.isArray(req.body?.detalle_ids)
@@ -6680,10 +8093,14 @@ async function startServer() {
     ['ensureIdempotencyRequestsTable', ensureIdempotencyRequestsTable],
     ['ensureCambiosProductosTables', ensureCambiosProductosTables],
     ['ensureProductosSoftDelete', ensureProductosSoftDelete],
+    ['ensureProductosAuditTable', ensureProductosAuditTable],
+    ['ensureEmpaquetadosDetalleSnapshotColumns', ensureEmpaquetadosDetalleSnapshotColumns],
     ['ensureHistoricoResultadosTable', ensureHistoricoResultadosTable],
     ['ensureControlInventarioTable', ensureControlInventarioTable],
     ['ensureMermaTables', ensureMermaTables],
     ['ensureSalidas09Tables', ensureSalidas09Tables],
+    ['ensureRouteDeliveryTables', ensureRouteDeliveryTables],
+    ['ensureIntegratedVrpTables', integratedVrpRoutes.ensureDatabaseReady],
     ['ensurePerformanceIndexes', ensurePerformanceIndexes],
     ['dropLegacyUnusedTables', dropLegacyUnusedTables],
     ['ensureInitialAdminUsers', ensureInitialAdminUsers],

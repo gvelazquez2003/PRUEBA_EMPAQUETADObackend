@@ -388,6 +388,7 @@ INSERT INTO motivos_merma (nombre) VALUES
 ('Burbuja/Mancha en la Corona'),
 ('Alveolado/Cavidad'),
 ('Crudo'),
+('QUEMADO'),
 ('Color'),
 ('Fermentado'),
 ('Pan Pequeno'),
