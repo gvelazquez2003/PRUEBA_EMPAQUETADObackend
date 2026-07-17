@@ -326,6 +326,26 @@ function appendVendedorAccessFilter(whereParts, params, auth, columnSql = 'vende
   )`);
 }
 
+function canReadRegistrosTipo(auth, tipo) {
+  const role = normalizeAuthRole(auth?.role);
+  const cleanTipo = String(tipo || '').trim().toLowerCase();
+  if (role === APP_ROLES.ADMIN) return true;
+  if (role === APP_ROLES.FACTURACION) {
+    return cleanTipo === 'cambios' || cleanTipo === 'hojas-ruta';
+  }
+  return false;
+}
+
+function canDeleteResultadoSource(auth, source) {
+  const role = normalizeAuthRole(auth?.role);
+  const cleanSource = String(source || '').trim().toLowerCase();
+  if (role === APP_ROLES.ADMIN) return true;
+  if (role === APP_ROLES.FACTURACION) {
+    return cleanSource === 'cambios_registros' || cleanSource === 'hojas_ruta_exportadas';
+  }
+  return false;
+}
+
 function isValidAuthUsername(username) {
   const clean = String(username || '');
   return /^[A-Z0-9]{2,20}$/.test(clean) && /[A-Z]/.test(clean);
@@ -4425,6 +4445,12 @@ app.post('/api/control-inventario', async (req, res) => {
 
 app.get('/api/registros', async (req, res) => {
   const tipo = String(req.query.tipo || 'Consolidado').trim().toLowerCase();
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+  if (!canReadRegistrosTipo(auth, tipo)) {
+    return res.status(403).json({ ok: false, error: 'No autorizado para consultar esta seccion de resultados' });
+  }
+
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 500);
   const offset = Math.max(Number(req.query.offset || 0), 0);
   const desde = String(req.query.desde || '').trim();
@@ -5376,26 +5402,41 @@ app.get('/api/registros', async (req, res) => {
 });
 
 app.post('/api/registros/delete', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const tipo = String(req.body?.tipo || '').trim().toLowerCase();
 
   const rowsRaw = Array.isArray(req.body?.rows) ? req.body.rows : [];
-  const rows = rowsRaw
+  const knownDeleteSources = new Set([
+    'empaquetados_detalle',
+    'historico_resultados_consolidado',
+    'mermas_detalle',
+    'control_inventario_guardia',
+    'cambios_registros',
+    'hojas_ruta_exportadas',
+  ]);
+  const normalizedRows = rowsRaw
     .map((row) => ({
       source: String(row?.source || '').trim().toLowerCase(),
       id: String(row?.id ?? '').trim(),
     }))
     .filter((row) => {
       if (!/^\d+$/.test(row.id) || row.id === '0') return false;
-      return row.source === 'empaquetados_detalle' || row.source === 'historico_resultados_consolidado' || row.source === 'mermas_detalle' || row.source === 'control_inventario_guardia' || row.source === 'cambios_registros' || row.source === 'hojas_ruta_exportadas';
+      return knownDeleteSources.has(row.source);
     });
+  const deniedRows = normalizedRows.filter((row) => !canDeleteResultadoSource(auth, row.source));
+  if (deniedRows.length) {
+    return res.status(403).json({ ok: false, error: 'No autorizado para borrar uno o mas registros seleccionados' });
+  }
+  const rows = normalizedRows.filter((row) => canDeleteResultadoSource(auth, row.source));
 
   const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  const legacyIds = legacyIdsRaw
-    .map((id) => Number(id))
-    .filter((id) => Number.isInteger(id) && id > 0);
+  const legacyIds = normalizeAuthRole(auth.role) === APP_ROLES.ADMIN
+    ? legacyIdsRaw
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    : [];
 
   const detalleIdsSet = new Set(legacyIds);
   const historicoIdsSet = new Set();
@@ -6376,6 +6417,9 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  if (!auth) return;
+
   const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 500);
   const offset = Math.max(Number(req.query?.offset || 0), 0);
   const mes = String(req.query?.mes || '').trim();
@@ -6402,6 +6446,7 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
       params.push(documento);
       whereParts.push(`sf.documento = $${params.length}`);
     }
+    appendVendedorAccessFilter(whereParts, params, auth, 'sf.vendedor_nombre');
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const result = await pool.query(
       `SELECT
@@ -7411,7 +7456,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
 });
 
 app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const detalleIds = Array.isArray(req.body?.detalle_ids)
