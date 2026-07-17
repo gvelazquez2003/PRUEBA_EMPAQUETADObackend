@@ -3594,6 +3594,45 @@ app.post('/api/clientes-admin/actualizar', async (req, res) => {
   }
 });
 
+app.post('/api/clientes-admin/eliminar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede eliminar clientes.' });
+  }
+
+  const rowKey = normalizeSalidasText(req.body?.row_key, 40);
+  if (!rowKey) {
+    return res.status(400).json({ ok: false, error: 'Selecciona un cliente antes de eliminar.' });
+  }
+
+  try {
+    const deleted = await pool.query(
+      `DELETE FROM public.clientes
+        WHERE ctid = $1::tid
+        RETURNING
+          CAST(id_cliente AS TEXT) AS id_cliente,
+          descripcion,
+          tipo_cliente,
+          direccion,
+          ruta,
+          transporte,
+          zona,
+          vendedor`,
+      [rowKey]
+    );
+
+    if (!deleted.rowCount) {
+      return res.status(404).json({ ok: false, error: 'No se encontro el cliente seleccionado. Recarga la busqueda.' });
+    }
+
+    return res.json({ ok: true, deleted: true, row: deleted.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.post('/api/clientes-catalogo', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
