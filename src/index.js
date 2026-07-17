@@ -2379,11 +2379,20 @@ function normalizeClienteDireccionMeta(row) {
   };
 }
 
+function cleanClienteCatalogDescription(value) {
+  return normalizeSalidasText(value, 200)
+    .toUpperCase()
+    .replace(/\b(?:N[°º]?\s*(?:DE\s*)?FACTURA|NRO\.?\s*FACTURA|NUM(?:ERO)?\.?\s*FACTURA|NOTA\s+ENTREGA|FACTURA)\s*:?\s*\d+[\s\S]*$/i, '')
+    .replace(/\b(?:RIF|DIRECCION|DIREC\.?|DIR\.?|FEC\.?|CONDIC|VENDEDOR|TRANSPORTE)\b[\s\S]*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function normalizeClienteCatalogPayload(payload) {
   const idCliente = normalizeSalidasText(payload?.id_cliente || payload?.rif, 40).toUpperCase();
   return {
     id_cliente: idCliente,
-    descripcion: normalizeSalidasText(payload?.descripcion || payload?.cliente, 200).toUpperCase(),
+    descripcion: cleanClienteCatalogDescription(payload?.descripcion || payload?.cliente),
     tipo_cliente: normalizeSalidasText(payload?.tipo_cliente, 80).toUpperCase(),
     direccion: normalizeSalidasText(payload?.direccion, 500).toUpperCase(),
     ruta: normalizeSalidasText(payload?.ruta, 120).toUpperCase(),
@@ -3195,7 +3204,7 @@ app.get('/api/almacen09/vendedores', async (req, res) => {
 });
 
 app.get('/api/clientes-catalogo/opciones', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   try {
@@ -3222,7 +3231,7 @@ app.get('/api/clientes-catalogo/opciones', async (req, res) => {
 });
 
 app.post('/api/clientes-catalogo', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
 
   const payload = normalizeClienteCatalogPayload(req.body || {});
@@ -3241,15 +3250,53 @@ app.post('/api/clientes-catalogo', async (req, res) => {
 
   try {
     const duplicated = await pool.query(
-      `SELECT 1
+      `SELECT ctid
          FROM public.clientes
-        WHERE regexp_replace(UPPER(TRIM(CAST(id_cliente AS TEXT))), '^([A-Z])-', '\\1') = regexp_replace(UPPER(TRIM($1)), '^([A-Z])-', '\\1')
-          AND LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($2))
+        WHERE LOWER(TRIM(COALESCE(direccion, ''))) = LOWER(TRIM($2))
+          AND (
+            REGEXP_REPLACE(UPPER(TRIM(CAST(id_cliente AS TEXT))), '[^A-Z0-9]', '', 'g') = REGEXP_REPLACE(UPPER(TRIM($1)), '[^A-Z0-9]', '', 'g')
+            OR LOWER(TRIM(COALESCE(descripcion, ''))) = LOWER(TRIM($3))
+          )
+        ORDER BY
+          CASE
+            WHEN REGEXP_REPLACE(UPPER(TRIM(CAST(id_cliente AS TEXT))), '[^A-Z0-9]', '', 'g') = REGEXP_REPLACE(UPPER(TRIM($1)), '[^A-Z0-9]', '', 'g') THEN 0
+            ELSE 1
+          END
         LIMIT 1`,
-      [payload.id_cliente, payload.direccion]
+      [payload.id_cliente, payload.direccion, payload.descripcion]
     );
     if (duplicated.rowCount) {
-      return res.status(409).json({ ok: false, error: 'Ya existe un cliente con ese RIF/C.I. y esa direccion.' });
+      const updated = await pool.query(
+        `UPDATE public.clientes
+            SET descripcion = $1,
+                tipo_cliente = $2,
+                direccion = $3,
+                ruta = $4,
+                transporte = $5,
+                zona = $6,
+                vendedor = $7
+          WHERE ctid = $8::tid
+          RETURNING
+            CAST(id_cliente AS TEXT) AS id_cliente,
+            descripcion,
+            tipo_cliente,
+            direccion,
+            ruta,
+            transporte,
+            zona,
+            vendedor`,
+        [
+          payload.descripcion,
+          payload.tipo_cliente,
+          payload.direccion,
+          payload.ruta,
+          payload.transporte,
+          payload.zona,
+          payload.vendedor,
+          String(duplicated.rows[0].ctid),
+        ]
+      );
+      return res.json({ ok: true, updated: true, row: updated.rows[0] });
     }
 
     const result = await pool.query(
