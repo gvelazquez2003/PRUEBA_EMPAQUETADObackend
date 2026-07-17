@@ -2402,6 +2402,50 @@ function normalizeClienteCatalogPayload(payload) {
   };
 }
 
+function normalizeClienteAuditKey(value) {
+  return stripDiacritics(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 80);
+}
+
+function hasInvoiceNoiseInClienteText(value) {
+  const clean = stripDiacritics(value).toUpperCase();
+  return /\b(N[°º]?\s*(?:DE\s*)?FACTURA|NRO\.?\s*FACTURA|NUM(?:ERO)?\.?\s*FACTURA|NOTA\s+ENTREGA|DESCRIPCION|CODIGO|SUBTOTAL|TOTAL\s+(?:FACTURA|CON|GENERAL)?|BASE\s+IMPONIBLE|I\.?\s*V\.?\s*A\.?)\b/.test(clean);
+}
+
+function getClienteAuditIssues(row, idDuplicateCount) {
+  const issues = [];
+  const idKey = normalizeClienteAuditKey(row.id_cliente);
+  const descripcion = normalizeSalidasText(row.descripcion, 500);
+  const direccion = normalizeSalidasText(row.direccion, 800);
+  const ruta = normalizeSalidasText(row.ruta, 160);
+  const cleanDescripcion = stripDiacritics(descripcion).toUpperCase();
+  const cleanDireccion = stripDiacritics(direccion).toUpperCase();
+  const cleanRuta = stripDiacritics(ruta).toUpperCase();
+  const emptyValues = new Set(['', '0', '-', 'N/A', 'NA', 'S/D', 'SD', 'SIN DIRECCION', 'SIN DIRECCION FISCAL']);
+
+  if (!idKey || idKey === '0') {
+    issues.push({ code: 'id_invalido', label: 'ID/RIF vacio o 0' });
+  } else if (idDuplicateCount > 1) {
+    issues.push({ code: 'id_repetido', label: 'ID/RIF repetido' });
+  }
+
+  if (emptyValues.has(cleanDescripcion) || hasInvoiceNoiseInClienteText(descripcion) || cleanDescripcion.length > 180) {
+    issues.push({ code: 'descripcion_error', label: 'Descripcion con texto de factura' });
+  }
+
+  if (emptyValues.has(cleanDireccion) || hasInvoiceNoiseInClienteText(direccion)) {
+    issues.push({ code: 'direccion_error', label: 'Direccion vacia o contaminada' });
+  }
+
+  if (!cleanRuta || cleanRuta.includes('REVISAR MANUALMENTE')) {
+    issues.push({ code: 'ruta_error', label: 'Ruta por revisar manualmente' });
+  }
+
+  return issues;
+}
+
 async function getClienteCatalogOptions(columnName, fallbackValues = []) {
   const allowedColumns = new Set(['tipo_cliente', 'ruta', 'transporte', 'zona', 'vendedor']);
   if (!allowedColumns.has(columnName)) return fallbackValues;
@@ -3225,6 +3269,326 @@ app.get('/api/clientes-catalogo/opciones', async (req, res) => {
         vendedor: vendedores,
       },
     });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/clientes-errores', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede ver esta auditoria.' });
+  }
+
+  const filters = {
+    q: stripDiacritics(req.query?.q || '').toUpperCase().trim(),
+    transporte: normalizeSalidasText(req.query?.transporte, 120).toUpperCase(),
+    tipo_cliente: normalizeSalidasText(req.query?.tipo_cliente, 120).toUpperCase(),
+    ruta: normalizeSalidasText(req.query?.ruta, 160).toUpperCase(),
+    zona: normalizeSalidasText(req.query?.zona, 160).toUpperCase(),
+    error: normalizeSalidasText(req.query?.error, 80).toLowerCase(),
+  };
+  const limit = Math.min(Math.max(Number(req.query?.limit || 80), 1), 300);
+  const offset = Math.max(Number(req.query?.offset || 0), 0);
+  const issueLabels = {
+    id_invalido: 'ID/RIF vacio o 0',
+    id_repetido: 'ID/RIF repetido',
+    descripcion_error: 'Descripcion con texto de factura',
+    direccion_error: 'Direccion vacia o contaminada',
+    ruta_error: 'Ruta por revisar manualmente',
+  };
+
+  const uniqueSorted = (values) => Array.from(new Set(values.map((value) => normalizeSalidasText(value, 160).toUpperCase()).filter(Boolean)))
+    .sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         ctid::text AS row_key,
+         CAST(id_cliente AS TEXT) AS id_cliente,
+         TRIM(COALESCE(descripcion, '')) AS descripcion,
+         TRIM(COALESCE(tipo_cliente, '')) AS tipo_cliente,
+         TRIM(COALESCE(direccion, '')) AS direccion,
+         TRIM(COALESCE(ruta, '')) AS ruta,
+         TRIM(COALESCE(transporte, '')) AS transporte,
+         TRIM(COALESCE(zona, '')) AS zona,
+         TRIM(COALESCE(vendedor, '')) AS vendedor
+       FROM public.clientes
+       ORDER BY TRIM(COALESCE(descripcion, '')) ASC, CAST(id_cliente AS TEXT) ASC`
+    );
+
+    const idCounts = new Map();
+    result.rows.forEach((row) => {
+      const key = normalizeClienteAuditKey(row.id_cliente);
+      if (!key) return;
+      idCounts.set(key, (idCounts.get(key) || 0) + 1);
+    });
+
+    const audited = result.rows
+      .map((row) => {
+        const idKey = normalizeClienteAuditKey(row.id_cliente);
+        const issues = getClienteAuditIssues(row, idCounts.get(idKey) || 0);
+        return {
+          row_key: row.row_key,
+          id_cliente: normalizeSalidasText(row.id_cliente, 80),
+          descripcion: normalizeSalidasText(row.descripcion, 240),
+          tipo_cliente: normalizeSalidasText(row.tipo_cliente, 120),
+          direccion: normalizeSalidasText(row.direccion, 800),
+          ruta: normalizeSalidasText(row.ruta, 160),
+          transporte: normalizeSalidasText(row.transporte, 120),
+          zona: normalizeSalidasText(row.zona, 160),
+          vendedor: normalizeSalidasText(row.vendedor, 160),
+          error_codes: issues.map((issue) => issue.code),
+          errores: issues.map((issue) => issue.label).join(' | '),
+          error_count: issues.length,
+        };
+      })
+      .filter((row) => row.error_count > 0);
+
+    const options = {
+      transporte: uniqueSorted(audited.map((row) => row.transporte)),
+      tipo_cliente: uniqueSorted(audited.map((row) => row.tipo_cliente)),
+      ruta: uniqueSorted(audited.map((row) => row.ruta)),
+      zona: uniqueSorted(audited.map((row) => row.zona)),
+      errores: Object.entries(issueLabels)
+        .filter(([code]) => audited.some((row) => row.error_codes.includes(code)))
+        .map(([code, label]) => ({ code, label })),
+    };
+
+    const filtered = audited.filter((row) => {
+      if (filters.transporte && normalizeSalidasText(row.transporte, 120).toUpperCase() !== filters.transporte) return false;
+      if (filters.tipo_cliente && normalizeSalidasText(row.tipo_cliente, 120).toUpperCase() !== filters.tipo_cliente) return false;
+      if (filters.ruta && normalizeSalidasText(row.ruta, 160).toUpperCase() !== filters.ruta) return false;
+      if (filters.zona && normalizeSalidasText(row.zona, 160).toUpperCase() !== filters.zona) return false;
+      if (filters.error && !row.error_codes.includes(filters.error)) return false;
+      if (filters.q) {
+        const haystack = stripDiacritics([
+          row.id_cliente,
+          row.descripcion,
+          row.tipo_cliente,
+          row.direccion,
+          row.ruta,
+          row.transporte,
+          row.zona,
+          row.vendedor,
+          row.errores,
+        ].join(' ')).toUpperCase();
+        if (!haystack.includes(filters.q)) return false;
+      }
+      return true;
+    });
+
+    filtered.sort((a, b) => {
+      const errorDiff = Number(b.error_count || 0) - Number(a.error_count || 0);
+      if (errorDiff !== 0) return errorDiff;
+      return String(a.descripcion || '').localeCompare(String(b.descripcion || ''), 'es', { sensitivity: 'base' });
+    });
+
+    const counters = {
+      total: filtered.length,
+      id_invalido: 0,
+      id_repetido: 0,
+      descripcion_error: 0,
+      direccion_error: 0,
+      ruta_error: 0,
+    };
+    filtered.forEach((row) => {
+      row.error_codes.forEach((code) => {
+        if (Object.prototype.hasOwnProperty.call(counters, code)) counters[code] += 1;
+      });
+    });
+
+    const rows = filtered.slice(offset, offset + limit);
+    return res.json({
+      ok: true,
+      rows,
+      total: filtered.length,
+      hasMore: offset + rows.length < filtered.length,
+      counters,
+      options,
+      limit,
+      offset,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/clientes-admin/buscar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede editar clientes.' });
+  }
+
+  const rawField = normalizeSalidasText(req.query?.field, 60).toLowerCase();
+  const q = normalizeSalidasText(req.query?.q, 220);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 60), 1), 200);
+  const fieldMap = {
+    id_cliente: 'CAST(id_cliente AS TEXT)',
+    descripcion: "COALESCE(descripcion, '')",
+    tipo_cliente: "COALESCE(tipo_cliente, '')",
+    direccion: "COALESCE(direccion, '')",
+    ruta: "COALESCE(ruta, '')",
+    transporte: "COALESCE(transporte, '')",
+    zona: "COALESCE(zona, '')",
+    vendedor: "COALESCE(vendedor, '')",
+  };
+  const field = Object.prototype.hasOwnProperty.call(fieldMap, rawField) ? rawField : 'todos';
+
+  try {
+    const params = [];
+    const whereParts = [];
+    if (q) {
+      params.push(`%${q}%`);
+      if (field === 'todos') {
+        whereParts.push(`(
+          CAST(id_cliente AS TEXT) ILIKE $${params.length}
+          OR COALESCE(descripcion, '') ILIKE $${params.length}
+          OR COALESCE(tipo_cliente, '') ILIKE $${params.length}
+          OR COALESCE(direccion, '') ILIKE $${params.length}
+          OR COALESCE(ruta, '') ILIKE $${params.length}
+          OR COALESCE(transporte, '') ILIKE $${params.length}
+          OR COALESCE(zona, '') ILIKE $${params.length}
+          OR COALESCE(vendedor, '') ILIKE $${params.length}
+        )`);
+      } else {
+        whereParts.push(`${fieldMap[field]} ILIKE $${params.length}`);
+      }
+    }
+    params.push(limit);
+
+    const [rowsResult, tipos, rutas, transportes, zonas, vendedores] = await Promise.all([
+      pool.query(
+        `SELECT
+           ctid::text AS row_key,
+           CAST(id_cliente AS TEXT) AS id_cliente,
+           TRIM(COALESCE(descripcion, '')) AS descripcion,
+           TRIM(COALESCE(tipo_cliente, '')) AS tipo_cliente,
+           TRIM(COALESCE(direccion, '')) AS direccion,
+           TRIM(COALESCE(ruta, '')) AS ruta,
+           TRIM(COALESCE(transporte, '')) AS transporte,
+           TRIM(COALESCE(zona, '')) AS zona,
+           TRIM(COALESCE(vendedor, '')) AS vendedor
+         FROM public.clientes
+         ${whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : ''}
+         ORDER BY TRIM(COALESCE(descripcion, '')) ASC, CAST(id_cliente AS TEXT) ASC
+         LIMIT $${params.length}`,
+        params
+      ),
+      getClienteCatalogOptions('tipo_cliente', ['CADENAS', 'FOOD SERVICES', 'TIENDAS', 'FOOD TRUCK']),
+      getClienteCatalogOptions('ruta'),
+      getClienteCatalogOptions('transporte', ['DESPACHO', 'RETIRO']),
+      getClienteCatalogOptions('zona'),
+      getClienteCatalogOptions('vendedor'),
+    ]);
+
+    return res.json({
+      ok: true,
+      rows: rowsResult.rows,
+      options: {
+        tipo_cliente: tipos,
+        ruta: rutas,
+        transporte: transportes,
+        zona: zonas,
+        vendedor: vendedores,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/clientes-admin/actualizar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, []);
+  if (!auth) return;
+
+  if (normalizeAuthUsername(auth.username) !== 'PRUEBAS') {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario PRUEBAS puede editar clientes.' });
+  }
+
+  const rowKey = normalizeSalidasText(req.body?.row_key, 40);
+  const payload = normalizeClienteCatalogPayload(req.body || {});
+  const missing = [];
+  if (!rowKey) missing.push('cliente seleccionado');
+  if (!payload.id_cliente) missing.push('RIF/C.I.');
+  if (!payload.descripcion) missing.push('cliente');
+  if (!payload.tipo_cliente) missing.push('tipo de cliente');
+  if (!payload.direccion) missing.push('direccion');
+  if (!payload.ruta) missing.push('ruta');
+  if (!payload.transporte) missing.push('transporte');
+  if (!payload.zona) missing.push('zona');
+  if (!payload.vendedor) missing.push('vendedor');
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: `Faltan campos: ${missing.join(', ')}` });
+  }
+
+  try {
+    const current = await pool.query(
+      `SELECT ctid::text AS row_key, CAST(id_cliente AS TEXT) AS id_cliente
+         FROM public.clientes
+        WHERE ctid = $1::tid
+        LIMIT 1`,
+      [rowKey]
+    );
+    if (!current.rowCount) {
+      return res.status(404).json({ ok: false, error: 'No se encontro el cliente seleccionado. Recarga la busqueda.' });
+    }
+
+    const oldIdKey = normalizeClienteAuditKey(current.rows[0].id_cliente);
+    const newIdKey = normalizeClienteAuditKey(payload.id_cliente);
+    if (newIdKey && newIdKey !== oldIdKey) {
+      const duplicated = await pool.query(
+        `SELECT 1
+           FROM public.clientes
+          WHERE ctid <> $2::tid
+            AND REGEXP_REPLACE(UPPER(TRIM(CAST(id_cliente AS TEXT))), '[^A-Z0-9]', '', 'g') = $1
+          LIMIT 1`,
+        [newIdKey, rowKey]
+      );
+      if (duplicated.rowCount) {
+        return res.status(409).json({ ok: false, error: 'Ese RIF/C.I. ya existe en otro cliente. El ID no puede repetirse.' });
+      }
+    }
+
+    const updated = await pool.query(
+      `UPDATE public.clientes
+          SET id_cliente = $1,
+              descripcion = $2,
+              tipo_cliente = $3,
+              direccion = $4,
+              ruta = $5,
+              transporte = $6,
+              zona = $7,
+              vendedor = $8
+        WHERE ctid = $9::tid
+        RETURNING
+          ctid::text AS row_key,
+          CAST(id_cliente AS TEXT) AS id_cliente,
+          descripcion,
+          tipo_cliente,
+          direccion,
+          ruta,
+          transporte,
+          zona,
+          vendedor`,
+      [
+        payload.id_cliente,
+        payload.descripcion,
+        payload.tipo_cliente,
+        payload.direccion,
+        payload.ruta,
+        payload.transporte,
+        payload.zona,
+        payload.vendedor,
+        rowKey,
+      ]
+    );
+
+    return res.json({ ok: true, row: updated.rows[0] });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
