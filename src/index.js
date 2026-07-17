@@ -6146,7 +6146,7 @@ app.patch('/auth/profile', async (req, res) => {
 });
 
 app.get('/api/hoja-ruta/rutas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR, APP_ROLES.CONDUCTOR]);
   if (!auth) return;
 
   try {
@@ -6344,7 +6344,7 @@ app.get('/api/hoja-ruta/exportaciones/:id', async (req, res) => {
 });
 
 app.get('/api/hoja-ruta', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR, APP_ROLES.CONDUCTOR]);
   if (!auth) return;
 
   const ruta = normalizeSalidasText(req.query?.ruta, 120);
