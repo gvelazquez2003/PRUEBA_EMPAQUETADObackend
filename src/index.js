@@ -2141,6 +2141,17 @@ async function ensureRouteDeliveryTables() {
     CREATE INDEX IF NOT EXISTS idx_delivery_status_updated_at
     ON delivery_status (updated_at DESC)
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rutas_completadas_ocultas (
+      id_hoja BIGINT PRIMARY KEY,
+      hidden_by VARCHAR(80) NOT NULL DEFAULT '',
+      hidden_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_rutas_completadas_ocultas_hidden_at
+    ON rutas_completadas_ocultas (hidden_at DESC)
+  `);
 }
 
 async function ensureMermaTables() {
@@ -7713,6 +7724,11 @@ app.get('/api/resultados/rutas-completadas', async (req, res) => {
   try {
     const whereParts = [`COALESCE(jsonb_array_length(COALESCE(hr.facturas, '[]'::jsonb)), 0) > 0`];
     const params = [];
+    whereParts.push(`NOT EXISTS (
+      SELECT 1
+      FROM rutas_completadas_ocultas rco
+      WHERE rco.id_hoja = hr.id_hoja
+    )`);
 
     if (hasDesde) {
       params.push(desde);
@@ -7786,6 +7802,42 @@ app.get('/api/resultados/rutas-completadas', async (req, res) => {
       offset,
       limit,
     });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.delete('/api/resultados/rutas-completadas/:id_hoja', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+
+  const idHoja = Number(req.params?.id_hoja);
+  if (!Number.isInteger(idHoja) || idHoja <= 0) {
+    return res.status(400).json({ ok: false, error: 'Hoja de ruta invalida.' });
+  }
+
+  try {
+    const exists = await pool.query(
+      `SELECT id_hoja
+       FROM hojas_ruta_exportadas
+       WHERE id_hoja = $1
+       LIMIT 1`,
+      [idHoja]
+    );
+    if (!exists.rowCount) {
+      return res.status(404).json({ ok: false, error: 'No existe esa hoja de ruta.' });
+    }
+
+    await pool.query(
+      `INSERT INTO rutas_completadas_ocultas (id_hoja, hidden_by, hidden_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (id_hoja) DO UPDATE
+         SET hidden_by = EXCLUDED.hidden_by,
+             hidden_at = NOW()`,
+      [idHoja, normalizeAuthUsername(auth.username)]
+    );
+
+    return res.json({ ok: true, hidden: true, id_hoja: idHoja });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
