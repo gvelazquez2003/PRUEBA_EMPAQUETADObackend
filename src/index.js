@@ -7239,6 +7239,14 @@ function normalizeRouteResultAddress(address) {
   if (!value) return '';
   const comparable = normalizeSalidasLookupKey(value, 500);
   if (comparable.includes('venezuela')) return value;
+  return `${value}, Venezuela`;
+}
+
+function normalizeRouteResultLegacyAddress(address) {
+  const value = normalizeRouteResultText(address);
+  if (!value) return '';
+  const comparable = normalizeSalidasLookupKey(value, 500);
+  if (comparable.includes('venezuela')) return value;
   if (comparable.includes('caracas')) return `${value}, Venezuela`;
   return `${value}, Caracas, Venezuela`;
 }
@@ -7269,12 +7277,19 @@ function flattenRouteResultClients(sheet) {
 
   facturas.forEach((invoice, index) => {
     const clientId = normalizeRouteResultText(invoice?.numero_control || invoice?.id_factura || index + 1);
-    const address = normalizeRouteResultAddress(invoice?.direccion_texto);
+    const originalAddress = normalizeRouteResultText(invoice?.direccion_texto);
+    const address = normalizeRouteResultAddress(originalAddress);
     const name = normalizeRouteResultText(invoice?.cliente_nombre);
     const invoiceKey = `${sheet.id_hoja}:${clientId}:${normalizeRouteResultText(invoice?.numero_factura || invoice?.id_factura || index + 1)}`;
     const key = makeRouteResultClientKey(invoiceKey, routeKey, address);
+    const statusKeys = Array.from(new Set([
+      key,
+      makeRouteResultClientKey(invoiceKey, routeKey, normalizeRouteResultLegacyAddress(originalAddress)),
+      makeRouteResultClientKey(invoiceKey, routeKey, originalAddress),
+    ].filter((value) => normalizeRouteResultText(value))));
     clients.push({
       key,
+      statusKeys,
       sheetId: String(sheet.id_hoja),
       rowNumber: index + 1,
       clientId,
@@ -7284,7 +7299,7 @@ function flattenRouteResultClients(sheet) {
       name,
       nombre_o_razon_social: name,
       address,
-      originalAddress: normalizeRouteResultText(invoice?.direccion_texto),
+      originalAddress,
       route: routeKey,
       routeName,
       routeDisplayName,
@@ -7334,9 +7349,20 @@ function applyRouteDeliveryStatus(client, status) {
   };
 }
 
+function getClientRouteDeliveryStatus(deliveryStatusMap, client) {
+  const keys = Array.isArray(client?.statusKeys) && client.statusKeys.length
+    ? client.statusKeys
+    : [client?.key];
+  for (const key of keys) {
+    const status = deliveryStatusMap.get(key);
+    if (status) return status;
+  }
+  return null;
+}
+
 function buildCompletedRouteResult(sheet, deliveryStatusMap) {
   const clients = flattenRouteResultClients(sheet).map((client) =>
-    applyRouteDeliveryStatus(client, deliveryStatusMap.get(client.key))
+    applyRouteDeliveryStatus(client, getClientRouteDeliveryStatus(deliveryStatusMap, client))
   );
   const totalClients = clients.length;
   const deliveredClients = clients.filter((client) => client.delivered).length;
@@ -7512,10 +7538,12 @@ async function buildConciliacionRows(auth) {
   });
   if (!clients.length) return [];
 
-  const deliveryStatusMap = await getRouteDeliveryStatusMap(clients.map((client) => client.key));
+  const deliveryStatusMap = await getRouteDeliveryStatusMap(
+    clients.flatMap((client) => Array.isArray(client.statusKeys) && client.statusKeys.length ? client.statusKeys : [client.key])
+  );
   const deliveredByFactura = new Map();
   clients.forEach((client) => {
-    const withStatus = applyRouteDeliveryStatus(client, deliveryStatusMap.get(client.key));
+    const withStatus = applyRouteDeliveryStatus(client, getClientRouteDeliveryStatus(deliveryStatusMap, client));
     if (!withStatus.delivered && !withStatus.partial) return;
     const productos = getDeliveredProductsForConciliacion(withStatus);
     if (!productos.length) return;
@@ -7736,7 +7764,13 @@ app.get('/api/resultados/rutas-completadas', async (req, res) => {
 
     const allClientKeys = [];
     result.rows.forEach((sheet) => {
-      flattenRouteResultClients(sheet).forEach((client) => allClientKeys.push(client.key));
+      flattenRouteResultClients(sheet).forEach((client) => {
+        if (Array.isArray(client.statusKeys)) {
+          client.statusKeys.forEach((key) => allClientKeys.push(key));
+          return;
+        }
+        allClientKeys.push(client.key);
+      });
     });
     const deliveryStatusMap = await getRouteDeliveryStatusMap(allClientKeys);
     const completedRoutes = result.rows
