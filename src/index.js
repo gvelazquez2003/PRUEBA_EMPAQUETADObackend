@@ -2152,6 +2152,36 @@ async function ensureRouteDeliveryTables() {
     ON delivery_status (updated_at DESC)
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS salidas_reentregas_pendientes (
+      id_reentrega BIGSERIAL PRIMARY KEY,
+      client_key TEXT NOT NULL UNIQUE,
+      sheet_id TEXT NOT NULL DEFAULT '',
+      original_invoice_id TEXT NOT NULL DEFAULT '',
+      original_numero_factura TEXT NOT NULL DEFAULT '',
+      original_numero_control TEXT NOT NULL DEFAULT '',
+      cliente_nombre VARCHAR(160),
+      vendedor_nombre VARCHAR(160),
+      zona_nombre VARCHAR(120),
+      ruta_nombre VARCHAR(120),
+      transporte_nombre VARCHAR(120),
+      direccion_texto VARCHAR(240),
+      fecha_emision DATE NOT NULL DEFAULT CURRENT_DATE,
+      detalle JSONB NOT NULL DEFAULT '[]'::jsonb,
+      estado VARCHAR(30) NOT NULL DEFAULT 'pendiente',
+      created_by VARCHAR(80),
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_salidas_reentregas_pendientes_ruta
+    ON salidas_reentregas_pendientes (LOWER(TRIM(ruta_nombre)), fecha_emision)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_salidas_reentregas_pendientes_estado
+    ON salidas_reentregas_pendientes (estado, updated_at DESC)
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS rutas_completadas_ocultas (
       id_hoja BIGINT PRIMARY KEY,
       hidden_by VARCHAR(80) NOT NULL DEFAULT '',
@@ -7044,6 +7074,7 @@ app.get('/api/hoja-ruta/rutas', async (req, res) => {
   if (!auth) return;
 
   try {
+    await ensureRouteDeliveryTables();
     const params = [];
     const whereParts = [
       `TRIM(COALESCE(ruta_nombre, '')) <> ''`,
@@ -7051,14 +7082,38 @@ app.get('/api/hoja-ruta/rutas', async (req, res) => {
     ];
     appendVendedorAccessFilter(whereParts, params, auth, 'vendedor_nombre');
     const result = await pool.query(
-      `SELECT
-         TRIM(COALESCE(ruta_nombre, '')) AS ruta,
-         TO_CHAR(MAX(fecha_emision)::date, 'YYYY-MM-DD') AS fecha,
-         COUNT(DISTINCT id_factura)::int AS facturas
-       FROM salidas_facturas
-       WHERE ${whereParts.join(' AND ')}
-       GROUP BY TRIM(COALESCE(ruta_nombre, ''))
-       ORDER BY TRIM(COALESCE(ruta_nombre, '')) ASC`,
+      `WITH rutas_base AS (
+         SELECT
+           TRIM(COALESCE(ruta_nombre, '')) AS ruta,
+           MAX(fecha_emision)::date AS fecha,
+           COUNT(DISTINCT id_factura)::int AS facturas
+         FROM salidas_facturas
+         WHERE ${whereParts.join(' AND ')}
+         GROUP BY TRIM(COALESCE(ruta_nombre, ''))
+       ),
+       rutas_reentrega AS (
+         SELECT
+           TRIM(COALESCE(ruta_nombre, '')) AS ruta,
+           MAX(fecha_emision)::date AS fecha,
+           COUNT(*)::int AS facturas
+         FROM salidas_reentregas_pendientes
+         WHERE estado = 'pendiente'
+           AND TRIM(COALESCE(ruta_nombre, '')) <> ''
+           AND LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'
+         GROUP BY TRIM(COALESCE(ruta_nombre, ''))
+       ),
+       rutas_union AS (
+         SELECT * FROM rutas_base
+         UNION ALL
+         SELECT * FROM rutas_reentrega
+       )
+       SELECT
+         ruta,
+         TO_CHAR(MAX(fecha), 'YYYY-MM-DD') AS fecha,
+         SUM(facturas)::int AS facturas
+       FROM rutas_union
+       GROUP BY ruta
+       ORDER BY ruta ASC`,
       params
     );
     return res.json({ ok: true, rows: result.rows });
@@ -7109,6 +7164,7 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   }
 
   try {
+    await ensureRouteDeliveryTables();
     const driverResult = await pool.query(
       `SELECT username, COALESCE(full_name, username) AS full_name, COALESCE(vehicle_plate, '') AS vehicle_plate
        FROM auth_users
@@ -7122,10 +7178,6 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'El conductor seleccionado no existe o no esta activo.' });
     }
     const driver = driverResult.rows[0];
-    const driverPlate = normalizeVehiclePlate(driver.vehicle_plate || '');
-    if (driverPlate && normalizeVehiclePlate(numeroCamion) !== driverPlate) {
-      return res.status(400).json({ ok: false, error: `La placa asignada a ${driver.full_name || driver.username} es ${driverPlate}.` });
-    }
     const fileSuffix = `_${conductorUsername}`;
     const upperFileName = String(nombreArchivo || '').toUpperCase();
     if (!upperFileName.endsWith(fileSuffix)) {
@@ -7181,6 +7233,19 @@ app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
         nombreArchivo || null,
       ]
     );
+    const reentregaIds = [...new Set(facturas
+      .map((factura) => Number(factura?.reentrega_id || factura?.id_reentrega || 0))
+      .filter((id) => Number.isInteger(id) && id > 0))];
+    if (reentregaIds.length) {
+      await pool.query(
+        `UPDATE salidas_reentregas_pendientes
+            SET estado = 'en_hoja',
+                updated_at = NOW()
+          WHERE id_reentrega = ANY($1::bigint[])
+            AND estado = 'pendiente'`,
+        [reentregaIds]
+      );
+    }
     return res.status(201).json({ ok: true, row: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
@@ -7875,6 +7940,7 @@ app.get('/api/hoja-ruta', async (req, res) => {
   }
 
   try {
+    await ensureRouteDeliveryTables();
     let fechaDesde = hasFechaDesde ? fechaDesdeRaw : '';
     let fechaHasta = hasFechaHasta ? fechaHastaRaw : '';
 
@@ -7886,13 +7952,28 @@ app.get('/api/hoja-ruta', async (req, res) => {
       ];
       appendVendedorAccessFilter(dateWhereParts, dateParams, auth, 'sf.vendedor_nombre');
       const dateResult = await pool.query(
-        `SELECT TO_CHAR(MAX(sf.fecha_emision)::date, 'YYYY-MM-DD') AS fecha
+        `WITH fechas_base AS (
+           SELECT MAX(sf.fecha_emision)::date AS fecha
+           FROM (
+             SELECT DISTINCT ON (id_factura) *
+             FROM salidas_facturas
+             ORDER BY id_factura
+           ) sf
+           WHERE ${dateWhereParts.join(' AND ')}
+         ),
+         fechas_reentrega AS (
+           SELECT MAX(fecha_emision)::date AS fecha
+           FROM salidas_reentregas_pendientes
+           WHERE estado = 'pendiente'
+             AND LOWER(TRIM(COALESCE(ruta_nombre, ''))) = LOWER(TRIM($1))
+             AND LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'
+         )
+         SELECT TO_CHAR(MAX(fecha), 'YYYY-MM-DD') AS fecha
          FROM (
-           SELECT DISTINCT ON (id_factura) *
-           FROM salidas_facturas
-           ORDER BY id_factura
-         ) sf
-         WHERE ${dateWhereParts.join(' AND ')}`,
+           SELECT fecha FROM fechas_base
+           UNION ALL
+           SELECT fecha FROM fechas_reentrega
+         ) fechas`,
         dateParams
       );
       const fecha = dateResult.rows?.[0]?.fecha || null;
@@ -7993,6 +8074,69 @@ app.get('/api/hoja-ruta', async (req, res) => {
         cantidad: row.cantidad,
         paquetes_por_cesta: row.paquetes_por_cesta,
         sobre_piso: row.sobre_piso,
+      });
+    });
+
+    const reentregasResult = await pool.query(
+      `SELECT
+         id_reentrega,
+         original_invoice_id,
+         original_numero_factura,
+         original_numero_control,
+         cliente_nombre,
+         vendedor_nombre,
+         zona_nombre,
+         ruta_nombre,
+         transporte_nombre,
+         direccion_texto,
+         TO_CHAR(fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+         detalle
+       FROM salidas_reentregas_pendientes
+       WHERE estado = 'pendiente'
+         AND LOWER(TRIM(COALESCE(ruta_nombre, ''))) = LOWER(TRIM($1))
+         AND fecha_emision BETWEEN $2::date AND $3::date
+         AND LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'
+       ORDER BY fecha_emision ASC, LOWER(TRIM(COALESCE(cliente_nombre, ''))) ASC, id_reentrega ASC`,
+      [ruta, fechaDesde, fechaHasta]
+    );
+
+    reentregasResult.rows.forEach((row) => {
+      const idReentrega = Number(row.id_reentrega);
+      if (!Number.isInteger(idReentrega) || idReentrega <= 0) return;
+      const detalle = Array.isArray(row.detalle) ? row.detalle : [];
+      const detalleReentrega = detalle.map((line, index) => ({
+        id_detalle: `REEN-${idReentrega}-${index + 1}`,
+        id_reentrega: idReentrega,
+        id_cambio: null,
+        codigo_producto: line?.codigo_producto || line?.codigo || '',
+        producto: line?.producto || '',
+        numero_lote: line?.numero_lote || line?.lote || 'SIN-LOTE',
+        cantidad: Math.max(0, Math.trunc(Number(line?.cantidad || 0))),
+        paquetes_por_cesta: line?.paquetes_por_cesta || 10,
+        sobre_piso: line?.sobre_piso || 0,
+        es_reentrega: true,
+        original_id_detalle: line?.original_id_detalle || ''
+      })).filter((line) => line.codigo_producto && line.producto && line.cantidad > 0);
+      if (!detalleReentrega.length) return;
+      facturasMap.set(`REEN-${idReentrega}`, {
+        id_factura: `REEN-${idReentrega}`,
+        reentrega_id: idReentrega,
+        numero_control: `RE-${idReentrega}`,
+        numero_factura: `REENTREGA-${idReentrega}`,
+        documento: 'reentrega',
+        fecha_emision: row.fecha_emision,
+        fecha_vencimiento: null,
+        cliente_nombre: row.cliente_nombre,
+        vendedor_nombre: row.vendedor_nombre,
+        zona_nombre: row.zona_nombre,
+        ruta_nombre: row.ruta_nombre,
+        transporte_nombre: row.transporte_nombre,
+        direccion_texto: row.direccion_texto,
+        es_reentrega: true,
+        original_invoice_id: row.original_invoice_id,
+        original_numero_factura: row.original_numero_factura,
+        original_numero_control: row.original_numero_control,
+        detalle: detalleReentrega,
       });
     });
 

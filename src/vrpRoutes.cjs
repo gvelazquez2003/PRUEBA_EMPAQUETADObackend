@@ -405,6 +405,36 @@ async function ensureDatabaseReady() {
         ADD COLUMN IF NOT EXISTS partial_detail JSONB
     `);
     await pool.query(`
+        CREATE TABLE IF NOT EXISTS salidas_reentregas_pendientes (
+            id_reentrega BIGSERIAL PRIMARY KEY,
+            client_key TEXT NOT NULL UNIQUE,
+            sheet_id TEXT NOT NULL DEFAULT '',
+            original_invoice_id TEXT NOT NULL DEFAULT '',
+            original_numero_factura TEXT NOT NULL DEFAULT '',
+            original_numero_control TEXT NOT NULL DEFAULT '',
+            cliente_nombre VARCHAR(160),
+            vendedor_nombre VARCHAR(160),
+            zona_nombre VARCHAR(120),
+            ruta_nombre VARCHAR(120),
+            transporte_nombre VARCHAR(120),
+            direccion_texto VARCHAR(240),
+            fecha_emision DATE NOT NULL DEFAULT CURRENT_DATE,
+            detalle JSONB NOT NULL DEFAULT '[]'::jsonb,
+            estado VARCHAR(30) NOT NULL DEFAULT 'pendiente',
+            created_by VARCHAR(80),
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    `);
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_salidas_reentregas_pendientes_ruta
+        ON salidas_reentregas_pendientes (LOWER(TRIM(ruta_nombre)), fecha_emision)
+    `);
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_salidas_reentregas_pendientes_estado
+        ON salidas_reentregas_pendientes (estado, updated_at DESC)
+    `);
+    await pool.query(`
         CREATE TABLE IF NOT EXISTS address_validations (
             client_key TEXT PRIMARY KEY,
             address TEXT NOT NULL DEFAULT '',
@@ -523,6 +553,9 @@ function flattenRouteSheetClients(sheets) {
                 route: routeKey,
                 routeName,
                 routeDisplayName,
+                invoiceRouteName: normalizeText(invoice.ruta_nombre),
+                seller: normalizeText(invoice.vendedor_nombre),
+                vendedor_nombre: normalizeText(invoice.vendedor_nombre),
                 zone: normalizeText(invoice.zona_nombre),
                 transport: normalizeText(invoice.transporte_nombre || sheet.numero_camion),
                 driver: normalizeText(sheet.conductor),
@@ -825,6 +858,114 @@ async function saveDeliveryStatus(key, delivered, deliveredBaskets, suppliedBask
              updated_at = NOW()`,
         [key, Boolean(delivered), baskets, supplied, recovered, isPartial, detailJson]
     );
+}
+
+function normalizePartialLookup(value) {
+    return normalizeHeader(value).replace(/[^A-Z0-9]/g, "");
+}
+
+function getPartialLineDelivered(partialDetail, line) {
+    const lineId = normalizeText(line?.id_detalle || line?.idDetalle || "");
+    const code = normalizeText(line?.codigo_producto || line?.codigo || "").toUpperCase();
+    const product = normalizePartialLookup(line?.producto || line?.descripcion || "");
+    const found = (Array.isArray(partialDetail) ? partialDetail : []).find((item) => {
+        if (lineId && normalizeText(item?.idDetalle || item?.id_detalle || "") === lineId) return true;
+        const itemCode = normalizeText(item?.codigo || item?.codigo_producto || "").toUpperCase();
+        const itemProduct = normalizePartialLookup(item?.producto || "");
+        if (code && itemCode === code && itemProduct === product) return true;
+        return itemProduct === product;
+    });
+    return Math.max(0, Math.trunc(Number(found?.cantidadEntregada || 0)));
+}
+
+function getClientMissingLines(client, partialDetail) {
+    const detail = Array.isArray(client?.detail) ? client.detail : [];
+    return detail
+        .map((line) => {
+            const expected = Math.max(0, Math.trunc(Number(line?.cantidad || line?.cantidadEsperada || 0)));
+            const delivered = getPartialLineDelivered(partialDetail, line);
+            const missing = Math.max(0, expected - delivered);
+            if (!missing) return null;
+            return {
+                original_id_detalle: normalizeText(line?.id_detalle || line?.idDetalle || ""),
+                codigo_producto: normalizeText(line?.codigo_producto || line?.codigo || "").toUpperCase(),
+                producto: normalizeText(line?.producto || line?.descripcion || ""),
+                numero_lote: normalizeText(line?.numero_lote || line?.lote || "SIN-LOTE").toUpperCase() || "SIN-LOTE",
+                cantidad: missing,
+                cantidad_original: expected,
+                cantidad_entregada: delivered
+            };
+        })
+        .filter((line) => line && line.codigo_producto && line.producto && line.cantidad > 0);
+}
+
+async function createPartialRedeliveryPending(key, partialDetail, auth) {
+    const clients = await getClients("", auth);
+    const client = clients.find((item) => item.key === key);
+    if (!client) return null;
+    const missingLines = getClientMissingLines(client, partialDetail);
+    if (!missingLines.length) {
+        await pool.query(
+            `DELETE FROM salidas_reentregas_pendientes
+             WHERE client_key = $1
+               AND estado = 'pendiente'`,
+            [key]
+        );
+        return null;
+    }
+    const result = await pool.query(
+        `INSERT INTO salidas_reentregas_pendientes (
+             client_key,
+             sheet_id,
+             original_invoice_id,
+             original_numero_factura,
+             original_numero_control,
+             cliente_nombre,
+             vendedor_nombre,
+             zona_nombre,
+             ruta_nombre,
+             transporte_nombre,
+             direccion_texto,
+             fecha_emision,
+             detalle,
+             estado,
+             created_by,
+             updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_DATE, $12::jsonb, 'pendiente', $13, NOW())
+         ON CONFLICT (client_key) DO UPDATE
+         SET sheet_id = EXCLUDED.sheet_id,
+             original_invoice_id = EXCLUDED.original_invoice_id,
+             original_numero_factura = EXCLUDED.original_numero_factura,
+             original_numero_control = EXCLUDED.original_numero_control,
+             cliente_nombre = EXCLUDED.cliente_nombre,
+             vendedor_nombre = EXCLUDED.vendedor_nombre,
+             zona_nombre = EXCLUDED.zona_nombre,
+             ruta_nombre = EXCLUDED.ruta_nombre,
+             transporte_nombre = EXCLUDED.transporte_nombre,
+             direccion_texto = EXCLUDED.direccion_texto,
+             fecha_emision = EXCLUDED.fecha_emision,
+             detalle = EXCLUDED.detalle,
+             estado = 'pendiente',
+             updated_at = NOW()
+         RETURNING id_reentrega`,
+        [
+            key,
+            normalizeText(client.sheetId),
+            normalizeText(client.invoiceId),
+            normalizeText(client.invoiceNumber),
+            normalizeText(client.controlNumber || client.clientId),
+            normalizeText(client.name || client.nombre_o_razon_social),
+            normalizeText(client.vendedor_nombre || client.seller || ""),
+            normalizeText(client.zone),
+            normalizeText(client.invoiceRouteName || client.routeName),
+            normalizeText(client.transport),
+            normalizeText(client.originalAddress || client.address),
+            JSON.stringify(missingLines),
+            normalizeText(auth?.username || "sistema")
+        ]
+    );
+    return { id_reentrega: result.rows?.[0]?.id_reentrega || null, lines: missingLines.length };
 }
 
 function classifyGeocodingResult(payload) {
@@ -2321,7 +2462,18 @@ app.put("/api/deliveries/:key", async (req, res) => {
             return res.status(400).json({ ok: false, error: "La cantidad de cestas recuperadas debe ser un numero entero no negativo." });
         }
         await saveDeliveryStatus(key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail);
-        res.json({ ok: true, key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial });
+        let redeliveryPending = null;
+        if (partial && !delivered) {
+            redeliveryPending = await createPartialRedeliveryPending(key, partialDetail, auth);
+        } else if (delivered) {
+            await pool.query(
+                `DELETE FROM salidas_reentregas_pendientes
+                 WHERE client_key = $1
+                   AND estado = 'pendiente'`,
+                [key]
+            );
+        }
+        res.json({ ok: true, key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, redeliveryPending });
     } catch (error) {
         res.status(500).json({ ok: false, error: String(error.message || error) });
     }
