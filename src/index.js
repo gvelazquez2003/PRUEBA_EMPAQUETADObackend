@@ -2121,6 +2121,8 @@ async function ensureRouteDeliveryTables() {
       client_key TEXT PRIMARY KEY,
       delivered BOOLEAN NOT NULL DEFAULT FALSE,
       delivered_baskets INT NOT NULL DEFAULT 0,
+      supplied_baskets INT NOT NULL DEFAULT 0,
+      recovered_baskets INT NOT NULL DEFAULT 0,
       delivered_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
@@ -2128,6 +2130,14 @@ async function ensureRouteDeliveryTables() {
   await pool.query(`
     ALTER TABLE delivery_status
     ADD COLUMN IF NOT EXISTS delivered_baskets INT NOT NULL DEFAULT 0
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS supplied_baskets INT NOT NULL DEFAULT 0
+  `);
+  await pool.query(`
+    ALTER TABLE delivery_status
+    ADD COLUMN IF NOT EXISTS recovered_baskets INT NOT NULL DEFAULT 0
   `);
   await pool.query(`
     ALTER TABLE delivery_status
@@ -6884,7 +6894,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
 });
 
 app.get('/api/almacen09/salidas-facturas', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 500);
@@ -7340,7 +7350,7 @@ async function getRouteDeliveryStatusMap(clientKeys) {
   const map = new Map();
   if (!keys.length) return map;
   const result = await pool.query(
-    `SELECT client_key, delivered, delivered_baskets, delivered_at, partial, partial_detail, updated_at
+    `SELECT client_key, delivered, delivered_baskets, supplied_baskets, recovered_baskets, delivered_at, partial, partial_detail, updated_at
      FROM delivery_status
      WHERE client_key = ANY($1::text[])`,
     [keys]
@@ -7358,6 +7368,8 @@ function applyRouteDeliveryStatus(client, status) {
     delivered,
     partial,
     deliveredBaskets: status ? Number(status.delivered_baskets || 0) : null,
+    suppliedBaskets: status ? Number(status.supplied_baskets || 0) : null,
+    recoveredBaskets: status ? Number(status.recovered_baskets || 0) : null,
     deliveredAt: status?.delivered_at || null,
     partialDetail,
   };

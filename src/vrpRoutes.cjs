@@ -378,6 +378,8 @@ async function ensureDatabaseReady() {
             client_key TEXT PRIMARY KEY,
             delivered BOOLEAN NOT NULL DEFAULT FALSE,
             delivered_baskets INT NOT NULL DEFAULT 0,
+            supplied_baskets INT NOT NULL DEFAULT 0,
+            recovered_baskets INT NOT NULL DEFAULT 0,
             delivered_at TIMESTAMPTZ,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -385,6 +387,14 @@ async function ensureDatabaseReady() {
     await pool.query(`
         ALTER TABLE delivery_status
         ADD COLUMN IF NOT EXISTS delivered_baskets INT NOT NULL DEFAULT 0
+    `);
+    await pool.query(`
+        ALTER TABLE delivery_status
+        ADD COLUMN IF NOT EXISTS supplied_baskets INT NOT NULL DEFAULT 0
+    `);
+    await pool.query(`
+        ALTER TABLE delivery_status
+        ADD COLUMN IF NOT EXISTS recovered_baskets INT NOT NULL DEFAULT 0
     `);
     await pool.query(`
         ALTER TABLE delivery_status
@@ -589,7 +599,7 @@ async function getOverridesMap() {
 }
 
 async function getDeliveryStatusMap() {
-    const result = await pool.query("SELECT client_key, delivered, delivered_baskets, delivered_at, partial, partial_detail FROM delivery_status");
+    const result = await pool.query("SELECT client_key, delivered, delivered_baskets, supplied_baskets, recovered_baskets, delivered_at, partial, partial_detail FROM delivery_status");
     const map = new Map();
     result.rows.forEach((row) => map.set(row.client_key, row));
     return map;
@@ -647,6 +657,8 @@ async function getClients(route, auth = null) {
         const delivery = {
             delivered: deliveryStatus ? Boolean(deliveryStatus.delivered) : Boolean(client.delivered),
             deliveredBaskets: deliveryStatus ? Number(deliveryStatus.delivered_baskets || 0) : null,
+            suppliedBaskets: deliveryStatus ? Number(deliveryStatus.supplied_baskets || 0) : null,
+            recoveredBaskets: deliveryStatus ? Number(deliveryStatus.recovered_baskets || 0) : null,
             deliveredAt: deliveryStatus?.delivered_at || null,
             partial: deliveryStatus ? Boolean(deliveryStatus.partial) : false,
             partialDetail: deliveryStatus?.partial_detail || null
@@ -793,21 +805,25 @@ async function saveClientOverride(key, data) {
     await pool.query("DELETE FROM address_validations WHERE client_key = $1", [key]);
 }
 
-async function saveDeliveryStatus(key, delivered, deliveredBaskets, partial, partialDetail) {
+async function saveDeliveryStatus(key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail) {
     const baskets = Math.max(0, Math.trunc(Number(deliveredBaskets || 0)));
+    const supplied = Math.max(0, Math.trunc(Number(suppliedBaskets || 0)));
+    const recovered = Math.max(0, Math.trunc(Number(recoveredBaskets || 0)));
     const isPartial = Boolean(partial) && !Boolean(delivered);
     const detailJson = isPartial && Array.isArray(partialDetail) ? JSON.stringify(partialDetail) : null;
     await pool.query(
-        `INSERT INTO delivery_status (client_key, delivered, delivered_baskets, delivered_at, partial, partial_detail, updated_at)
-         VALUES ($1, $2::boolean, $3::int, CASE WHEN $2::boolean THEN NOW() ELSE NULL END, $4::boolean, $5::jsonb, NOW())
+        `INSERT INTO delivery_status (client_key, delivered, delivered_baskets, supplied_baskets, recovered_baskets, delivered_at, partial, partial_detail, updated_at)
+         VALUES ($1, $2::boolean, $3::int, $4::int, $5::int, CASE WHEN $2::boolean THEN NOW() ELSE NULL END, $6::boolean, $7::jsonb, NOW())
          ON CONFLICT (client_key) DO UPDATE
          SET delivered = EXCLUDED.delivered,
              delivered_baskets = EXCLUDED.delivered_baskets,
+             supplied_baskets = EXCLUDED.supplied_baskets,
+             recovered_baskets = EXCLUDED.recovered_baskets,
              delivered_at = CASE WHEN EXCLUDED.delivered THEN COALESCE(delivery_status.delivered_at, NOW()) ELSE NULL END,
              partial = EXCLUDED.partial,
              partial_detail = EXCLUDED.partial_detail,
              updated_at = NOW()`,
-        [key, Boolean(delivered), baskets, isPartial, detailJson]
+        [key, Boolean(delivered), baskets, supplied, recovered, isPartial, detailJson]
     );
 }
 
@@ -2289,6 +2305,8 @@ app.put("/api/deliveries/:key", async (req, res) => {
         const partialDetail = Array.isArray(req.body?.partialDetail) ? req.body.partialDetail : null;
         const hasDeliveredBaskets = Object.prototype.hasOwnProperty.call(req.body || {}, "deliveredBaskets");
         const deliveredBaskets = Number(req.body?.deliveredBaskets);
+        const suppliedBaskets = Number(req.body?.suppliedBaskets ?? 0);
+        const recoveredBaskets = Number(req.body?.recoveredBaskets ?? 0);
         if (!key) return res.status(400).json({ ok: false, error: "Debes enviar una entrega valida." });
         if (!hasDeliveredBaskets) {
             return res.status(400).json({ ok: false, error: "Debes enviar la cantidad de cestas entregadas." });
@@ -2296,8 +2314,14 @@ app.put("/api/deliveries/:key", async (req, res) => {
         if (!Number.isInteger(deliveredBaskets) || deliveredBaskets < 0) {
             return res.status(400).json({ ok: false, error: "La cantidad de cestas debe ser un numero entero no negativo." });
         }
-        await saveDeliveryStatus(key, delivered, deliveredBaskets, partial, partialDetail);
-        res.json({ ok: true, key, delivered, deliveredBaskets, partial });
+        if (!Number.isInteger(suppliedBaskets) || suppliedBaskets < 0) {
+            return res.status(400).json({ ok: false, error: "La cantidad de cestas surtidas debe ser un numero entero no negativo." });
+        }
+        if (!Number.isInteger(recoveredBaskets) || recoveredBaskets < 0) {
+            return res.status(400).json({ ok: false, error: "La cantidad de cestas recuperadas debe ser un numero entero no negativo." });
+        }
+        await saveDeliveryStatus(key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail);
+        res.json({ ok: true, key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial });
     } catch (error) {
         res.status(500).json({ ok: false, error: String(error.message || error) });
     }
