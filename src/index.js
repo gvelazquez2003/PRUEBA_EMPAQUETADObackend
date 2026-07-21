@@ -3070,6 +3070,9 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
          nombre,
          MIN(id_cliente_text) AS id_cliente,
          MIN(id_cliente_text) AS rif,
+         COUNT(DISTINCT NULLIF(id_cliente_text, ''))::int AS total_ids,
+         COUNT(DISTINCT NULLIF(direccion, ''))::int AS total_direcciones,
+         COUNT(DISTINCT NULLIF(zona, ''))::int AS total_zonas,
          COALESCE(
            JSON_AGG(DISTINCT id_cliente_text ORDER BY id_cliente_text) FILTER (WHERE id_cliente_text <> ''),
            '[]'::json
@@ -3096,8 +3099,8 @@ app.get('/api/almacen09/cambios/clientes', async (req, res) => {
            TRIM(COALESCE(direccion, '')),
            TRIM(COALESCE(zona, ''))
        ) base
-       GROUP BY nombre, id_cliente_text
-       ORDER BY nombre ASC, id_cliente_text ASC
+       GROUP BY nombre
+       ORDER BY nombre ASC, MIN(id_cliente_text) ASC
        LIMIT $${params.length}`,
       params
     );
