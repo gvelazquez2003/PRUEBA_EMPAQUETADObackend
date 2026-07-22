@@ -27,6 +27,13 @@ function parseNumberEnv(value, fallback) {
     return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseNonNegativeInteger(value, fallback = 0) {
+    const text = String(value ?? "").trim();
+    if (!text) return fallback;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback;
+}
+
 function parseNumberListEnv(value, fallback) {
     const parsed = String(value || "")
         .split(",")
@@ -2444,23 +2451,10 @@ app.put("/api/deliveries/:key", async (req, res) => {
         const delivered = req.body?.delivered === true;
         const partial = req.body?.partial === true;
         const partialDetail = Array.isArray(req.body?.partialDetail) ? req.body.partialDetail : null;
-        const hasDeliveredBaskets = Object.prototype.hasOwnProperty.call(req.body || {}, "deliveredBaskets");
-        const deliveredBaskets = Number(req.body?.deliveredBaskets);
-        const suppliedBaskets = Number(req.body?.suppliedBaskets ?? 0);
-        const recoveredBaskets = Number(req.body?.recoveredBaskets ?? 0);
+        const deliveredBaskets = parseNonNegativeInteger(req.body?.deliveredBaskets, 0);
+        const suppliedBaskets = parseNonNegativeInteger(req.body?.suppliedBaskets, 0);
+        const recoveredBaskets = parseNonNegativeInteger(req.body?.recoveredBaskets, 0);
         if (!key) return res.status(400).json({ ok: false, error: "Debes enviar una entrega valida." });
-        if (!hasDeliveredBaskets) {
-            return res.status(400).json({ ok: false, error: "Debes enviar la cantidad de cestas entregadas." });
-        }
-        if (!Number.isInteger(deliveredBaskets) || deliveredBaskets < 0) {
-            return res.status(400).json({ ok: false, error: "La cantidad de cestas debe ser un numero entero no negativo." });
-        }
-        if (!Number.isInteger(suppliedBaskets) || suppliedBaskets < 0) {
-            return res.status(400).json({ ok: false, error: "La cantidad de cestas surtidas debe ser un numero entero no negativo." });
-        }
-        if (!Number.isInteger(recoveredBaskets) || recoveredBaskets < 0) {
-            return res.status(400).json({ ok: false, error: "La cantidad de cestas recuperadas debe ser un numero entero no negativo." });
-        }
         await saveDeliveryStatus(key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail);
         let redeliveryPending = null;
         if (partial && !delivered) {
