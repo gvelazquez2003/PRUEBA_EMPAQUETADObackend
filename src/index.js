@@ -3983,8 +3983,6 @@ app.post('/api/almacen09/cambios', async (req, res) => {
   const rifClienteRaw = normalizeSalidasText(req.body?.rif || req.body?.id_cliente, 40).toUpperCase();
   const direccionRaw = normalizeSalidasText(req.body?.direccion, 240);
   const responsableRaw = normalizeSalidasText(req.body?.responsable, 180);
-  const contactoRaw = normalizeSalidasText(req.body?.contacto, 180);
-  const telefonoRaw = normalizeSalidasText(req.body?.telefono, 20);
   const detalleRaw = Array.isArray(req.body?.detalle) ? req.body.detalle : [];
 
   const detalle = detalleRaw
@@ -3999,9 +3997,6 @@ app.post('/api/almacen09/cambios', async (req, res) => {
 
   if (!clienteRaw || !responsableRaw) {
     return res.status(400).json({ ok: false, error: 'cliente y responsable son obligatorios' });
-  }
-  if (!/^\d{4}-\d{7}$/.test(telefonoRaw)) {
-    return res.status(400).json({ ok: false, error: 'telefono debe tener formato XXXX-XXXXXXX' });
   }
   if (!detalle.length) {
     return res.status(400).json({ ok: false, error: 'detalle debe incluir productos con razon y cantidades validas' });
@@ -4067,8 +4062,8 @@ app.post('/api/almacen09/cambios', async (req, res) => {
           direccionCatalog.value || direccionRaw || null,
           rutaCambio || null,
           responsableRaw,
-          contactoRaw || null,
-          telefonoRaw,
+          null,
+          null,
           JSON.stringify([item]),
         ]
       );
