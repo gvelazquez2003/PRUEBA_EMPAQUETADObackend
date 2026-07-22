@@ -746,10 +746,6 @@ async function ensureInitialDriverUsers() {
        VALUES ($1, $2, $3, $4, $5, $6, TRUE)
        ON CONFLICT (username) DO UPDATE
          SET role = EXCLUDED.role,
-             password_hash = EXCLUDED.password_hash,
-             password_visible = EXCLUDED.password_visible,
-             full_name = EXCLUDED.full_name,
-             vehicle_plate = EXCLUDED.vehicle_plate,
              activo = TRUE,
              updated_at = NOW()`,
       [username, APP_ROLES.CONDUCTOR, passwordHash, INITIAL_DRIVER_PASSWORD, fullName, vehiclePlate]
