@@ -6887,6 +6887,35 @@ async function buildFacturaBotSalidasPayload(upload, auth) {
   return { payload, datos };
 }
 
+async function extractFacturaBotPreview(upload) {
+  const buffer = await fs.readFile(upload.file_path);
+  const parser = new PDFParse({ data: buffer });
+  let parsedPdf = null;
+  try {
+    parsedPdf = await parser.getText();
+  } finally {
+    await parser.destroy().catch(() => {});
+  }
+  const datos = parseFacturaBotPdfText(parsedPdf?.text || '');
+  if (!datos.numero_factura) {
+    datos.numero_factura = extractFacturaBotNumberFromFilename(upload.original_name || upload.stored_name);
+  }
+  return {
+    documento: datos.documento,
+    cliente: datos.cliente,
+    rif: datos.rif,
+    numero_factura: datos.numero_factura,
+    fecha_emision: datos.fecha_emision,
+    fecha_vencimiento: datos.fecha_vencimiento,
+    vendedor: datos.vendedor,
+    transporte: datos.transporte,
+    direccion: datos.direccion,
+    productos_count: datos.productos.length,
+    productos: datos.productos.slice(0, 12),
+    text_length: String(parsedPdf?.text || '').length,
+  };
+}
+
 async function updateFacturaBotUpload(idUpload, fields) {
   const allowed = ['estado', 'mensaje', 'id_factura', 'extracted_payload', 'processed_by', 'processed_at'];
   const sets = [];
@@ -7068,6 +7097,43 @@ app.post('/api/facturas-bot/uploads', async (req, res) => {
       ]
     );
     return res.status(201).json({ ok: true, upload: mapFacturaUploadRow(inserted.rows[0]) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/facturas-bot/uploads/:id_upload/debug', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const idUpload = Number(req.params?.id_upload || 0);
+  if (!Number.isInteger(idUpload) || idUpload <= 0) {
+    return res.status(400).json({ ok: false, error: 'id_upload invalido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id_upload, original_name, stored_name, file_path, estado, mensaje
+         FROM facturas_bot_uploads
+        WHERE id_upload = $1
+        LIMIT 1`,
+      [idUpload]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: 'No existe la carga indicada.' });
+    }
+    const upload = result.rows[0];
+    const extracted = await extractFacturaBotPreview(upload);
+    return res.json({
+      ok: true,
+      upload: {
+        id_upload: Number(upload.id_upload),
+        original_name: upload.original_name || '',
+        estado: upload.estado || '',
+        mensaje: upload.mensaje || '',
+      },
+      extracted,
+    });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
