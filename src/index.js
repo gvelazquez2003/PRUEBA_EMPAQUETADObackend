@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import crypto from 'crypto';
 import { createRequire } from 'module';
+import fs from 'fs/promises';
+import path from 'path';
 
 dotenv.config();
 
@@ -16,6 +18,8 @@ const AUTH_SESSION_TTL_HOURS = Number(process.env.AUTH_SESSION_TTL_HOURS || 168)
 const CONTROL_PRODUCCION_API_BASE = String(process.env.CONTROL_PRODUCCION_API_BASE || 'https://control.produccionpdt.com').trim().replace(/\/+$/, '');
 const ALMACEN09_ENTRADAS_START_DATE = String(process.env.ALMACEN09_ENTRADAS_START_DATE || '2026-06-09').trim();
 const ALMACEN09_ENTRADAS_VISIBLE_DAYS = Math.max(0, Number(process.env.ALMACEN09_ENTRADAS_VISIBLE_DAYS || 2) || 2);
+const FACTURAS_BOT_UPLOAD_DIR = path.resolve(process.env.FACTURAS_BOT_UPLOAD_DIR || path.join(process.cwd(), 'data', 'facturas-bot', 'pendientes'));
+const FACTURAS_BOT_MAX_UPLOAD_MB = Math.max(1, Number(process.env.FACTURAS_BOT_MAX_UPLOAD_MB || 15) || 15);
 const APP_ROLES = {
   ADMIN: 'administrador',
   PRODUCCION: 'produccion',
@@ -149,7 +153,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   next();
 });
-app.use(express.json());
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
 
 const databaseUrl = String(process.env.DATABASE_URL || '').trim();
 const dbSslValue = String(process.env.DB_SSL || '').trim().toLowerCase();
@@ -2108,6 +2112,50 @@ async function ensureSalidas09Tables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_hojas_ruta_exportadas_ruta
     ON hojas_ruta_exportadas (LOWER(TRIM(ruta_nombre)))
+  `);
+}
+
+async function ensureFacturasBotTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS facturas_bot_uploads (
+      id_upload BIGSERIAL PRIMARY KEY,
+      original_name VARCHAR(240) NOT NULL,
+      stored_name VARCHAR(260) NOT NULL,
+      file_path TEXT NOT NULL,
+      mime_type VARCHAR(120) NOT NULL DEFAULT 'application/pdf',
+      file_size BIGINT NOT NULL DEFAULT 0,
+      sha256 VARCHAR(64) NOT NULL,
+      estado VARCHAR(30) NOT NULL DEFAULT 'pendiente',
+      mensaje TEXT,
+      uploaded_by VARCHAR(80),
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS original_name VARCHAR(240)`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS stored_name VARCHAR(260)`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS file_path TEXT`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS mime_type VARCHAR(120) NOT NULL DEFAULT 'application/pdf'`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS file_size BIGINT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS sha256 VARCHAR(64)`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS estado VARCHAR(30) NOT NULL DEFAULT 'pendiente'`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS mensaje TEXT`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS uploaded_by VARCHAR(80)`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_bot_uploads_sha256
+    ON facturas_bot_uploads (sha256)
+  `).catch(() => {});
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_facturas_bot_uploads_created_at
+    ON facturas_bot_uploads (created_at DESC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_facturas_bot_uploads_estado
+    ON facturas_bot_uploads (estado)
   `);
 }
 
@@ -6517,6 +6565,149 @@ app.get('/api/almacen09/errores-conteo', async (req, res) => {
   }
 });
 
+function sanitizeUploadedPdfName(value) {
+  const raw = String(value || 'factura.pdf').trim().replace(/\\/g, '/').split('/').pop() || 'factura.pdf';
+  const withoutExt = raw.replace(/\.pdf$/i, '');
+  const cleanBase = stripDiacritics(withoutExt)
+    .replace(/[^A-Za-z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 120) || 'factura';
+  return `${cleanBase}.pdf`;
+}
+
+function normalizeUploadStatus(value) {
+  const clean = String(value || '').trim().toLowerCase();
+  return ['pendiente', 'procesando', 'cargada', 'revision', 'error', 'duplicada'].includes(clean) ? clean : '';
+}
+
+function mapFacturaUploadRow(row) {
+  return {
+    id_upload: Number(row.id_upload),
+    original_name: row.original_name || '',
+    stored_name: row.stored_name || '',
+    mime_type: row.mime_type || 'application/pdf',
+    file_size: Number(row.file_size || 0),
+    sha256: row.sha256 || '',
+    estado: row.estado || 'pendiente',
+    mensaje: row.mensaje || '',
+    uploaded_by: row.uploaded_by || '',
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+app.get('/api/facturas-bot/uploads', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
+  const estado = normalizeUploadStatus(req.query?.estado);
+  try {
+    const params = [];
+    const whereParts = [];
+    if (estado) {
+      params.push(estado);
+      whereParts.push(`estado = $${params.length}`);
+    }
+    params.push(limit);
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const result = await pool.query(
+      `SELECT id_upload, original_name, stored_name, mime_type, file_size, sha256, estado, mensaje, uploaded_by,
+              TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+              TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at
+         FROM facturas_bot_uploads
+         ${whereSql}
+        ORDER BY created_at DESC, id_upload DESC
+        LIMIT $${params.length}`,
+      params
+    );
+    return res.json({ ok: true, rows: result.rows.map(mapFacturaUploadRow) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/facturas-bot/uploads', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const originalName = sanitizeUploadedPdfName(req.body?.filename || req.body?.file_name || '');
+  const mimeType = String(req.body?.mime_type || req.body?.mimeType || 'application/pdf').trim().toLowerCase();
+  const rawBase64 = String(req.body?.content_base64 || req.body?.base64 || '').trim();
+  const base64 = rawBase64.replace(/^data:application\/pdf;base64,/i, '');
+  if (mimeType !== 'application/pdf' || !/\.pdf$/i.test(originalName)) {
+    return res.status(400).json({ ok: false, error: 'Solo se permiten archivos PDF.' });
+  }
+  if (!base64) {
+    return res.status(400).json({ ok: false, error: 'content_base64 es obligatorio.' });
+  }
+
+  let buffer = null;
+  try {
+    buffer = Buffer.from(base64, 'base64');
+  } catch (_) {
+    return res.status(400).json({ ok: false, error: 'El archivo no tiene base64 valido.' });
+  }
+  if (!buffer?.length || buffer.slice(0, 4).toString('latin1') !== '%PDF') {
+    return res.status(400).json({ ok: false, error: 'El archivo no parece ser un PDF valido.' });
+  }
+  const maxBytes = FACTURAS_BOT_MAX_UPLOAD_MB * 1024 * 1024;
+  if (buffer.length > maxBytes) {
+    return res.status(413).json({ ok: false, error: `El PDF supera el limite de ${FACTURAS_BOT_MAX_UPLOAD_MB} MB.` });
+  }
+
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+  const duplicate = await pool.query(
+    `SELECT id_upload, estado, original_name
+       FROM facturas_bot_uploads
+      WHERE sha256 = $1
+      LIMIT 1`,
+    [sha256]
+  );
+  if (duplicate.rowCount) {
+    const previous = duplicate.rows[0];
+    return res.status(409).json({
+      ok: false,
+      error: `Este PDF ya fue cargado como ${previous.original_name || `#${previous.id_upload}`}.`,
+      duplicate: {
+        id_upload: Number(previous.id_upload),
+        estado: previous.estado || '',
+        original_name: previous.original_name || '',
+      },
+    });
+  }
+
+  try {
+    await fs.mkdir(FACTURAS_BOT_UPLOAD_DIR, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+    const storedName = `${timestamp}_${sha256.slice(0, 12)}_${originalName}`;
+    const filePath = path.join(FACTURAS_BOT_UPLOAD_DIR, storedName);
+    await fs.writeFile(filePath, buffer, { flag: 'wx' });
+
+    const inserted = await pool.query(
+      `INSERT INTO facturas_bot_uploads (
+         original_name, stored_name, file_path, mime_type, file_size, sha256, estado, mensaje, uploaded_by
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, 'pendiente', 'PDF recibido. Pendiente por procesar.', $7)
+       RETURNING id_upload, original_name, stored_name, mime_type, file_size, sha256, estado, mensaje, uploaded_by,
+                 TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+                 TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at`,
+      [
+        originalName,
+        storedName,
+        filePath,
+        'application/pdf',
+        buffer.length,
+        sha256,
+        normalizeAuthUsername(auth.username) || 'SISTEMA',
+      ]
+    );
+    return res.status(201).json({ ok: true, upload: mapFacturaUploadRow(inserted.rows[0]) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.post('/api/almacen09/errores-conteo/delete', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
   if (!auth) return;
@@ -8338,6 +8529,7 @@ async function startServer() {
     ['ensureControlInventarioTable', ensureControlInventarioTable],
     ['ensureMermaTables', ensureMermaTables],
     ['ensureSalidas09Tables', ensureSalidas09Tables],
+    ['ensureFacturasBotTables', ensureFacturasBotTables],
     ['ensureRouteDeliveryTables', ensureRouteDeliveryTables],
     ['ensureIntegratedVrpTables', integratedVrpRoutes.ensureDatabaseReady],
     ['ensurePerformanceIndexes', ensurePerformanceIndexes],
