@@ -1029,18 +1029,23 @@ function safeDecodeURIComponent(value) {
 async function resolveDeliveryStatusKeys(key, auth) {
     const cleanKey = normalizeText(key);
     if (!cleanKey) return [];
-    const clients = await getClients("", auth);
-    const client = clients.find((item) => {
-        const keys = Array.isArray(item.statusKeys) && item.statusKeys.length
-            ? item.statusKeys
-            : [item.key];
-        return keys.some((candidate) => normalizeText(candidate) === cleanKey);
-    });
-    if (!client) return [cleanKey];
-    return uniqueTextValues([
-        client.key,
-        ...(Array.isArray(client.statusKeys) ? client.statusKeys : [])
+    const parts = cleanKey.split("::");
+    if (parts.length < 3) return [cleanKey];
+    const clientId = parts[0];
+    const route = parts[1];
+    const address = parts.slice(2).join("::");
+    const addressWithoutVenezuela = /(?:,\s*)?venezuela\s*$/i.test(address)
+        ? address.replace(/(?:,\s*)?venezuela\s*$/i, "").trim()
+        : "";
+    const addressVariants = uniqueTextValues([
+        address,
+        addressWithoutVenezuela,
+        normalizeDeliveryAddress(address),
+        normalizeDeliveryLegacyAddress(address),
+        addressWithoutVenezuela ? normalizeDeliveryAddress(addressWithoutVenezuela) : "",
+        addressWithoutVenezuela ? normalizeDeliveryLegacyAddress(addressWithoutVenezuela) : ""
     ]);
+    return uniqueTextValues(addressVariants.map((variant) => makeClientKey(clientId, route, variant)));
 }
 
 async function handleDeliveryStatusRequest(req, res, keyValue) {
