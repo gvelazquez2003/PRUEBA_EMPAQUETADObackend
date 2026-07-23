@@ -6729,6 +6729,7 @@ function mapFacturaUploadRow(row) {
     estado: row.estado || 'pendiente',
     mensaje: row.mensaje || '',
     id_factura: row.id_factura === null || row.id_factura === undefined ? null : Number(row.id_factura),
+    numero_control: row.numero_control === null || row.numero_control === undefined ? null : Number(row.numero_control),
     uploaded_by: row.uploaded_by || '',
     processed_by: row.processed_by || '',
     created_at: row.created_at,
@@ -7011,18 +7012,31 @@ app.get('/api/facturas-bot/uploads', async (req, res) => {
     const whereParts = [];
     if (estado) {
       params.push(estado);
-      whereParts.push(`estado = $${params.length}`);
+      whereParts.push(`fbu.estado = $${params.length}`);
     }
     params.push(limit);
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const result = await pool.query(
-      `SELECT id_upload, original_name, stored_name, mime_type, file_size, sha256, estado, mensaje, id_factura, uploaded_by, processed_by,
-              TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
-              TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at,
-              TO_CHAR(processed_at, 'YYYY-MM-DD HH24:MI:SS') AS processed_at
-         FROM facturas_bot_uploads
+      `SELECT
+              fbu.id_upload,
+              fbu.original_name,
+              fbu.stored_name,
+              fbu.mime_type,
+              fbu.file_size,
+              fbu.sha256,
+              fbu.estado,
+              fbu.mensaje,
+              fbu.id_factura,
+              sf.numero_control,
+              fbu.uploaded_by,
+              fbu.processed_by,
+              TO_CHAR(fbu.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+              TO_CHAR(fbu.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at,
+              TO_CHAR(fbu.processed_at, 'YYYY-MM-DD HH24:MI:SS') AS processed_at
+         FROM facturas_bot_uploads fbu
+         LEFT JOIN salidas_facturas sf ON sf.id_factura = fbu.id_factura
          ${whereSql}
-        ORDER BY created_at DESC, id_upload DESC
+        ORDER BY fbu.created_at DESC, fbu.id_upload DESC
         LIMIT $${params.length}`,
       params
     );
@@ -7147,6 +7161,42 @@ app.get('/api/facturas-bot/uploads/:id_upload/debug', async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/facturas-bot/uploads/:id_upload/pdf', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const idUpload = Number(req.params?.id_upload || 0);
+  if (!Number.isInteger(idUpload) || idUpload <= 0) {
+    return res.status(400).json({ ok: false, error: 'id_upload invalido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT original_name, file_path
+         FROM facturas_bot_uploads
+        WHERE id_upload = $1
+        LIMIT 1`,
+      [idUpload]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: 'No existe la carga indicada.' });
+    }
+    const row = result.rows[0];
+    const filePath = path.resolve(String(row.file_path || ''));
+    const uploadRoot = path.resolve(FACTURAS_BOT_UPLOAD_DIR);
+    if (!filePath.startsWith(`${uploadRoot}${path.sep}`) && filePath !== uploadRoot) {
+      return res.status(403).json({ ok: false, error: 'Ruta de archivo no permitida.' });
+    }
+    await fs.access(filePath);
+    const filename = sanitizeUploadedPdfName(row.original_name || `factura-${idUpload}.pdf`);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    return res.sendFile(filePath);
+  } catch (error) {
+    return res.status(404).json({ ok: false, error: 'No se pudo abrir el PDF registrado.' });
   }
 });
 
@@ -7614,11 +7664,11 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
     const detalleCreatedVzExpr = `(sd.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Caracas')`;
     if (hasMes) {
       params.push(mes);
-      whereParts.push(`TO_CHAR(sf.fecha_emision, 'YYYY-MM') = $${params.length}`);
+      whereParts.push(`TO_CHAR(${facturaCreatedVzExpr}, 'YYYY-MM') = $${params.length}`);
     }
     if (hasAnio) {
       params.push(anio);
-      whereParts.push(`TO_CHAR(sf.fecha_emision, 'YYYY') = $${params.length}`);
+      whereParts.push(`TO_CHAR(${facturaCreatedVzExpr}, 'YYYY') = $${params.length}`);
     }
     if (hasDocumento) {
       params.push(documento);
@@ -7647,6 +7697,8 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          sf.direccion_id,
          sf.direccion_texto,
          TO_CHAR(${facturaCreatedVzExpr}, 'YYYY-MM-DD HH24:MI:SS') AS factura_created_at,
+         fbu.id_upload AS factura_bot_upload_id,
+         fbu.original_name AS factura_bot_original_name,
          sf.estado,
          sd.id_detalle,
          sd.id_producto,
@@ -7666,8 +7718,15 @@ app.get('/api/almacen09/salidas-facturas', async (req, res) => {
          FROM almacen09_salidas_detalle
          ORDER BY id_detalle
        ) sd ON sd.id_factura = sf.id_factura
+       LEFT JOIN LATERAL (
+         SELECT id_upload, original_name
+         FROM facturas_bot_uploads
+         WHERE id_factura = sf.id_factura
+         ORDER BY processed_at DESC NULLS LAST, id_upload DESC
+         LIMIT 1
+       ) fbu ON TRUE
        ${whereSql}
-       ORDER BY sf.fecha_emision DESC, sf.id_factura DESC, sd.id_detalle ASC
+       ORDER BY ${facturaCreatedVzExpr} DESC, sf.id_factura DESC, sd.id_detalle ASC
        LIMIT $${params.length + 1}
        OFFSET $${params.length + 2}`,
       [...params, fetchLimit, offset]
