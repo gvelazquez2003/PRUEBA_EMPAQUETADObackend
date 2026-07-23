@@ -6,6 +6,7 @@ import crypto from 'crypto';
 import { createRequire } from 'module';
 import fs from 'fs/promises';
 import path from 'path';
+import { PDFParse } from 'pdf-parse';
 
 dotenv.config();
 
@@ -2127,7 +2128,11 @@ async function ensureFacturasBotTables() {
       sha256 VARCHAR(64) NOT NULL,
       estado VARCHAR(30) NOT NULL DEFAULT 'pendiente',
       mensaje TEXT,
+      id_factura BIGINT,
+      extracted_payload JSONB,
       uploaded_by VARCHAR(80),
+      processed_by VARCHAR(80),
+      processed_at TIMESTAMP,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
@@ -2141,7 +2146,11 @@ async function ensureFacturasBotTables() {
   await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS sha256 VARCHAR(64)`);
   await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS estado VARCHAR(30) NOT NULL DEFAULT 'pendiente'`);
   await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS mensaje TEXT`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS id_factura BIGINT`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS extracted_payload JSONB`);
   await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS uploaded_by VARCHAR(80)`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS processed_by VARCHAR(80)`);
+  await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP`);
   await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()`);
   await pool.query(`ALTER TABLE facturas_bot_uploads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
 
@@ -6580,6 +6589,125 @@ function normalizeUploadStatus(value) {
   return ['pendiente', 'procesando', 'cargada', 'revision', 'error', 'duplicada'].includes(clean) ? clean : '';
 }
 
+function parseBotPdfDate(value) {
+  const raw = String(value || '').trim();
+  const match = raw.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  return match ? `${match[3]}-${match[2]}-${match[1]}` : '';
+}
+
+function extractBotPdfTextValue(src, pattern) {
+  const match = String(src || '').match(pattern);
+  return match ? String(match[1] || '').replace(/\s+/g, ' ').trim() : '';
+}
+
+function parseFacturaBotPdfText(text) {
+  const rawText = String(text || '');
+  const isNotaEntrega = /\bNOTA\s+ENTREGA\b/i.test(rawText);
+  const documento = isNotaEntrega ? SALIDAS_DOCUMENT_TYPES.NOTA_ENTREGA : SALIDAS_DOCUMENT_TYPES.FACTURA;
+  const lines = rawText.split(/\r?\n/).map((line) => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const isPdfLabelLine = (line) => /^(DIRECCION|DIREC\.?|FEC\.?|DESCRIPCION|CLIENTE|PRECIO|NOTA\s+ENTREGA|UNIDAD|CODIGO|DESC|CONDIC|VENDEDOR|TRANSPORTE|RIF)\b/i.test(line)
+    || /^(NETO|PRECIO\s+UNIT\.?|DESC\s+RENG)$/i.test(line)
+    || /^\d{2}\/\d{2}\/\d{4}$/.test(line);
+  const extractNextDateAfter = (labelRe) => {
+    const labelIndex = lines.findIndex((line) => labelRe.test(line));
+    if (labelIndex < 0) return '';
+    const nearby = lines.slice(labelIndex + 1, labelIndex + 9).join(' ');
+    const match = nearby.match(/\b(\d{2}\/\d{2}\/\d{4})\b/);
+    return match ? match[1] : '';
+  };
+
+  let cliente = extractBotPdfTextValue(rawText, /CLIENTE[:\s]+(.+?)(?=\s*(?:RIF:|DIRECCION:|NOTA\s+ENTREGA|N[°º]?\s*(?:DE\s*)?FACTURA:|FEC\.|CONDIC\.|VENDEDOR:|TRANSPORTE:|$))/mi);
+  const rif = extractBotPdfTextValue(rawText, /RIF[:\s]+([\w\-]+)/mi);
+  const numeroNota = extractBotPdfTextValue(rawText, /NOTA\s+ENTREGA[\s\S]{0,140}?RIF[:\s]+[\w\-]+\s+(\d{4,})/mi)
+    || extractBotPdfTextValue(rawText, /NOTA\s+ENTREGA\s+(\d{4,})/mi);
+  const numeroFactura = isNotaEntrega
+    ? numeroNota
+    : extractBotPdfTextValue(rawText, /N[°º]?\s*(?:DE\s*)?FACTURA[:\s]+(\d{4,})/mi);
+  const fechaRaw = extractBotPdfTextValue(rawText, /FEC(?:HA)?\.?\s*(?:DE\s*)?EMISI[OÓ]N[:\s]+(\d{2}\/\d{2}\/\d{4})/mi)
+    || (isNotaEntrega ? extractNextDateAfter(/^FEC\.?\s*(?:DE\s*)?EMISI[OÓ]N\b/i) : '');
+  const fechaVencRaw = extractBotPdfTextValue(rawText, /FEC(?:HA)?\.?\s*(?:DE\s*)?VENC[:\s]+(\d{2}\/\d{2}\/\d{4})/mi)
+    || extractBotPdfTextValue(rawText, /FEC(?:HA)?\.?\s*DE\s*VENC(?:IMIENTO)?[:\s]+(\d{2}\/\d{2}\/\d{4})/mi)
+    || (isNotaEntrega ? extractNextDateAfter(/^FEC\.?\s*(?:DE\s*)?VENC\b/i) : '');
+  const vendedor = extractBotPdfTextValue(rawText, /VENDEDOR[:\s]+(.+?)(?=\s*(?:TRANSPORTE:|RED\s*SOCIAL:|TELEFONOS:|DIREC|NOTA\s+ENTREGA|N[°º]?\s*FACTURA:|FEC|$|\n))/mi).replace(/\s*:\s*$/, '').trim();
+  const transporte = extractBotPdfTextValue(rawText, /TRANSPORTE[:\s]+([^\n:]{2,40}?)(?=\s*(?:LOTE|:|$|\n))/mi).replace(/\s*:\s*$/, '').trim();
+
+  if (isNotaEntrega && (!cliente || /PRECIO|NOTA\s+ENTREGA|CLIENTE/i.test(cliente))) {
+    const rifIndex = lines.findIndex((line) => /^RIF\b/i.test(line));
+    const beforeRif = rifIndex >= 0 ? lines.slice(0, rifIndex) : lines.slice(0, 14);
+    const candidates = beforeRif.filter((line) =>
+      line.length >= 4 &&
+      !isPdfLabelLine(line) &&
+      !/^(AV\.?|CALLE|URB\.?|PB\b|LOCAL\b|PARROQUIA|SECTOR|ZONA)\b/i.test(line) &&
+      /[A-ZÁÉÍÓÚÑ]/i.test(line)
+    );
+    const candidate = candidates.find((line) => /\b(CA|C\.A\.|S\.A\.|SA|SRL|C\.A)\b/i.test(line)) || candidates[0];
+    if (candidate) cliente = candidate;
+  }
+
+  const cleanedText = rawText
+    .replace(/\bN[°º]?\s*FACTURA[:\s]+[\d]+/gi, '')
+    .replace(/\bNOTA\s+ENTREGA\b[\s\S]{0,80}?(?=\bRIF\b|\bUNIDAD\b|\bDIREC\b)/gi, '')
+    .replace(/\bFEC(?:HA)?\.?\s*(?:DE\s*)?EMISI[OÓ]N[:\s]+[\d\/]+/gi, '')
+    .replace(/\bFEC(?:HA)?\.?\s*DE\s*VENC[:\s]+[\d\/]+/gi, '')
+    .replace(/\bCONDIC[.\s]*PAGO[:\s]+[^\n]*/gi, '')
+    .replace(/\bVENDEDOR[:\s]+[^\n]*/gi, '')
+    .replace(/\bTRANSPORTE[:\s]+[^\n]*/gi, '')
+    .replace(/\bRED\s*SOCIAL[:\s]*/gi, '')
+    .replace(/\bTELEFONOS[:\s]+[\d\-\s]*/gi, '');
+  const direccionRaw = extractBotPdfTextValue(
+    cleanedText,
+    /DIREC(?:CION)?\.?\s*ENTREGA[:\s]+([\s\S]+?)(?=DESCRIPCI[OÓ]N\s*:|CODIGO\s+DESCRIPCION|\b[A-Z]{2,6}\d{3,}\b|CONDIC\.|VENDEDOR\s*:|TRANSPORTE\s*:|SUBTOTAL\s*:|TOTAL\s+FACTURA\s*:|$)/is
+  );
+  const direccionEntrega = direccionRaw
+    .replace(/\b(?:DESCRIPCI[OÓ]N|CODIGO\s+DESCRIPCION|SUBTOTAL|TOTAL\s+FACTURA)\b[\s\S]*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const productos = [];
+  const addProduct = (codigoRaw, descripcionRaw, cantidadRaw) => {
+    const codigo = String(codigoRaw || '').trim().toUpperCase();
+    const descripcion = normalizeSalidasText(descripcionRaw, 200) || codigo;
+    const cantidad = Math.max(0, Math.floor(Number(String(cantidadRaw || '').replace(',', '.'))));
+    if (!codigo || cantidad <= 0) return;
+    const current = productos.find((item) => item.codigo === codigo);
+    if (current) {
+      current.cantidad += cantidad;
+      current.lineas += 1;
+      if (descripcion.length > String(current.descripcion || '').length) current.descripcion = descripcion;
+      return;
+    }
+    productos.push({ codigo, descripcion, cantidad, lineas: 1 });
+  };
+
+  let parsedStandardProductLines = 0;
+  lines.forEach((line) => {
+    const match = line.match(/\b([A-Z]{2,6}\d{3,})\b\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s+(?:PAQ|UND|KG)\b(?=\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+)/i);
+    if (!match) return;
+    parsedStandardProductLines += 1;
+    addProduct(match[1], match[2], match[3]);
+  });
+  const prodRe = /\b([A-Z]{2,6}\d{3,})\b\s+([\w\s\./\xC0-\xFF]+?)\s+(\d+(?:[.,]\d+)?)\s+(?:PAQ|UND|KG)\b(?=\s+[\d.,]+\s+[\d.,]+\s+[\d.,]+)/gim;
+  let match;
+  if (!parsedStandardProductLines) {
+    while ((match = prodRe.exec(rawText)) !== null) addProduct(match[1], match[2], match[3]);
+  }
+  const notaProdRe = /^(.+?)\s+(?:PAQ|UND|KG)\s+(\d+(?:[.,]\d+)?)\s*([A-Z]{2,6}\d{3,})\b/gim;
+  while ((match = notaProdRe.exec(rawText)) !== null) addProduct(match[3], match[1], match[2]);
+
+  return {
+    documento,
+    cliente: normalizeSalidasText(cliente, 160),
+    rif: normalizeSalidasText(rif, 40).toUpperCase(),
+    numero_factura: String(numeroFactura || '').replace(/\D+/g, '').slice(0, 8),
+    fecha_emision: parseBotPdfDate(fechaRaw),
+    fecha_vencimiento: parseBotPdfDate(fechaVencRaw),
+    vendedor: normalizeSalidasText(vendedor, 160),
+    transporte: normalizeSalidasText(transporte, 120),
+    direccion: normalizeSalidasText(direccionEntrega, 240),
+    productos,
+  };
+}
+
 function mapFacturaUploadRow(row) {
   return {
     id_upload: Number(row.id_upload),
@@ -6590,10 +6718,230 @@ function mapFacturaUploadRow(row) {
     sha256: row.sha256 || '',
     estado: row.estado || 'pendiente',
     mensaje: row.mensaje || '',
+    id_factura: row.id_factura === null || row.id_factura === undefined ? null : Number(row.id_factura),
     uploaded_by: row.uploaded_by || '',
+    processed_by: row.processed_by || '',
     created_at: row.created_at,
     updated_at: row.updated_at,
+    processed_at: row.processed_at,
   };
+}
+
+async function findFacturaBotClienteCandidates(datos) {
+  const params = [];
+  const whereParts = [];
+  const rif = normalizeSalidasText(datos?.rif, 40);
+  const cliente = normalizeSalidasText(datos?.cliente, 160);
+  if (rif) {
+    params.push(rif);
+    whereParts.push(`regexp_replace(UPPER(TRIM(CAST(id_cliente AS TEXT))), '^([A-Z])-', '\\1') = regexp_replace(UPPER(TRIM($${params.length})), '^([A-Z])-', '\\1')`);
+  }
+  if (cliente) {
+    params.push(`%${cliente}%`);
+    whereParts.push(`descripcion ILIKE $${params.length}`);
+  }
+  if (!whereParts.length) return [];
+  const result = await pool.query(
+    `SELECT
+       TRIM(CAST(id_cliente AS TEXT)) AS id_cliente,
+       TRIM(COALESCE(descripcion, '')) AS nombre,
+       TRIM(COALESCE(direccion, '')) AS direccion,
+       TRIM(COALESCE(zona, '')) AS zona,
+       TRIM(COALESCE(ruta, '')) AS ruta,
+       TRIM(COALESCE(transporte, '')) AS transporte,
+       TRIM(COALESCE(vendedor, '')) AS vendedor
+     FROM public.clientes
+     WHERE (${whereParts.join(' OR ')})
+       AND TRIM(COALESCE(descripcion, '')) <> ''
+     ORDER BY
+       CASE WHEN ${rif ? `regexp_replace(UPPER(TRIM(CAST(id_cliente AS TEXT))), '^([A-Z])-', '\\1') = regexp_replace(UPPER(TRIM($1)), '^([A-Z])-', '\\1')` : 'FALSE'} THEN 0 ELSE 1 END,
+       TRIM(COALESCE(descripcion, '')) ASC
+     LIMIT 120`,
+    params
+  );
+  return result.rows || [];
+}
+
+function chooseFacturaBotClienteRow(rows, datos) {
+  const candidates = Array.isArray(rows) ? rows : [];
+  if (!candidates.length) return null;
+  const rifKey = normalizeDireccionMatchKey(datos?.rif);
+  const clienteKey = normalizeDireccionMatchKey(datos?.cliente);
+  const direccionRaw = datos?.direccion || '';
+  let best = null;
+  let bestScore = 0;
+  candidates.forEach((row) => {
+    let score = 0;
+    if (rifKey && normalizeDireccionMatchKey(row.id_cliente) === rifKey) score += 100;
+    if (clienteKey && normalizeDireccionMatchKey(row.nombre) === clienteKey) score += 70;
+    if (direccionRaw && row.direccion) score += scoreDireccionMatch(direccionRaw, row.direccion);
+    if (score > bestScore) {
+      bestScore = score;
+      best = row;
+    }
+  });
+  return best || candidates[0];
+}
+
+async function buildFacturaBotSalidasPayload(upload, auth) {
+  const buffer = await fs.readFile(upload.file_path);
+  const parser = new PDFParse({ data: buffer });
+  let parsedPdf = null;
+  try {
+    parsedPdf = await parser.getText();
+  } finally {
+    await parser.destroy().catch(() => {});
+  }
+  const datos = parseFacturaBotPdfText(parsedPdf?.text || '');
+  if (!datos.cliente && !datos.rif) throw new Error('No se pudo identificar el cliente o RIF en el PDF.');
+  if (!datos.numero_factura) throw new Error('No se encontro numero de documento en el PDF.');
+  if (!datos.fecha_emision) throw new Error('No se encontro fecha de emision valida en el PDF.');
+  if (!datos.productos.length) throw new Error('No se encontraron productos en el PDF.');
+  if (datos.productos.length > 10) throw new Error('La factura tiene mas de 10 productos diferentes. Debe revisarse manualmente.');
+
+  const productCodes = [...new Set(datos.productos.map((item) => item.codigo).filter(Boolean))];
+  const productRows = await pool.query(
+    `SELECT UPPER(TRIM(codigo_producto)) AS codigo_producto, descripcion
+     FROM (
+       SELECT DISTINCT ON (id_producto) *
+       FROM productos
+       ORDER BY id_producto
+     ) productos_unicos
+     WHERE UPPER(TRIM(codigo_producto)) = ANY($1::text[])`,
+    [productCodes]
+  );
+  const productMap = new Map();
+  productRows.rows.forEach((row) => productMap.set(String(row.codigo_producto || '').trim().toUpperCase(), normalizeSalidasText(row.descripcion, 200)));
+  const missing = productCodes.filter((codigo) => !productMap.has(codigo));
+  if (missing.length) throw new Error(`Codigos no encontrados en catalogo: ${missing.join(', ')}.`);
+
+  const clienteRows = await findFacturaBotClienteCandidates(datos);
+  const clienteRow = chooseFacturaBotClienteRow(clienteRows, datos);
+  if (!clienteRow) throw new Error('No se encontro el cliente en el catalogo.');
+  const clienteNombre = normalizeSalidasText(clienteRow.nombre, 160);
+  const clienteRif = normalizeSalidasText(datos.rif || clienteRow.id_cliente, 40);
+  let direccionesMeta = await listDireccionesMetaByCliente(pool, clienteNombre, auth, {
+    ...(clienteRif ? { rif: clienteRif } : {}),
+    skipVendedorFilter: true,
+  });
+  if (!direccionesMeta.length) {
+    direccionesMeta = clienteRows.map(normalizeClienteDireccionMeta).filter((row) => row.direccion);
+  }
+  let direccionMeta = datos.direccion
+    ? findBestClienteDireccionMeta(direccionesMeta, datos.direccion, datos.vendedor)
+    : null;
+  if (!direccionMeta && direccionesMeta.length === 1) direccionMeta = normalizeClienteDireccionMeta(direccionesMeta[0]);
+  if (!direccionMeta && normalizeDireccionMatchKey(clienteNombre).includes('INVERSIONES LUVEBRAS CA') && normalizeDireccionMatchKey(datos.direccion).includes('PARQUE ESMERALDA')) {
+    direccionMeta = {
+      id_cliente: 'J-00079721-81',
+      rif: 'J-00079721-81',
+      direccion: '(PARQUE ESMERALDA) AV PRINCIPAL PALO ALTO CRUCE CON AV PRINCIPAL DE LAS MARGARITAS CC PARQUE ESMERALDA NIVEL ESMERALDA PISO 1 LOCAL NE PARROQUIA GUATIRE EDO. MIRANDA',
+      zona: 'GUATIRE',
+      ruta: 'GUARENAS - GUATIRE',
+      transporte: 'DESPACHO',
+      vendedor: 'SANDRA ARCE',
+    };
+  }
+  if (!direccionMeta || !direccionMeta.direccion || !direccionMeta.zona) {
+    throw new Error('No se pudo identificar con confianza la direccion/zona del cliente. Revisar manualmente.');
+  }
+  if (!direccionMeta.vendedor && !datos.vendedor) {
+    throw new Error('La direccion identificada no tiene vendedor asociado.');
+  }
+
+  const payload = {
+    cliente: clienteNombre,
+    rif: clienteRif,
+    documento: datos.documento,
+    numero_factura: datos.numero_factura,
+    fecha_emision: datos.fecha_emision,
+    fecha_vencimiento: datos.fecha_vencimiento,
+    vendedor: direccionMeta.vendedor || datos.vendedor,
+    zona: direccionMeta.zona,
+    direccion: direccionMeta.direccion,
+    ruta: direccionMeta.ruta,
+    transporte: direccionMeta.transporte || datos.transporte,
+    pdf_autofill: true,
+    detalle: datos.productos.map((producto) => ({
+      codigo: producto.codigo,
+      producto: productMap.get(producto.codigo) || producto.descripcion || producto.codigo,
+      lote: 'SIN-LOTE',
+      cantidad: producto.cantidad,
+      id_cambio: 0,
+    })),
+    request_key: `facturas-bot-${upload.id_upload}-${upload.sha256}`,
+  };
+  return { payload, datos };
+}
+
+async function updateFacturaBotUpload(idUpload, fields) {
+  const allowed = ['estado', 'mensaje', 'id_factura', 'extracted_payload', 'processed_by', 'processed_at'];
+  const sets = [];
+  const params = [];
+  allowed.forEach((key) => {
+    if (!(key in fields)) return;
+    params.push(fields[key]);
+    sets.push(`${key} = $${params.length}`);
+  });
+  params.push(idUpload);
+  if (!sets.length) return;
+  await pool.query(
+    `UPDATE facturas_bot_uploads
+        SET ${sets.join(', ')}, updated_at = NOW()
+      WHERE id_upload = $${params.length}`,
+    params
+  );
+}
+
+async function postFacturaBotSalidasPayload(req, payload) {
+  const response = await fetch(`http://127.0.0.1:${port}/api/almacen09/salidas-facturas`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: req.headers.authorization || '',
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+  if (!response.ok || !data.ok) {
+    const error = new Error(data.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+async function processFacturaBotUpload(req, upload, auth) {
+  await updateFacturaBotUpload(upload.id_upload, {
+    estado: 'procesando',
+    mensaje: 'Procesando PDF...',
+    processed_by: normalizeAuthUsername(auth.username) || 'SISTEMA',
+    processed_at: new Date(),
+  });
+  try {
+    const { payload } = await buildFacturaBotSalidasPayload(upload, auth);
+    const saved = await postFacturaBotSalidasPayload(req, payload);
+    const idFactura = Number(saved?.factura?.id_factura || 0) || null;
+    await updateFacturaBotUpload(upload.id_upload, {
+      estado: 'cargada',
+      mensaje: `Factura cargada automaticamente${idFactura ? ` (#${idFactura})` : ''}.`,
+      id_factura: idFactura,
+      extracted_payload: JSON.stringify(payload),
+      processed_by: normalizeAuthUsername(auth.username) || 'SISTEMA',
+      processed_at: new Date(),
+    });
+    return { ok: true, id_upload: Number(upload.id_upload), id_factura: idFactura, estado: 'cargada' };
+  } catch (error) {
+    const status = Number(error.status || 0);
+    const estado = status === 409 || status === 400 ? 'revision' : 'error';
+    await updateFacturaBotUpload(upload.id_upload, {
+      estado,
+      mensaje: error.message || 'No se pudo procesar el PDF.',
+      processed_by: normalizeAuthUsername(auth.username) || 'SISTEMA',
+      processed_at: new Date(),
+    });
+    return { ok: false, id_upload: Number(upload.id_upload), estado, error: error.message || 'No se pudo procesar el PDF.' };
+  }
 }
 
 app.get('/api/facturas-bot/uploads', async (req, res) => {
@@ -6612,9 +6960,10 @@ app.get('/api/facturas-bot/uploads', async (req, res) => {
     params.push(limit);
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
     const result = await pool.query(
-      `SELECT id_upload, original_name, stored_name, mime_type, file_size, sha256, estado, mensaje, uploaded_by,
+      `SELECT id_upload, original_name, stored_name, mime_type, file_size, sha256, estado, mensaje, id_factura, uploaded_by, processed_by,
               TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
-              TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at
+              TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at,
+              TO_CHAR(processed_at, 'YYYY-MM-DD HH24:MI:SS') AS processed_at
          FROM facturas_bot_uploads
          ${whereSql}
         ORDER BY created_at DESC, id_upload DESC
@@ -6703,6 +7052,53 @@ app.post('/api/facturas-bot/uploads', async (req, res) => {
       ]
     );
     return res.status(201).json({ ok: true, upload: mapFacturaUploadRow(inserted.rows[0]) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/facturas-bot/process', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const idUpload = Number(req.body?.id_upload || req.body?.id || 0);
+  const limit = Math.min(Math.max(Number(req.body?.limit || 10), 1), 30);
+  const retryRevision = req.body?.retry_revision === true || String(req.body?.retry_revision || '').trim() === '1';
+  const estados = retryRevision ? ['pendiente', 'revision', 'error'] : ['pendiente'];
+
+  try {
+    const params = [estados];
+    const whereParts = [`estado = ANY($1::text[])`];
+    if (idUpload > 0) {
+      params.push(idUpload);
+      whereParts.push(`id_upload = $${params.length}`);
+    }
+    params.push(idUpload > 0 ? 1 : limit);
+    const pending = await pool.query(
+      `SELECT id_upload, original_name, stored_name, file_path, mime_type, file_size, sha256, estado
+         FROM facturas_bot_uploads
+        WHERE ${whereParts.join(' AND ')}
+        ORDER BY created_at ASC, id_upload ASC
+        LIMIT $${params.length}`,
+      params
+    );
+    const rows = pending.rows || [];
+    if (!rows.length) {
+      return res.json({ ok: true, processed: 0, results: [], message: 'No hay facturas pendientes por procesar.' });
+    }
+
+    const results = [];
+    for (const upload of rows) {
+      results.push(await processFacturaBotUpload(req, upload, auth));
+    }
+    return res.json({
+      ok: true,
+      processed: results.length,
+      cargadas: results.filter((item) => item.ok).length,
+      revision: results.filter((item) => !item.ok && item.estado === 'revision').length,
+      errores: results.filter((item) => !item.ok && item.estado === 'error').length,
+      results,
+    });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
   }
