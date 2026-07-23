@@ -6806,9 +6806,12 @@ async function buildFacturaBotSalidasPayload(upload, auth) {
   if (!datos.numero_factura) {
     datos.numero_factura = extractFacturaBotNumberFromFilename(upload.original_name || upload.stored_name);
   }
+  const fechaEmisionFromPdf = Boolean(datos.fecha_emision);
+  if (!datos.fecha_emision) {
+    datos.fecha_emision = getTodayCaracasIsoDate();
+  }
   if (!datos.cliente && !datos.rif) throw new Error('No se pudo identificar el cliente o RIF en el PDF.');
   if (!datos.numero_factura) throw new Error('No se encontro numero de documento en el PDF.');
-  if (!datos.fecha_emision) throw new Error('No se encontro fecha de emision valida en el PDF.');
   if (!datos.productos.length) throw new Error('No se encontraron productos en el PDF.');
   if (datos.productos.length > 10) throw new Error('La factura tiene mas de 10 productos diferentes. Debe revisarse manualmente.');
 
@@ -6884,6 +6887,9 @@ async function buildFacturaBotSalidasPayload(upload, auth) {
     })),
     request_key: `facturas-bot-${upload.id_upload}-${upload.sha256}`,
   };
+  if (!fechaEmisionFromPdf) {
+    payload.fecha_emision_fuente = 'fecha_actual_por_respaldo';
+  }
   return { payload, datos };
 }
 
@@ -6900,12 +6906,17 @@ async function extractFacturaBotPreview(upload) {
   if (!datos.numero_factura) {
     datos.numero_factura = extractFacturaBotNumberFromFilename(upload.original_name || upload.stored_name);
   }
+  const fechaEmisionFromPdf = Boolean(datos.fecha_emision);
+  if (!datos.fecha_emision) {
+    datos.fecha_emision = getTodayCaracasIsoDate();
+  }
   return {
     documento: datos.documento,
     cliente: datos.cliente,
     rif: datos.rif,
     numero_factura: datos.numero_factura,
     fecha_emision: datos.fecha_emision,
+    fecha_emision_fuente: fechaEmisionFromPdf ? 'pdf' : 'fecha_actual_por_respaldo',
     fecha_vencimiento: datos.fecha_vencimiento,
     vendedor: datos.vendedor,
     transporte: datos.transporte,
