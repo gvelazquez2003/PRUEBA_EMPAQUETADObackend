@@ -333,6 +333,18 @@ function makeClientKey(clientId, route, address) {
     return [normalizeText(clientId), normalizeText(route), normalizeText(address)].join("::");
 }
 
+function uniqueTextValues(values) {
+    const seen = new Set();
+    const result = [];
+    values.forEach((value) => {
+        const clean = normalizeText(value);
+        if (!clean || seen.has(clean)) return;
+        seen.add(clean);
+        result.push(clean);
+    });
+    return result;
+}
+
 function isRouteSheetSource(columns) {
     const normalized = columns.map(normalizeHeader);
     return normalized.includes("id_hoja") && normalized.includes("facturas");
@@ -367,6 +379,15 @@ function normalizeDeliveryAddress(address) {
     const comparable = normalizeHeader(value);
     if (comparable.includes("venezuela")) return value;
     return `${value}, Venezuela`;
+}
+
+function normalizeDeliveryLegacyAddress(address) {
+    const value = normalizeText(address);
+    if (!value) return "";
+    const comparable = normalizeHeader(value);
+    if (comparable.includes("venezuela")) return value;
+    if (comparable.includes("caracas")) return `${value}, Venezuela`;
+    return `${value}, Caracas, Venezuela`;
 }
 
 async function ensureDatabaseReady() {
@@ -536,16 +557,20 @@ function flattenRouteSheetClients(sheets) {
 
         facturas.forEach((invoice, index) => {
             const clientId = normalizeText(invoice.numero_control || invoice.id_factura || index + 1);
-            const address = normalizeDeliveryAddress(invoice.direccion_texto);
+            const originalAddress = normalizeText(invoice.direccion_texto);
+            const address = normalizeDeliveryAddress(originalAddress);
             const name = normalizeText(invoice.cliente_nombre);
-            const key = makeClientKey(
-                `${sheet.id_hoja}:${clientId}:${normalizeText(invoice.numero_factura || invoice.id_factura || index + 1)}`,
-                routeKey,
-                address
-            );
+            const invoiceKey = `${sheet.id_hoja}:${clientId}:${normalizeText(invoice.numero_factura || invoice.id_factura || index + 1)}`;
+            const key = makeClientKey(invoiceKey, routeKey, address);
+            const statusKeys = uniqueTextValues([
+                key,
+                makeClientKey(invoiceKey, routeKey, normalizeDeliveryLegacyAddress(originalAddress)),
+                makeClientKey(invoiceKey, routeKey, originalAddress)
+            ]);
 
             clients.push({
                 key,
+                statusKeys,
                 sheet: "hojas_ruta_exportadas",
                 sheetId: String(sheet.id_hoja),
                 rowNumber: index + 1,
@@ -556,7 +581,7 @@ function flattenRouteSheetClients(sheets) {
                 name,
                 nombre_o_razon_social: name,
                 address,
-                originalAddress: normalizeText(invoice.direccion_texto),
+                originalAddress,
                 route: routeKey,
                 routeName,
                 routeDisplayName,
@@ -686,6 +711,17 @@ function withAddressValidation(client, validation) {
     };
 }
 
+function getClientDeliveryStatus(deliveryStatuses, client) {
+    const keys = Array.isArray(client?.statusKeys) && client.statusKeys.length
+        ? client.statusKeys
+        : [client?.key];
+    for (const key of keys) {
+        const status = deliveryStatuses.get(key);
+        if (status) return status;
+    }
+    return null;
+}
+
 async function getClients(route, auth = null) {
     const base = await fetchSourceClients(route, auth);
     const overrides = await getOverridesMap();
@@ -693,7 +729,7 @@ async function getClients(route, auth = null) {
     const addressValidations = await getAddressValidationsMap();
     const merged = base.map((client) => {
         const override = overrides.get(client.key);
-        const deliveryStatus = deliveryStatuses.get(client.key);
+        const deliveryStatus = getClientDeliveryStatus(deliveryStatuses, client);
         const delivery = {
             delivered: deliveryStatus ? Boolean(deliveryStatus.delivered) : Boolean(client.delivered),
             deliveredBaskets: deliveryStatus ? Number(deliveryStatus.delivered_baskets || 0) : null,
@@ -766,7 +802,7 @@ async function routeStats(auth = null) {
             const facturas = Array.isArray(sheet.facturas) ? sheet.facturas : [];
             const clients = flattenRouteSheetClients([sheet]);
             const totals = clients.reduce((acc, client) => {
-                const deliveryStatus = deliveryStatuses.get(client.key);
+                const deliveryStatus = getClientDeliveryStatus(deliveryStatuses, client);
                 const delivered = deliveryStatus ? Boolean(deliveryStatus.delivered) : Boolean(client.delivered);
                 const partial = deliveryStatus ? Boolean(deliveryStatus.partial) && !delivered : false;
                 acc.delivered += delivered ? 1 : 0;
@@ -845,26 +881,31 @@ async function saveClientOverride(key, data) {
     await pool.query("DELETE FROM address_validations WHERE client_key = $1", [key]);
 }
 
-async function saveDeliveryStatus(key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail) {
+async function saveDeliveryStatus(clientKeys, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail) {
+    const keys = uniqueTextValues(Array.isArray(clientKeys) ? clientKeys : [clientKeys]);
+    if (!keys.length) return [];
     const baskets = Math.max(0, Math.trunc(Number(deliveredBaskets || 0)));
     const supplied = Math.max(0, Math.trunc(Number(suppliedBaskets || 0)));
     const recovered = Math.max(0, Math.trunc(Number(recoveredBaskets || 0)));
     const isPartial = Boolean(partial) && !Boolean(delivered);
     const detailJson = isPartial && Array.isArray(partialDetail) ? JSON.stringify(partialDetail) : null;
-    await pool.query(
-        `INSERT INTO delivery_status (client_key, delivered, delivered_baskets, supplied_baskets, recovered_baskets, delivered_at, partial, partial_detail, updated_at)
-         VALUES ($1, $2::boolean, $3::int, $4::int, $5::int, CASE WHEN $2::boolean THEN NOW() ELSE NULL END, $6::boolean, $7::jsonb, NOW())
-         ON CONFLICT (client_key) DO UPDATE
-         SET delivered = EXCLUDED.delivered,
-             delivered_baskets = EXCLUDED.delivered_baskets,
-             supplied_baskets = EXCLUDED.supplied_baskets,
-             recovered_baskets = EXCLUDED.recovered_baskets,
-             delivered_at = CASE WHEN EXCLUDED.delivered THEN COALESCE(delivery_status.delivered_at, NOW()) ELSE NULL END,
-             partial = EXCLUDED.partial,
-             partial_detail = EXCLUDED.partial_detail,
-             updated_at = NOW()`,
-        [key, Boolean(delivered), baskets, supplied, recovered, isPartial, detailJson]
-    );
+    for (const key of keys) {
+        await pool.query(
+            `INSERT INTO delivery_status (client_key, delivered, delivered_baskets, supplied_baskets, recovered_baskets, delivered_at, partial, partial_detail, updated_at)
+             VALUES ($1, $2::boolean, $3::int, $4::int, $5::int, CASE WHEN $2::boolean THEN NOW() ELSE NULL END, $6::boolean, $7::jsonb, NOW())
+             ON CONFLICT (client_key) DO UPDATE
+             SET delivered = EXCLUDED.delivered,
+                 delivered_baskets = EXCLUDED.delivered_baskets,
+                 supplied_baskets = EXCLUDED.supplied_baskets,
+                 recovered_baskets = EXCLUDED.recovered_baskets,
+                 delivered_at = CASE WHEN EXCLUDED.delivered THEN COALESCE(delivery_status.delivered_at, NOW()) ELSE NULL END,
+                 partial = EXCLUDED.partial,
+                 partial_detail = EXCLUDED.partial_detail,
+                 updated_at = NOW()`,
+            [key, Boolean(delivered), baskets, supplied, recovered, isPartial, detailJson]
+        );
+    }
+    return keys;
 }
 
 function normalizePartialLookup(value) {
@@ -973,6 +1014,77 @@ async function createPartialRedeliveryPending(key, partialDetail, auth) {
         ]
     );
     return { id_reentrega: result.rows?.[0]?.id_reentrega || null, lines: missingLines.length };
+}
+
+function safeDecodeURIComponent(value) {
+    const text = normalizeText(value);
+    if (!text) return "";
+    try {
+        return decodeURIComponent(text);
+    } catch (_) {
+        return text;
+    }
+}
+
+async function resolveDeliveryStatusKeys(key, auth) {
+    const cleanKey = normalizeText(key);
+    if (!cleanKey) return [];
+    const clients = await getClients("", auth);
+    const client = clients.find((item) => {
+        const keys = Array.isArray(item.statusKeys) && item.statusKeys.length
+            ? item.statusKeys
+            : [item.key];
+        return keys.some((candidate) => normalizeText(candidate) === cleanKey);
+    });
+    if (!client) return [cleanKey];
+    return uniqueTextValues([
+        client.key,
+        ...(Array.isArray(client.statusKeys) ? client.statusKeys : [])
+    ]);
+}
+
+async function handleDeliveryStatusRequest(req, res, keyValue) {
+    try {
+        await ensureDatabaseReady();
+        const auth = await requireRequestAuthContext(req, res);
+        if (!auth) return;
+        const key = normalizeText(keyValue ?? req.body?.key);
+        const delivered = req.body?.delivered === true;
+        const partial = req.body?.partial === true;
+        const partialDetail = Array.isArray(req.body?.partialDetail) ? req.body.partialDetail : null;
+        const deliveredBaskets = parseNonNegativeInteger(req.body?.deliveredBaskets, 0);
+        const suppliedBaskets = parseNonNegativeInteger(req.body?.suppliedBaskets, 0);
+        const recoveredBaskets = parseNonNegativeInteger(req.body?.recoveredBaskets, 0);
+        if (!key) return res.status(400).json({ ok: false, error: "Debes enviar una entrega valida." });
+
+        const statusKeys = await resolveDeliveryStatusKeys(key, auth);
+        const savedKeys = await saveDeliveryStatus(statusKeys, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail);
+        const primaryKey = savedKeys[0] || key;
+        let redeliveryPending = null;
+        if (partial && !delivered) {
+            redeliveryPending = await createPartialRedeliveryPending(primaryKey, partialDetail, auth);
+        } else if (delivered) {
+            await pool.query(
+                `DELETE FROM salidas_reentregas_pendientes
+                 WHERE client_key = ANY($1::text[])
+                   AND estado = 'pendiente'`,
+                [savedKeys.length ? savedKeys : [key]]
+            );
+        }
+        return res.json({
+            ok: true,
+            key: primaryKey,
+            statusKeys: savedKeys,
+            delivered,
+            deliveredBaskets,
+            suppliedBaskets,
+            recoveredBaskets,
+            partial,
+            redeliveryPending
+        });
+    } catch (error) {
+        return res.status(500).json({ ok: false, error: String(error.message || error) });
+    }
 }
 
 function classifyGeocodingResult(payload) {
@@ -2442,35 +2554,12 @@ app.put("/api/clients/:key", async (req, res) => {
     }
 });
 
+app.put("/api/deliveries", async (req, res) => {
+    await handleDeliveryStatusRequest(req, res, req.body?.key);
+});
+
 app.put("/api/deliveries/:key", async (req, res) => {
-    try {
-        await ensureDatabaseReady();
-        const auth = await requireRequestAuthContext(req, res);
-        if (!auth) return;
-        const key = decodeURIComponent(req.params.key);
-        const delivered = req.body?.delivered === true;
-        const partial = req.body?.partial === true;
-        const partialDetail = Array.isArray(req.body?.partialDetail) ? req.body.partialDetail : null;
-        const deliveredBaskets = parseNonNegativeInteger(req.body?.deliveredBaskets, 0);
-        const suppliedBaskets = parseNonNegativeInteger(req.body?.suppliedBaskets, 0);
-        const recoveredBaskets = parseNonNegativeInteger(req.body?.recoveredBaskets, 0);
-        if (!key) return res.status(400).json({ ok: false, error: "Debes enviar una entrega valida." });
-        await saveDeliveryStatus(key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, partialDetail);
-        let redeliveryPending = null;
-        if (partial && !delivered) {
-            redeliveryPending = await createPartialRedeliveryPending(key, partialDetail, auth);
-        } else if (delivered) {
-            await pool.query(
-                `DELETE FROM salidas_reentregas_pendientes
-                 WHERE client_key = $1
-                   AND estado = 'pendiente'`,
-                [key]
-            );
-        }
-        res.json({ ok: true, key, delivered, deliveredBaskets, suppliedBaskets, recoveredBaskets, partial, redeliveryPending });
-    } catch (error) {
-        res.status(500).json({ ok: false, error: String(error.message || error) });
-    }
+    await handleDeliveryStatusRequest(req, res, safeDecodeURIComponent(req.params.key));
 });
 
 app.post("/api/optimize-route", async (req, res) => {
