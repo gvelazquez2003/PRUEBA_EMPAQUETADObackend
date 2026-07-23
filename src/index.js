@@ -7046,6 +7046,83 @@ app.get('/api/facturas-bot/uploads', async (req, res) => {
   }
 });
 
+app.post('/api/facturas-bot/uploads/delete', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
+  if (!auth) return;
+
+  const ids = Array.from(new Set(
+    (Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0)
+  ));
+  if (!ids.length) {
+    return res.status(400).json({ ok: false, error: 'Selecciona al menos un PDF para borrar.' });
+  }
+  if (ids.length > 100) {
+    return res.status(400).json({ ok: false, error: 'No se pueden borrar mas de 100 PDFs a la vez.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT id_upload, original_name, file_path
+         FROM facturas_bot_uploads
+        WHERE id_upload = ANY($1::bigint[])`,
+      [ids]
+    );
+    const rows = result.rows || [];
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: 'No se encontraron PDFs para borrar.' });
+    }
+
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM facturas_bot_uploads
+        WHERE id_upload = ANY($1::bigint[])`,
+      [rows.map((row) => Number(row.id_upload))]
+    );
+    await client.query('COMMIT');
+
+    const uploadRoot = path.resolve(FACTURAS_BOT_UPLOAD_DIR);
+    const fileResults = [];
+    for (const row of rows) {
+      const rawPath = String(row.file_path || '').trim();
+      if (!rawPath) {
+        fileResults.push({ id_upload: Number(row.id_upload), deleted_file: false, reason: 'sin_ruta' });
+        continue;
+      }
+      const filePath = path.resolve(rawPath);
+      if (!filePath.startsWith(`${uploadRoot}${path.sep}`) && filePath !== uploadRoot) {
+        fileResults.push({ id_upload: Number(row.id_upload), deleted_file: false, reason: 'ruta_no_permitida' });
+        continue;
+      }
+      try {
+        await fs.unlink(filePath);
+        fileResults.push({ id_upload: Number(row.id_upload), deleted_file: true });
+      } catch (error) {
+        fileResults.push({
+          id_upload: Number(row.id_upload),
+          deleted_file: false,
+          reason: error?.code === 'ENOENT' ? 'archivo_no_existia' : 'error_borrando_archivo',
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      deleted: rows.length,
+      requested: ids.length,
+      files: fileResults,
+      message: `Se borraron ${rows.length} registro(s) de la cola del bot.`,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post('/api/facturas-bot/uploads', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
