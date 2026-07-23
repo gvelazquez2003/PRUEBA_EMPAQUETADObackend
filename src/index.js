@@ -6595,6 +6595,13 @@ function parseBotPdfDate(value) {
   return match ? `${match[3]}-${match[2]}-${match[1]}` : '';
 }
 
+function extractFacturaBotNumberFromFilename(value) {
+  const raw = String(value || '').replace(/\.pdf$/i, '');
+  const matches = raw.match(/\b\d{4,8}\b/g) || [];
+  if (!matches.length) return '';
+  return matches[matches.length - 1].slice(0, 8);
+}
+
 function extractBotPdfTextValue(src, pattern) {
   const match = String(src || '').match(pattern);
   return match ? String(match[1] || '').replace(/\s+/g, ' ').trim() : '';
@@ -6619,10 +6626,13 @@ function parseFacturaBotPdfText(text) {
   let cliente = extractBotPdfTextValue(rawText, /CLIENTE[:\s]+(.+?)(?=\s*(?:RIF:|DIRECCION:|NOTA\s+ENTREGA|N[°º]?\s*(?:DE\s*)?FACTURA:|FEC\.|CONDIC\.|VENDEDOR:|TRANSPORTE:|$))/mi);
   const rif = extractBotPdfTextValue(rawText, /RIF[:\s]+([\w\-]+)/mi);
   const numeroNota = extractBotPdfTextValue(rawText, /NOTA\s+ENTREGA[\s\S]{0,140}?RIF[:\s]+[\w\-]+\s+(\d{4,})/mi)
-    || extractBotPdfTextValue(rawText, /NOTA\s+ENTREGA\s+(\d{4,})/mi);
+    || extractBotPdfTextValue(rawText, /NOTA\s+ENTREGA\s*(?:N[°ºO.]*)?\s*[:#-]?\s*(\d{4,8})/mi)
+    || extractBotPdfTextValue(rawText, /\bNOTA\b[\s\S]{0,80}?\b(?:NRO|NO|NUM(?:ERO)?|N[°º])\b\s*[:#-]?\s*(\d{4,8})/mi);
   const numeroFactura = isNotaEntrega
     ? numeroNota
-    : extractBotPdfTextValue(rawText, /N[°º]?\s*(?:DE\s*)?FACTURA[:\s]+(\d{4,})/mi);
+    : extractBotPdfTextValue(rawText, /N[°ºO.]?\s*(?:DE\s*)?FACTURA[:\s#-]+(\d{4,8})/mi)
+      || extractBotPdfTextValue(rawText, /\bFACTURA\b[\s\S]{0,90}?\b(?:NRO|NO|NUM(?:ERO)?|N[°º])\b\s*[:#-]?\s*(\d{4,8})/mi)
+      || extractBotPdfTextValue(rawText, /\b(?:NRO|NO|NUM(?:ERO)?|N[°º])\b\s*(?:DE\s*)?FACTURA\s*[:#-]?\s*(\d{4,8})/mi);
   const fechaRaw = extractBotPdfTextValue(rawText, /FEC(?:HA)?\.?\s*(?:DE\s*)?EMISI[OÓ]N[:\s]+(\d{2}\/\d{2}\/\d{4})/mi)
     || (isNotaEntrega ? extractNextDateAfter(/^FEC\.?\s*(?:DE\s*)?EMISI[OÓ]N\b/i) : '');
   const fechaVencRaw = extractBotPdfTextValue(rawText, /FEC(?:HA)?\.?\s*(?:DE\s*)?VENC[:\s]+(\d{2}\/\d{2}\/\d{4})/mi)
@@ -6793,6 +6803,9 @@ async function buildFacturaBotSalidasPayload(upload, auth) {
     await parser.destroy().catch(() => {});
   }
   const datos = parseFacturaBotPdfText(parsedPdf?.text || '');
+  if (!datos.numero_factura) {
+    datos.numero_factura = extractFacturaBotNumberFromFilename(upload.original_name || upload.stored_name);
+  }
   if (!datos.cliente && !datos.rif) throw new Error('No se pudo identificar el cliente o RIF en el PDF.');
   if (!datos.numero_factura) throw new Error('No se encontro numero de documento en el PDF.');
   if (!datos.fecha_emision) throw new Error('No se encontro fecha de emision valida en el PDF.');
@@ -6933,14 +6946,17 @@ async function processFacturaBotUpload(req, upload, auth) {
     return { ok: true, id_upload: Number(upload.id_upload), id_factura: idFactura, estado: 'cargada' };
   } catch (error) {
     const status = Number(error.status || 0);
-    const estado = status === 409 || status === 400 ? 'revision' : 'error';
+    const message = String(error.message || '');
+    const estado = status === 409 || status === 400 || /no se pudo|no se encontro|no se encontraron|debe revisarse|revisar manualmente/i.test(message)
+      ? 'revision'
+      : 'error';
     await updateFacturaBotUpload(upload.id_upload, {
       estado,
-      mensaje: error.message || 'No se pudo procesar el PDF.',
+      mensaje: message || 'No se pudo procesar el PDF.',
       processed_by: normalizeAuthUsername(auth.username) || 'SISTEMA',
       processed_at: new Date(),
     });
-    return { ok: false, id_upload: Number(upload.id_upload), estado, error: error.message || 'No se pudo procesar el PDF.' };
+    return { ok: false, id_upload: Number(upload.id_upload), estado, error: message || 'No se pudo procesar el PDF.' };
   }
 }
 
