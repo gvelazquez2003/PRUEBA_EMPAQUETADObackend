@@ -7929,6 +7929,225 @@ app.get('/api/hoja-ruta/rutas', async (req, res) => {
   }
 });
 
+app.get('/api/hoja-ruta/manual', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.CONDUCTOR]);
+  if (!auth) return;
+
+  const rawRoutes = [];
+  const pushRouteValue = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(pushRouteValue);
+      return;
+    }
+    String(value || '')
+      .split('|')
+      .map((item) => normalizeSalidasText(item, 120))
+      .filter(Boolean)
+      .forEach((item) => rawRoutes.push(item));
+  };
+  pushRouteValue(req.query?.ruta);
+  pushRouteValue(req.query?.rutas);
+
+  const rutas = [...new Map(rawRoutes.map((ruta) => [ruta.toLowerCase(), ruta])).values()];
+  const fechaDesdeRaw = String(req.query?.fecha_desde || '').trim();
+  const fechaHastaRaw = String(req.query?.fecha_hasta || '').trim();
+  const hasFechaDesde = /^\d{4}-\d{2}-\d{2}$/.test(fechaDesdeRaw);
+  const hasFechaHasta = /^\d{4}-\d{2}-\d{2}$/.test(fechaHastaRaw);
+
+  if (!rutas.length) {
+    return res.status(400).json({ ok: false, error: 'Selecciona al menos una ruta.' });
+  }
+  if ((fechaDesdeRaw && !hasFechaDesde) || (fechaHastaRaw && !hasFechaHasta)) {
+    return res.status(400).json({ ok: false, error: 'Las fechas deben tener formato YYYY-MM-DD' });
+  }
+
+  try {
+    await ensureRouteDeliveryTables();
+
+    const routeLookup = rutas.map((ruta) => ruta.toLowerCase());
+    const sheetParams = [routeLookup];
+    const sheetWhereParts = [
+      `LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = ANY($1::text[])`,
+      `LOWER(TRIM(COALESCE(sf.transporte_nombre, ''))) <> 'retiro'`,
+    ];
+    if (hasFechaDesde) {
+      sheetParams.push(fechaDesdeRaw);
+      sheetWhereParts.push(`sf.fecha_emision::date >= $${sheetParams.length}::date`);
+    }
+    if (hasFechaHasta) {
+      sheetParams.push(fechaHastaRaw);
+      sheetWhereParts.push(`sf.fecha_emision::date <= $${sheetParams.length}::date`);
+    }
+    appendVendedorAccessFilter(sheetWhereParts, sheetParams, auth, 'sf.vendedor_nombre');
+
+    const result = await pool.query(
+      `SELECT
+         sf.id_factura,
+         sf.numero_control,
+         sf.numero_factura,
+         TO_CHAR(sf.fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+         TO_CHAR(sf.fecha_vencimiento, 'YYYY-MM-DD') AS fecha_vencimiento,
+         sf.cliente_nombre,
+         sf.vendedor_nombre,
+         sf.zona_nombre,
+         sf.ruta_nombre,
+         sf.transporte_nombre,
+         sf.direccion_texto,
+         sd.id_detalle,
+         sd.id_cambio,
+         sd.codigo_producto,
+         sd.producto,
+         sd.numero_lote,
+         sd.cantidad,
+         COALESCE(NULLIF(p.paquetes, 0), 10) AS paquetes_por_cesta,
+         COALESCE(p.sobre_piso, 0) AS sobre_piso
+       FROM (
+         SELECT DISTINCT ON (id_factura) *
+         FROM salidas_facturas
+         ORDER BY id_factura
+       ) sf
+       JOIN (
+         SELECT DISTINCT ON (id_detalle) *
+         FROM almacen09_salidas_detalle
+         ORDER BY id_detalle
+       ) sd ON sd.id_factura = sf.id_factura
+       LEFT JOIN (
+         SELECT DISTINCT ON (id_producto) *
+         FROM productos
+         ORDER BY id_producto
+       ) p ON p.id_producto = sd.id_producto
+       WHERE ${sheetWhereParts.join(' AND ')}
+       ORDER BY
+         sf.fecha_emision::date ASC,
+         LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) ASC,
+         LOWER(TRIM(COALESCE(sf.cliente_nombre, ''))) ASC,
+         sf.numero_control ASC,
+         sd.id_detalle ASC`,
+      sheetParams
+    );
+
+    const facturasMap = new Map();
+    result.rows.forEach((row) => {
+      const idFactura = Number(row.id_factura);
+      if (!facturasMap.has(idFactura)) {
+        facturasMap.set(idFactura, {
+          id_factura: idFactura,
+          numero_control: row.numero_control,
+          numero_factura: row.numero_factura,
+          fecha_emision: row.fecha_emision,
+          fecha_vencimiento: row.fecha_vencimiento,
+          cliente_nombre: row.cliente_nombre,
+          vendedor_nombre: row.vendedor_nombre,
+          zona_nombre: row.zona_nombre,
+          ruta_nombre: row.ruta_nombre,
+          transporte_nombre: row.transporte_nombre,
+          direccion_texto: row.direccion_texto,
+          detalle: [],
+        });
+      }
+      facturasMap.get(idFactura).detalle.push({
+        id_detalle: row.id_detalle,
+        id_cambio: row.id_cambio,
+        codigo_producto: row.codigo_producto,
+        producto: row.producto,
+        numero_lote: row.numero_lote,
+        cantidad: row.cantidad,
+        paquetes_por_cesta: row.paquetes_por_cesta,
+        sobre_piso: row.sobre_piso,
+      });
+    });
+
+    const reentregaParams = [routeLookup];
+    const reentregaWhereParts = [
+      `estado = 'pendiente'`,
+      `LOWER(TRIM(COALESCE(ruta_nombre, ''))) = ANY($1::text[])`,
+      `LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'`,
+    ];
+    if (hasFechaDesde) {
+      reentregaParams.push(fechaDesdeRaw);
+      reentregaWhereParts.push(`fecha_emision >= $${reentregaParams.length}::date`);
+    }
+    if (hasFechaHasta) {
+      reentregaParams.push(fechaHastaRaw);
+      reentregaWhereParts.push(`fecha_emision <= $${reentregaParams.length}::date`);
+    }
+    appendVendedorAccessFilter(reentregaWhereParts, reentregaParams, auth, 'vendedor_nombre');
+
+    const reentregasResult = await pool.query(
+      `SELECT
+         id_reentrega,
+         original_invoice_id,
+         original_numero_factura,
+         original_numero_control,
+         cliente_nombre,
+         vendedor_nombre,
+         zona_nombre,
+         ruta_nombre,
+         transporte_nombre,
+         direccion_texto,
+         TO_CHAR(fecha_emision, 'YYYY-MM-DD') AS fecha_emision,
+         detalle
+       FROM salidas_reentregas_pendientes
+       WHERE ${reentregaWhereParts.join(' AND ')}
+       ORDER BY fecha_emision ASC, LOWER(TRIM(COALESCE(ruta_nombre, ''))) ASC, LOWER(TRIM(COALESCE(cliente_nombre, ''))) ASC, id_reentrega ASC`,
+      reentregaParams
+    );
+
+    reentregasResult.rows.forEach((row) => {
+      const idReentrega = Number(row.id_reentrega);
+      if (!Number.isInteger(idReentrega) || idReentrega <= 0) return;
+      const detalle = Array.isArray(row.detalle) ? row.detalle : [];
+      const detalleReentrega = detalle.map((line, index) => ({
+        id_detalle: `REEN-${idReentrega}-${index + 1}`,
+        id_reentrega: idReentrega,
+        id_cambio: null,
+        codigo_producto: line?.codigo_producto || line?.codigo || '',
+        producto: line?.producto || '',
+        numero_lote: line?.numero_lote || line?.lote || 'SIN-LOTE',
+        cantidad: Math.max(0, Math.trunc(Number(line?.cantidad || 0))),
+        paquetes_por_cesta: line?.paquetes_por_cesta || 10,
+        sobre_piso: line?.sobre_piso || 0,
+        es_reentrega: true,
+        original_id_detalle: line?.original_id_detalle || ''
+      })).filter((line) => line.codigo_producto && line.producto && line.cantidad > 0);
+      if (!detalleReentrega.length) return;
+      facturasMap.set(`REEN-${idReentrega}`, {
+        id_factura: `REEN-${idReentrega}`,
+        reentrega_id: idReentrega,
+        numero_control: `RE-${idReentrega}`,
+        numero_factura: `REENTREGA-${idReentrega}`,
+        documento: 'reentrega',
+        fecha_emision: row.fecha_emision,
+        fecha_vencimiento: null,
+        cliente_nombre: row.cliente_nombre,
+        vendedor_nombre: row.vendedor_nombre,
+        zona_nombre: row.zona_nombre,
+        ruta_nombre: row.ruta_nombre,
+        transporte_nombre: row.transporte_nombre,
+        direccion_texto: row.direccion_texto,
+        es_reentrega: true,
+        original_invoice_id: row.original_invoice_id,
+        original_numero_factura: row.original_numero_factura,
+        original_numero_control: row.original_numero_control,
+        detalle: detalleReentrega,
+      });
+    });
+
+    const facturas = Array.from(facturasMap.values());
+    return res.json({
+      ok: true,
+      ruta: rutas.join('-'),
+      rutas,
+      fecha_entrega: hasFechaDesde && hasFechaHasta && fechaDesdeRaw === fechaHastaRaw ? fechaDesdeRaw : '',
+      fecha_desde: hasFechaDesde ? fechaDesdeRaw : null,
+      fecha_hasta: hasFechaHasta ? fechaHastaRaw : null,
+      facturas,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.post('/api/hoja-ruta/exportaciones', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION]);
   if (!auth) return;
