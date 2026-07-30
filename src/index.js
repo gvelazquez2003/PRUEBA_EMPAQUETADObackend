@@ -7954,7 +7954,10 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
   const hasFechaDesde = /^\d{4}-\d{2}-\d{2}$/.test(fechaDesdeRaw);
   const hasFechaHasta = /^\d{4}-\d{2}-\d{2}$/.test(fechaHastaRaw);
   const compactManual = ['1', 'true', 'si', 'sí'].includes(String(req.query?.compact || '').trim().toLowerCase());
-  const manualLineLimit = 2000;
+  const requestedManualLimit = Math.floor(Number(req.query?.limit) || 300);
+  const manualLineLimit = compactManual
+    ? Math.min(500, Math.max(1, requestedManualLimit))
+    : 2000;
 
   if (!rutas.length) {
     return res.status(400).json({ ok: false, error: 'Selecciona al menos una ruta.' });
