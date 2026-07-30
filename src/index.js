@@ -7953,6 +7953,8 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
   const fechaHastaRaw = String(req.query?.fecha_hasta || '').trim();
   const hasFechaDesde = /^\d{4}-\d{2}-\d{2}$/.test(fechaDesdeRaw);
   const hasFechaHasta = /^\d{4}-\d{2}-\d{2}$/.test(fechaHastaRaw);
+  const compactManual = ['1', 'true', 'si', 'sí'].includes(String(req.query?.compact || '').trim().toLowerCase());
+  const manualLineLimit = 2000;
 
   if (!rutas.length) {
     return res.status(400).json({ ok: false, error: 'Selecciona al menos una ruta.' });
@@ -8053,6 +8055,7 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
       )`);
     }
     appendVendedorAccessFilter(sheetWhereParts, sheetParams, auth, 'sf.vendedor_nombre');
+    const compactLimitSql = compactManual ? `LIMIT ${manualLineLimit}` : '';
 
     const result = await pool.query(
       `SELECT
@@ -8096,11 +8099,50 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
          LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) ASC,
          LOWER(TRIM(COALESCE(sf.cliente_nombre, ''))) ASC,
          sf.numero_control ASC,
-         sd.id_detalle ASC`,
+         sd.id_detalle ASC
+       ${compactLimitSql}`,
       sheetParams
     );
 
     const facturasMap = new Map();
+    const manualLineRows = [];
+    let manualCapped = false;
+    const pushManualLineRow = (factura, line) => {
+      if (!compactManual) return;
+      if (manualLineRows.length >= manualLineLimit) {
+        manualCapped = true;
+        return;
+      }
+      manualLineRows.push({
+        id_factura: factura.id_factura,
+        reentrega_id: factura.reentrega_id || null,
+        numero_control: factura.numero_control,
+        numero_factura: factura.numero_factura,
+        documento: factura.documento || 'factura',
+        fecha_emision: factura.fecha_emision,
+        fecha_vencimiento: factura.fecha_vencimiento || null,
+        cliente_nombre: factura.cliente_nombre,
+        vendedor_nombre: factura.vendedor_nombre,
+        zona_nombre: factura.zona_nombre,
+        ruta_nombre: factura.ruta_nombre,
+        transporte_nombre: factura.transporte_nombre,
+        direccion_texto: factura.direccion_texto,
+        id_detalle: line.id_detalle,
+        id_cambio: line.id_cambio || null,
+        codigo_producto: line.codigo_producto,
+        producto: line.producto,
+        numero_lote: line.numero_lote,
+        cantidad: line.cantidad,
+        paquetes_por_cesta: line.paquetes_por_cesta,
+        sobre_piso: line.sobre_piso,
+        es_reentrega: Boolean(line.es_reentrega || factura.es_reentrega),
+        original_id_detalle: line.original_id_detalle || '',
+        original_invoice_id: factura.original_invoice_id || null,
+        original_numero_factura: factura.original_numero_factura || null,
+        original_numero_control: factura.original_numero_control || null,
+      });
+    };
+
     result.rows.forEach((row) => {
       const idFactura = Number(row.id_factura);
       if (!facturasMap.has(idFactura)) {
@@ -8119,7 +8161,7 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
           detalle: [],
         });
       }
-      facturasMap.get(idFactura).detalle.push({
+      const line = {
         id_detalle: row.id_detalle,
         id_cambio: row.id_cambio,
         codigo_producto: row.codigo_producto,
@@ -8128,7 +8170,10 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
         cantidad: row.cantidad,
         paquetes_por_cesta: row.paquetes_por_cesta,
         sobre_piso: row.sobre_piso,
-      });
+      };
+      const factura = facturasMap.get(idFactura);
+      factura.detalle.push(line);
+      pushManualLineRow(factura, line);
     });
 
     const reentregaParams = [routeLookup];
@@ -8196,7 +8241,7 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
         original_id_detalle: line?.original_id_detalle || ''
       })).filter((line) => line.codigo_producto && line.producto && line.cantidad > 0);
       if (!detalleReentrega.length) return;
-      facturasMap.set(`REEN-${idReentrega}`, {
+      const facturaReentrega = {
         id_factura: `REEN-${idReentrega}`,
         reentrega_id: idReentrega,
         numero_control: `RE-${idReentrega}`,
@@ -8215,16 +8260,34 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
         original_numero_factura: row.original_numero_factura,
         original_numero_control: row.original_numero_control,
         detalle: detalleReentrega,
-      });
+      };
+      facturasMap.set(`REEN-${idReentrega}`, facturaReentrega);
+      detalleReentrega.forEach((line) => pushManualLineRow(facturaReentrega, line));
     });
 
-    const facturas = Array.from(facturasMap.values());
     const effectiveFechaDesde = hasFechaDesde
       ? fechaDesdeRaw
       : (latestRouteDates.length ? latestRouteDates.reduce((min, fecha) => fecha < min ? fecha : min, latestRouteDates[0]) : null);
     const effectiveFechaHasta = hasFechaHasta
       ? fechaHastaRaw
       : (latestRouteDates.length ? latestRouteDates.reduce((max, fecha) => fecha > max ? fecha : max, latestRouteDates[0]) : null);
+
+    if (compactManual) {
+      return res.json({
+        ok: true,
+        ruta: rutas.join('-'),
+        rutas,
+        fecha_entrega: effectiveFechaDesde && effectiveFechaHasta && effectiveFechaDesde === effectiveFechaHasta ? effectiveFechaDesde : '',
+        fecha_desde: effectiveFechaDesde,
+        fecha_hasta: effectiveFechaHasta,
+        facturas: [],
+        lineas: manualLineRows,
+        total_lineas: manualLineRows.length,
+        manual_capped: manualCapped || result.rows.length >= manualLineLimit,
+      });
+    }
+
+    const facturas = Array.from(facturasMap.values());
     return res.json({
       ok: true,
       ruta: rutas.join('-'),
