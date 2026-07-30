@@ -3851,7 +3851,7 @@ app.post('/api/clientes-catalogo', async (req, res) => {
 });
 
 app.get('/api/almacen09/cambios/razones', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   try {
@@ -4029,7 +4029,7 @@ async function getAlmacen09StockActualRows(db, options = {}) {
 }
 
 app.post('/api/almacen09/cambios', async (req, res) => {
-  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN, APP_ROLES.FACTURACION, APP_ROLES.VENTAS, APP_ROLES.VENDEDOR]);
   if (!auth) return;
 
   const clienteRaw = normalizeSalidasText(req.body?.cliente, 180);
