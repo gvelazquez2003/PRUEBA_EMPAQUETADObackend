@@ -7965,6 +7965,69 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
     await ensureRouteDeliveryTables();
 
     const routeLookup = rutas.map((ruta) => ruta.toLowerCase());
+    let latestRouteKeys = [];
+    let latestRouteDates = [];
+
+    if (!hasFechaDesde && !hasFechaHasta) {
+      const latestByRoute = new Map();
+      const upsertLatestDate = (row) => {
+        const rutaKey = String(row?.ruta_key || '').trim();
+        const fecha = String(row?.fecha || '').trim();
+        if (!rutaKey || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return;
+        const previous = latestByRoute.get(rutaKey);
+        if (!previous || fecha > previous) latestByRoute.set(rutaKey, fecha);
+      };
+
+      const facturaDateParams = [routeLookup];
+      const facturaDateWhereParts = [
+        `LOWER(TRIM(COALESCE(ruta_nombre, ''))) = ANY($1::text[])`,
+        `LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'`,
+      ];
+      appendVendedorAccessFilter(facturaDateWhereParts, facturaDateParams, auth, 'vendedor_nombre');
+      const facturaDateResult = await pool.query(
+        `SELECT
+           LOWER(TRIM(COALESCE(ruta_nombre, ''))) AS ruta_key,
+           TO_CHAR(MAX(fecha_emision)::date, 'YYYY-MM-DD') AS fecha
+         FROM salidas_facturas
+         WHERE ${facturaDateWhereParts.join(' AND ')}
+         GROUP BY LOWER(TRIM(COALESCE(ruta_nombre, '')))`,
+        facturaDateParams
+      );
+      facturaDateResult.rows.forEach(upsertLatestDate);
+
+      const reentregaDateParams = [routeLookup];
+      const reentregaDateWhereParts = [
+        `estado = 'pendiente'`,
+        `LOWER(TRIM(COALESCE(ruta_nombre, ''))) = ANY($1::text[])`,
+        `LOWER(TRIM(COALESCE(transporte_nombre, ''))) <> 'retiro'`,
+      ];
+      appendVendedorAccessFilter(reentregaDateWhereParts, reentregaDateParams, auth, 'vendedor_nombre');
+      const reentregaDateResult = await pool.query(
+        `SELECT
+           LOWER(TRIM(COALESCE(ruta_nombre, ''))) AS ruta_key,
+           TO_CHAR(MAX(fecha_emision)::date, 'YYYY-MM-DD') AS fecha
+         FROM salidas_reentregas_pendientes
+         WHERE ${reentregaDateWhereParts.join(' AND ')}
+         GROUP BY LOWER(TRIM(COALESCE(ruta_nombre, '')))`,
+        reentregaDateParams
+      );
+      reentregaDateResult.rows.forEach(upsertLatestDate);
+
+      latestRouteKeys = Array.from(latestByRoute.keys());
+      latestRouteDates = latestRouteKeys.map((rutaKey) => latestByRoute.get(rutaKey));
+      if (!latestRouteKeys.length) {
+        return res.json({
+          ok: true,
+          ruta: rutas.join('-'),
+          rutas,
+          fecha_entrega: '',
+          fecha_desde: null,
+          fecha_hasta: null,
+          facturas: [],
+        });
+      }
+    }
+
     const sheetParams = [routeLookup];
     const sheetWhereParts = [
       `LOWER(TRIM(COALESCE(sf.ruta_nombre, ''))) = ANY($1::text[])`,
@@ -7977,6 +8040,17 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
     if (hasFechaHasta) {
       sheetParams.push(fechaHastaRaw);
       sheetWhereParts.push(`sf.fecha_emision::date <= $${sheetParams.length}::date`);
+    }
+    if (!hasFechaDesde && !hasFechaHasta) {
+      sheetParams.push(latestRouteKeys, latestRouteDates);
+      const routeKeyIndex = sheetParams.length - 1;
+      const routeDateIndex = sheetParams.length;
+      sheetWhereParts.push(`EXISTS (
+        SELECT 1
+        FROM UNNEST($${routeKeyIndex}::text[], $${routeDateIndex}::date[]) AS latest(ruta_key, fecha)
+        WHERE latest.ruta_key = LOWER(TRIM(COALESCE(sf.ruta_nombre, '')))
+          AND latest.fecha = sf.fecha_emision::date
+      )`);
     }
     appendVendedorAccessFilter(sheetWhereParts, sheetParams, auth, 'sf.vendedor_nombre');
 
@@ -8071,6 +8145,17 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
       reentregaParams.push(fechaHastaRaw);
       reentregaWhereParts.push(`fecha_emision <= $${reentregaParams.length}::date`);
     }
+    if (!hasFechaDesde && !hasFechaHasta) {
+      reentregaParams.push(latestRouteKeys, latestRouteDates);
+      const routeKeyIndex = reentregaParams.length - 1;
+      const routeDateIndex = reentregaParams.length;
+      reentregaWhereParts.push(`EXISTS (
+        SELECT 1
+        FROM UNNEST($${routeKeyIndex}::text[], $${routeDateIndex}::date[]) AS latest(ruta_key, fecha)
+        WHERE latest.ruta_key = LOWER(TRIM(COALESCE(ruta_nombre, '')))
+          AND latest.fecha = fecha_emision::date
+      )`);
+    }
     appendVendedorAccessFilter(reentregaWhereParts, reentregaParams, auth, 'vendedor_nombre');
 
     const reentregasResult = await pool.query(
@@ -8134,13 +8219,19 @@ app.get('/api/hoja-ruta/manual', async (req, res) => {
     });
 
     const facturas = Array.from(facturasMap.values());
+    const effectiveFechaDesde = hasFechaDesde
+      ? fechaDesdeRaw
+      : (latestRouteDates.length ? latestRouteDates.reduce((min, fecha) => fecha < min ? fecha : min, latestRouteDates[0]) : null);
+    const effectiveFechaHasta = hasFechaHasta
+      ? fechaHastaRaw
+      : (latestRouteDates.length ? latestRouteDates.reduce((max, fecha) => fecha > max ? fecha : max, latestRouteDates[0]) : null);
     return res.json({
       ok: true,
       ruta: rutas.join('-'),
       rutas,
-      fecha_entrega: hasFechaDesde && hasFechaHasta && fechaDesdeRaw === fechaHastaRaw ? fechaDesdeRaw : '',
-      fecha_desde: hasFechaDesde ? fechaDesdeRaw : null,
-      fecha_hasta: hasFechaHasta ? fechaHastaRaw : null,
+      fecha_entrega: effectiveFechaDesde && effectiveFechaHasta && effectiveFechaDesde === effectiveFechaHasta ? effectiveFechaDesde : '',
+      fecha_desde: effectiveFechaDesde,
+      fecha_hasta: effectiveFechaHasta,
       facturas,
     });
   } catch (error) {
