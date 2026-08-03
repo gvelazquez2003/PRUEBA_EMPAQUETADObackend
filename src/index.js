@@ -21,6 +21,17 @@ const ALMACEN09_ENTRADAS_START_DATE = String(process.env.ALMACEN09_ENTRADAS_STAR
 const ALMACEN09_ENTRADAS_VISIBLE_DAYS = Math.max(0, Number(process.env.ALMACEN09_ENTRADAS_VISIBLE_DAYS || 2) || 2);
 const FACTURAS_BOT_UPLOAD_DIR = path.resolve(process.env.FACTURAS_BOT_UPLOAD_DIR || path.join(process.cwd(), 'data', 'facturas-bot', 'pendientes'));
 const FACTURAS_BOT_MAX_UPLOAD_MB = Math.max(1, Number(process.env.FACTURAS_BOT_MAX_UPLOAD_MB || 15) || 15);
+const SOLICITUDES_SHEETS_WEBHOOK_URL = String(process.env.SOLICITUDES_SHEETS_WEBHOOK_URL || '').trim();
+const SOLICITUDES_SHEETS_WEBHOOK_SECRET = String(process.env.SOLICITUDES_SHEETS_WEBHOOK_SECRET || '').trim();
+const SOLICITUDES_SHEETS_SYNC_ENABLED = ['true', '1', 'yes', 'si', 'sí'].includes(String(process.env.SOLICITUDES_SHEETS_SYNC_ENABLED || 'false').trim().toLowerCase());
+const SOLICITUDES_DEFAULT_ALLOWED_UNITS = 'UND,KG,PAQ,LT,CAJ,BLT,ENV,SAC,RLL,BOLSA,CESTA,BULTO';
+const SOLICITUDES_ALLOWED_UNITS = String(process.env.SOLICITUDES_ALLOWED_UNITS || SOLICITUDES_DEFAULT_ALLOWED_UNITS)
+  .split(',')
+  .map((item) => {
+    const normalized = String(item || '').trim().toUpperCase().replace(/\s+/g, '');
+    return normalized === 'LTS' ? 'LT' : normalized;
+  })
+  .filter(Boolean);
 const APP_ROLES = {
   ADMIN: 'administrador',
   PRODUCCION: 'produccion',
@@ -156,17 +167,20 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
 
+const testRuntime = process.env.NODE_ENV === 'test'
+  ? globalThis.__PDT_TEST_RUNTIME || null
+  : null;
 const databaseUrl = String(process.env.DATABASE_URL || '').trim();
 const dbSslValue = String(process.env.DB_SSL || '').trim().toLowerCase();
 const databaseUsesSsl = dbSslValue
   ? ['true', '1', 'yes', 'require'].includes(dbSslValue)
   : process.env.NODE_ENV === 'production';
 
-if (!databaseUrl) {
+if (!databaseUrl && !testRuntime?.pool) {
   throw new Error('Falta DATABASE_URL en las variables de entorno.');
 }
 
-const pool = new Pool({
+const pool = testRuntime?.pool || new Pool({
   connectionString: databaseUrl,
   ssl: databaseUsesSsl ? { rejectUnauthorized: false } : false,
   max: Number(process.env.DB_POOL_MAX || 5),
@@ -511,6 +525,533 @@ async function requireRolesForRequest(req, res, allowedRoles) {
 
   req.auth = session;
   return session;
+}
+
+const SOLICITUDES_SEDES_PERMISSIONS = Object.freeze({
+  catalogRead: [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION, APP_ROLES.ALMACEN],
+  solicitudRead: [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION, APP_ROLES.ALMACEN],
+  solicitudCreate: [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION],
+  solicitudStateUpdate: [APP_ROLES.ADMIN],
+  entregaRead: [APP_ROLES.ADMIN, APP_ROLES.PRODUCCION, APP_ROLES.ALMACEN],
+  entregaCreate: [APP_ROLES.ADMIN, APP_ROLES.ALMACEN],
+  productUnitUpdate: [APP_ROLES.ADMIN, APP_ROLES.ALMACEN],
+  sheetsRetry: [APP_ROLES.ADMIN, APP_ROLES.ALMACEN],
+});
+const SOLICITUD_ESTADOS = new Set(['PENDIENTE', 'PARCIAL', 'COMPLETADA', 'CANCELADA']);
+
+function normalizeSolicitudesText(value, maxLength = 255) {
+  const clean = String(value || '').trim().replace(/\s+/g, ' ');
+  return clean ? clean.slice(0, maxLength) : '';
+}
+
+function normalizeSolicitudesEmail(value) {
+  const clean = normalizeSolicitudesText(value, 160).toLowerCase();
+  if (!clean) return '';
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean) ? clean : '';
+}
+
+function normalizeSolicitudesUnit(value) {
+  const clean = stripDiacritics(value).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 20);
+  const normalized = clean === 'LTS' ? 'LT' : clean;
+  return SOLICITUDES_ALLOWED_UNITS.includes(normalized) ? normalized : '';
+}
+
+function isValidIsoDate(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return false;
+  const date = new Date(`${raw}T00:00:00Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === raw;
+}
+
+function isValidHoraMinuto(value) {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || '').trim());
+}
+
+function toPositiveDecimal(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 1000) / 1000 : null;
+}
+
+function createExternalReference(prefix) {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  return `${prefix}-${stamp}-${crypto.randomBytes(6).toString('hex')}`;
+}
+
+function mapSedeRow(row) {
+  return {
+    id_sede: Number(row.id_sede),
+    nombre: String(row.nombre || '').trim(),
+  };
+}
+
+function mapProductoRow(row) {
+  return {
+    id_producto: Number(row.id_producto),
+    codigo_producto: String(row.codigo_producto || '').trim(),
+    descripcion: String(row.descripcion || row.nombre_producto || '').trim(),
+    unidad_primaria: row.unidad_primaria === null || row.unidad_primaria === undefined ? null : String(row.unidad_primaria || '').trim().toUpperCase(),
+    activo: row.activo === undefined ? true : Boolean(row.activo),
+  };
+}
+
+async function getSedeById(db, sedeId) {
+  const result = await db.query(
+    `SELECT id_sede, nombre
+       FROM sedes
+      WHERE id_sede = $1
+      LIMIT 1`,
+    [sedeId]
+  );
+  return result.rowCount ? mapSedeRow(result.rows[0]) : null;
+}
+
+async function getProductosByIds(db, ids) {
+  if (!ids.length) return new Map();
+  const result = await db.query(
+    `SELECT id_producto, codigo_producto, descripcion, unidad_primaria, COALESCE(activo, TRUE) AS activo
+       FROM productos
+      WHERE id_producto = ANY($1::int[])`,
+    [ids]
+  );
+  const map = new Map();
+  result.rows.forEach((row) => {
+    const product = mapProductoRow(row);
+    map.set(product.id_producto, product);
+  });
+  return map;
+}
+
+function validateSolicitudesProductos(rawProductos, quantityField) {
+  const productos = Array.isArray(rawProductos) ? rawProductos : [];
+  if (!productos.length) {
+    return { ok: false, error: 'Debes agregar al menos un producto.' };
+  }
+  if (productos.length > 250) {
+    return { ok: false, error: 'No se pueden enviar mas de 250 productos por formulario.' };
+  }
+
+  const seen = new Set();
+  const normalized = [];
+  for (const item of productos) {
+    const productoId = Number(item?.producto_id || item?.id_producto || 0);
+    const cantidad = toPositiveDecimal(item?.[quantityField] ?? item?.cantidad);
+    const familia = normalizeSolicitudesText(item?.familia, 120);
+    const unidad = normalizeSolicitudesUnit(item?.unidad_medida || item?.unidad || '');
+    if (!Number.isInteger(productoId) || productoId <= 0) {
+      return { ok: false, error: 'Todos los productos deben tener producto_id valido.' };
+    }
+    if (seen.has(productoId)) {
+      return { ok: false, error: 'No puedes repetir productos dentro del mismo formulario.' };
+    }
+    if (cantidad === null) {
+      return { ok: false, error: 'Las cantidades deben ser mayores que cero.' };
+    }
+    seen.add(productoId);
+    normalized.push({ producto_id: productoId, cantidad, familia, unidad_medida: unidad });
+  }
+  return { ok: true, productos: normalized };
+}
+
+async function validateSolicitudesPayload(db, body, quantityField) {
+  const fecha = String(body?.fecha || '').trim();
+  const hora = String(body?.hora || '').trim();
+  const sedeId = Number(body?.sede_id || body?.id_sede || 0);
+  const responsableNombre = normalizeSolicitudesText(body?.responsable_nombre || body?.responsable || '', 120);
+  const responsableEmail = normalizeSolicitudesEmail(body?.responsable_email || body?.correo || '');
+  const observaciones = normalizeSolicitudesText(body?.observaciones || '', 1000);
+  const productValidation = validateSolicitudesProductos(body?.productos, quantityField);
+
+  if (!isValidIsoDate(fecha)) return { ok: false, status: 400, error: 'fecha debe tener formato YYYY-MM-DD.' };
+  if (!isValidHoraMinuto(hora)) return { ok: false, status: 400, error: 'hora debe tener formato HH:mm.' };
+  if (!Number.isInteger(sedeId) || sedeId <= 0) return { ok: false, status: 400, error: 'sede_id es obligatorio.' };
+  if (!responsableNombre) return { ok: false, status: 400, error: 'responsable_nombre es obligatorio.' };
+  if ((body?.responsable_email || body?.correo) && !responsableEmail) return { ok: false, status: 400, error: 'responsable_email no es valido.' };
+  if (!productValidation.ok) return { ok: false, status: 400, error: productValidation.error };
+
+  const sede = await getSedeById(db, sedeId);
+  if (!sede) return { ok: false, status: 400, error: 'La sede indicada no existe.' };
+
+  const productMap = await getProductosByIds(db, productValidation.productos.map((item) => item.producto_id));
+  const productos = [];
+  for (const item of productValidation.productos) {
+    const product = productMap.get(item.producto_id);
+    if (!product || !product.activo) {
+      return { ok: false, status: 400, error: `Producto no encontrado o inactivo: ${item.producto_id}` };
+    }
+    const unidadHistorica = item.unidad_medida || normalizeSolicitudesUnit(product.unidad_primaria);
+    if (!unidadHistorica) {
+      return { ok: false, status: 400, error: `Selecciona una unidad para ${product.codigo_producto || product.descripcion}.` };
+    }
+    productos.push({
+      ...item,
+      unidad_medida: unidadHistorica,
+      codigo_producto: product.codigo_producto,
+      producto: product.descripcion,
+    });
+  }
+
+  return {
+    ok: true,
+    data: {
+      fecha,
+      hora,
+      sede,
+      responsable_nombre: responsableNombre,
+      responsable_email: responsableEmail,
+      observaciones,
+      productos,
+    },
+  };
+}
+
+function mapSolicitudRow(row) {
+  return {
+    id_solicitud: Number(row.id_solicitud),
+    referencia_externa: row.referencia_externa || '',
+    fecha: row.fecha ? String(row.fecha).slice(0, 10) : null,
+    hora: row.hora || '',
+    sede_id: row.sede_id === null ? null : Number(row.sede_id),
+    sede_nombre: row.sede_nombre || '',
+    responsable_nombre: row.responsable_nombre || '',
+    responsable_email: row.responsable_email || '',
+    observaciones: row.observaciones || '',
+    estado: row.estado || 'PENDIENTE',
+    creado_por: row.creado_por || '',
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function mapSolicitudDetalleRow(row) {
+  const solicitada = Number(row.cantidad_solicitada || 0);
+  const entregada = Number(row.cantidad_entregada || 0);
+  return {
+    id_detalle: Number(row.id_detalle),
+    producto_id: Number(row.producto_id),
+    codigo_producto: row.codigo_producto || '',
+    producto: row.producto || '',
+    familia: row.familia || '',
+    cantidad_solicitada: solicitada,
+    cantidad_entregada: entregada,
+    cantidad_pendiente: Math.max(0, solicitada - entregada),
+    unidad_medida: row.unidad_medida || '',
+  };
+}
+
+function mapEntregaRow(row) {
+  return {
+    id_entrega: Number(row.id_entrega),
+    solicitud_id: row.solicitud_id === null ? null : Number(row.solicitud_id),
+    referencia_externa: row.referencia_externa || '',
+    fecha: row.fecha ? String(row.fecha).slice(0, 10) : null,
+    hora: row.hora || '',
+    sede_id: row.sede_id === null ? null : Number(row.sede_id),
+    sede_nombre: row.sede_nombre || '',
+    responsable_nombre: row.responsable_nombre || '',
+    responsable_email: row.responsable_email || '',
+    observaciones: row.observaciones || '',
+    creado_por: row.creado_por || '',
+    created_at: row.created_at || null,
+  };
+}
+
+function mapEntregaDetalleRow(row) {
+  return {
+    id_detalle: Number(row.id_detalle),
+    producto_id: Number(row.producto_id),
+    codigo_producto: row.codigo_producto || '',
+    producto: row.producto || '',
+    familia: row.familia || '',
+    cantidad_entregada: Number(row.cantidad_entregada || 0),
+    unidad_medida: row.unidad_medida || '',
+  };
+}
+
+async function fetchSolicitudById(db, idSolicitud) {
+  const result = await db.query(
+    `SELECT
+       ss.id_solicitud,
+       ss.referencia_externa,
+       TO_CHAR(ss.fecha, 'YYYY-MM-DD') AS fecha,
+       TO_CHAR(ss.hora, 'HH24:MI') AS hora,
+       ss.sede_id,
+       ss.sede_nombre,
+       ss.responsable_nombre,
+       ss.responsable_email,
+       ss.observaciones,
+       ss.estado,
+       ss.creado_por,
+       TO_CHAR(ss.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+       TO_CHAR(ss.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at
+     FROM solicitudes_sedes ss
+     WHERE ss.id_solicitud = $1
+     LIMIT 1`,
+    [idSolicitud]
+  );
+  if (!result.rowCount) return null;
+
+  const detailResult = await db.query(
+    `SELECT
+       d.id_detalle,
+       d.producto_id,
+       d.codigo_producto,
+       d.producto,
+       d.familia,
+       d.cantidad_solicitada,
+       COALESCE(ent.entregado, 0) AS cantidad_entregada,
+       d.unidad_medida
+     FROM solicitudes_sedes_detalle d
+     LEFT JOIN (
+       SELECT ed.producto_id, SUM(ed.cantidad_entregada) AS entregado
+       FROM entregas_sedes e
+       JOIN entregas_sedes_detalle ed ON ed.entrega_id = e.id_entrega
+       WHERE e.solicitud_id = $1
+       GROUP BY ed.producto_id
+     ) ent ON ent.producto_id = d.producto_id
+     WHERE d.solicitud_id = $1
+     ORDER BY d.id_detalle ASC`,
+    [idSolicitud]
+  );
+
+  return {
+    ...mapSolicitudRow(result.rows[0]),
+    productos: detailResult.rows.map(mapSolicitudDetalleRow),
+  };
+}
+
+async function fetchEntregaById(db, idEntrega) {
+  const result = await db.query(
+    `SELECT
+       e.id_entrega,
+       e.solicitud_id,
+       e.referencia_externa,
+       TO_CHAR(e.fecha, 'YYYY-MM-DD') AS fecha,
+       TO_CHAR(e.hora, 'HH24:MI') AS hora,
+       e.sede_id,
+       e.sede_nombre,
+       e.responsable_nombre,
+       e.responsable_email,
+       e.observaciones,
+       e.creado_por,
+       TO_CHAR(e.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+     FROM entregas_sedes e
+     WHERE e.id_entrega = $1
+     LIMIT 1`,
+    [idEntrega]
+  );
+  if (!result.rowCount) return null;
+  const detailResult = await db.query(
+    `SELECT id_detalle, producto_id, codigo_producto, producto, familia, cantidad_entregada, unidad_medida
+       FROM entregas_sedes_detalle
+      WHERE entrega_id = $1
+      ORDER BY id_detalle ASC`,
+    [idEntrega]
+  );
+  return {
+    ...mapEntregaRow(result.rows[0]),
+    productos: detailResult.rows.map(mapEntregaDetalleRow),
+  };
+}
+
+async function recalculateSolicitudEstado(db, solicitudId) {
+  const result = await db.query(
+    `WITH solicitado AS (
+       SELECT producto_id, SUM(cantidad_solicitada)::numeric AS cantidad_solicitada
+       FROM solicitudes_sedes_detalle
+       WHERE solicitud_id = $1
+       GROUP BY producto_id
+     ),
+     entregado AS (
+       SELECT ed.producto_id, SUM(ed.cantidad_entregada)::numeric AS cantidad_entregada
+       FROM entregas_sedes e
+       JOIN entregas_sedes_detalle ed ON ed.entrega_id = e.id_entrega
+       WHERE e.solicitud_id = $1
+       GROUP BY ed.producto_id
+     )
+     SELECT
+       COALESCE(SUM(COALESCE(e.cantidad_entregada, 0)), 0) AS total_entregado,
+       BOOL_AND(COALESCE(e.cantidad_entregada, 0) >= s.cantidad_solicitada) AS completa
+     FROM solicitado s
+     LEFT JOIN entregado e ON e.producto_id = s.producto_id`,
+    [solicitudId]
+  );
+  const totalEntregado = Number(result.rows?.[0]?.total_entregado || 0);
+  const completa = Boolean(result.rows?.[0]?.completa);
+  const estado = totalEntregado <= 0 ? 'PENDIENTE' : completa ? 'COMPLETADA' : 'PARCIAL';
+  await db.query(
+    `UPDATE solicitudes_sedes
+        SET estado = $2, updated_at = NOW()
+      WHERE id_solicitud = $1`,
+    [solicitudId, estado]
+  );
+  return estado;
+}
+
+function buildSolicitudesSheetsRows(kind, header, detalles) {
+  return detalles.map((item) => ({
+    tipo: kind,
+    referencia_externa: header.referencia_externa,
+    fecha: header.fecha,
+    hora: header.hora,
+    sede_id: header.sede_id,
+    sede_nombre: header.sede_nombre,
+    responsable_nombre: header.responsable_nombre,
+    responsable_email: header.responsable_email,
+    observaciones: header.observaciones || '',
+    producto_id: item.producto_id,
+    codigo_producto: item.codigo_producto,
+    producto: item.producto,
+    familia: item.familia || '',
+    cantidad_solicitada: kind === 'solicitud' ? item.cantidad_solicitada : null,
+    cantidad_entregada: kind === 'entrega' ? item.cantidad_entregada : null,
+    unidad_medida: item.unidad_medida,
+    row_reference: `${header.referencia_externa}:${item.producto_id}`,
+  }));
+}
+
+function buildSolicitudesSheetsPayload(kind, header, detalles) {
+  return {
+    tipo: kind,
+    referencia_externa: header.referencia_externa,
+    secret: SOLICITUDES_SHEETS_WEBHOOK_SECRET || undefined,
+    rows: buildSolicitudesSheetsRows(kind, header, detalles),
+  };
+}
+
+async function createSolicitudesSheetsOutboxEvent(db, kind, entityId, reference, payload) {
+  const eventType = `sync_${kind}_sheets`;
+  const entityType = kind === 'entrega' ? 'entrega_sede' : 'solicitud_sede';
+  try {
+    const result = await db.query(
+      `INSERT INTO solicitudes_sedes_sheets_outbox (
+         event_type, entity_type, entity_id, tipo, referencia_externa, payload, estado, intentos, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'pendiente', 0, NOW(), NOW())
+       ON CONFLICT (event_type, referencia_externa)
+       DO UPDATE SET
+         entity_type = EXCLUDED.entity_type,
+         entity_id = EXCLUDED.entity_id,
+         tipo = EXCLUDED.tipo,
+         payload = EXCLUDED.payload,
+         estado = 'pendiente',
+         ultimo_error = NULL,
+         updated_at = NOW()
+       RETURNING id_sync, event_type, entity_type, entity_id, tipo, referencia_externa, payload, estado, intentos`,
+      [eventType, entityType, entityId, kind, reference, JSON.stringify(payload)]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    if (error?.code !== '42P01' && error?.code !== '42703') throw error;
+    console.warn('[solicitudes-sheets] outbox no disponible:', error.message || error);
+    return null;
+  }
+}
+
+async function markSolicitudesSheetsOutbox(db, eventId, status, errorMessage = '') {
+  if (!eventId) return;
+  const estado = status === 'sincronizado' ? 'sincronizado' : 'error';
+  await db.query(
+    `UPDATE solicitudes_sedes_sheets_outbox
+        SET estado = $2,
+            intentos = intentos + 1,
+            ultimo_error = NULLIF($3, ''),
+            synced_at = CASE WHEN $2 = 'sincronizado' THEN NOW() ELSE synced_at END,
+            updated_at = NOW()
+      WHERE id_sync = $1`,
+    [eventId, estado, normalizeSolicitudesText(errorMessage, 1000)]
+  );
+}
+
+async function claimSolicitudesSheetsOutboxEvents(limit = 10) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT id_sync, event_type, entity_type, entity_id, tipo, referencia_externa, payload, estado, intentos
+         FROM solicitudes_sedes_sheets_outbox
+        WHERE estado IN ('pendiente', 'error')
+        ORDER BY updated_at ASC, id_sync ASC
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED`,
+      [Math.min(Math.max(Number(limit || 10), 1), 50)]
+    );
+    const ids = result.rows.map((row) => row.id_sync);
+    if (ids.length) {
+      await client.query(
+        `UPDATE solicitudes_sedes_sheets_outbox
+            SET estado = 'procesando', updated_at = NOW()
+          WHERE id_sync = ANY($1::bigint[])`,
+        [ids]
+      );
+    }
+    await client.query('COMMIT');
+    return result.rows;
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function syncSolicitudesSedesOutboxEvent(event) {
+  if (!event) return { ok: false, error: 'Evento de outbox invalido' };
+  if (!SOLICITUDES_SHEETS_SYNC_ENABLED) {
+    return { ok: true, skipped: true, reason: 'disabled', id_sync: event.id_sync };
+  }
+  if (!SOLICITUDES_SHEETS_WEBHOOK_URL) {
+    await markSolicitudesSheetsOutbox(pool, event.id_sync, 'error', 'SOLICITUDES_SHEETS_WEBHOOK_URL no configurado');
+    return { ok: false, queued: true, error: 'Webhook de Sheets no configurado', id_sync: event.id_sync };
+  }
+
+  try {
+    const response = await fetch(SOLICITUDES_SHEETS_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(event.payload),
+    });
+    let data = null;
+    try { data = await response.json(); } catch (_) {}
+    if (!response.ok || data?.ok === false) {
+      const message = data?.error || `Sheets HTTP ${response.status}`;
+      await markSolicitudesSheetsOutbox(pool, event.id_sync, 'error', message);
+      return { ok: false, queued: true, error: message, id_sync: event.id_sync };
+    }
+    await markSolicitudesSheetsOutbox(pool, event.id_sync, 'sincronizado');
+    return { ok: true, data, id_sync: event.id_sync };
+  } catch (error) {
+    const message = error.message || String(error);
+    await markSolicitudesSheetsOutbox(pool, event.id_sync, 'error', message);
+    return { ok: false, queued: true, error: message, id_sync: event.id_sync };
+  }
+}
+
+async function enqueueSolicitudesSheetsOutbox(kind, reference, payload, errorMessage) {
+  try {
+    await pool.query(
+      `INSERT INTO solicitudes_sedes_sheets_outbox (
+         event_type, entity_type, entity_id, tipo, referencia_externa, payload, estado, intentos, ultimo_error, created_at, updated_at
+       )
+       VALUES ($1, $2, NULL, $3, $4, $5::jsonb, 'pendiente', 0, $6, NOW(), NOW())
+       ON CONFLICT (event_type, referencia_externa)
+       DO UPDATE SET
+         payload = EXCLUDED.payload,
+         estado = 'pendiente',
+         ultimo_error = EXCLUDED.ultimo_error,
+         updated_at = NOW()`,
+      [`sync_${kind}_sheets`, kind === 'entrega' ? 'entrega_sede' : 'solicitud_sede', kind, reference, JSON.stringify(payload), normalizeSolicitudesText(errorMessage, 1000)]
+    );
+  } catch (error) {
+    if (error?.code !== '42P01' && error?.code !== '42703') {
+      console.warn('[solicitudes-sheets] outbox no disponible:', error.message || error);
+    }
+  }
+}
+
+async function syncSolicitudesSedesToSheets(kind, header, detalles, event) {
+  const payload = buildSolicitudesSheetsPayload(kind, header, detalles);
+  const outboxEvent = event || { id_sync: null, payload };
+  return syncSolicitudesSedesOutboxEvent(outboxEvent);
 }
 
 async function callControlProduccionApi(pathname, options = {}) {
@@ -4410,6 +4951,446 @@ app.post('/api/mermas', async (req, res) => {
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
+  }
+});
+
+app.get('/api/solicitudes-sedes/catalogos/sedes', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.catalogRead);
+  if (!auth) return;
+  try {
+    const result = await pool.query(
+      `SELECT id_sede, nombre
+         FROM sedes
+        ORDER BY nombre ASC`
+    );
+    return res.json({ ok: true, sedes: result.rows.map(mapSedeRow) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/solicitudes-sedes/catalogos/productos', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.catalogRead);
+  if (!auth) return;
+  const q = normalizeSolicitudesText(req.query?.q || '', 80);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 100), 1), 250);
+  const params = [];
+  const whereParts = [`COALESCE(activo, TRUE) = TRUE`];
+  if (q) {
+    params.push(`%${q}%`);
+    whereParts.push(`(codigo_producto ILIKE $${params.length} OR descripcion ILIKE $${params.length})`);
+  }
+  params.push(limit);
+  try {
+    const result = await pool.query(
+      `SELECT id_producto, codigo_producto, descripcion, unidad_primaria, COALESCE(activo, TRUE) AS activo
+         FROM productos
+        WHERE ${whereParts.join(' AND ')}
+        ORDER BY codigo_producto ASC
+        LIMIT $${params.length}`,
+      params
+    );
+    return res.json({ ok: true, productos: result.rows.map(mapProductoRow), unidades: SOLICITUDES_ALLOWED_UNITS });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.patch('/api/solicitudes-sedes/catalogos/productos/:id/unidad', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.productUnitUpdate);
+  if (!auth) return;
+  const idProducto = Number(req.params?.id || 0);
+  const unidad = normalizeSolicitudesUnit(req.body?.unidad_primaria || req.body?.unidad || '');
+  if (!Number.isInteger(idProducto) || idProducto <= 0) return res.status(400).json({ ok: false, error: 'id_producto invalido.' });
+  if (!unidad) return res.status(400).json({ ok: false, error: 'Unidad no permitida.' });
+  try {
+    const result = await pool.query(
+      `UPDATE productos
+          SET unidad_primaria = $2
+        WHERE id_producto = $1
+        RETURNING id_producto, codigo_producto, descripcion, unidad_primaria, COALESCE(activo, TRUE) AS activo`,
+      [idProducto, unidad]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: 'Producto no encontrado.' });
+    return res.json({ ok: true, producto: mapProductoRow(result.rows[0]) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/solicitudes-sedes', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.solicitudRead);
+  if (!auth) return;
+  const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
+  const page = Math.max(Number(req.query?.page || 1), 1);
+  const offset = (page - 1) * limit;
+  const params = [];
+  const whereParts = [];
+  const sedeId = Number(req.query?.sede_id || 0);
+  const productoId = Number(req.query?.producto_id || 0);
+  const estado = normalizeSolicitudesText(req.query?.estado || '', 20).toUpperCase();
+  const fechaDesde = String(req.query?.fecha_desde || '').trim();
+  const fechaHasta = String(req.query?.fecha_hasta || '').trim();
+  if (Number.isInteger(sedeId) && sedeId > 0) {
+    params.push(sedeId);
+    whereParts.push(`ss.sede_id = $${params.length}`);
+  }
+  if (estado && SOLICITUD_ESTADOS.has(estado)) {
+    params.push(estado);
+    whereParts.push(`ss.estado = $${params.length}`);
+  }
+  if (isValidIsoDate(fechaDesde)) {
+    params.push(fechaDesde);
+    whereParts.push(`ss.fecha >= $${params.length}::date`);
+  }
+  if (isValidIsoDate(fechaHasta)) {
+    params.push(fechaHasta);
+    whereParts.push(`ss.fecha <= $${params.length}::date`);
+  }
+  if (Number.isInteger(productoId) && productoId > 0) {
+    params.push(productoId);
+    whereParts.push(`EXISTS (
+      SELECT 1 FROM solicitudes_sedes_detalle sd
+      WHERE sd.solicitud_id = ss.id_solicitud AND sd.producto_id = $${params.length}
+    )`);
+  }
+  const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+  params.push(limit, offset);
+  try {
+    const result = await pool.query(
+      `SELECT
+         ss.id_solicitud,
+         ss.referencia_externa,
+         TO_CHAR(ss.fecha, 'YYYY-MM-DD') AS fecha,
+         TO_CHAR(ss.hora, 'HH24:MI') AS hora,
+         ss.sede_id,
+         ss.sede_nombre,
+         ss.responsable_nombre,
+         ss.responsable_email,
+         ss.observaciones,
+         ss.estado,
+         ss.creado_por,
+         TO_CHAR(ss.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+         TO_CHAR(ss.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at,
+         COUNT(*) OVER()::int AS total
+       FROM solicitudes_sedes ss
+       ${whereSql}
+       ORDER BY ss.fecha DESC, ss.created_at DESC, ss.id_solicitud DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    const total = Number(result.rows?.[0]?.total || 0);
+    return res.json({ ok: true, rows: result.rows.map(mapSolicitudRow), pagination: { page, limit, total } });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/solicitudes-sedes/:id', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.solicitudRead);
+  if (!auth) return;
+  const idSolicitud = Number(req.params?.id || 0);
+  if (!Number.isInteger(idSolicitud) || idSolicitud <= 0) return res.status(400).json({ ok: false, error: 'id de solicitud invalido.' });
+  try {
+    const solicitud = await fetchSolicitudById(pool, idSolicitud);
+    if (!solicitud) return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
+    return res.json({ ok: true, solicitud });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/solicitudes-sedes', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.solicitudCreate);
+  if (!auth) return;
+  const client = await pool.connect();
+  let solicitudId = null;
+  let createdSolicitud = null;
+  let sheetsEvent = null;
+  try {
+    await client.query('BEGIN');
+    const validation = await validateSolicitudesPayload(client, req.body, 'cantidad_solicitada');
+    if (!validation.ok) {
+      await client.query('ROLLBACK');
+      return res.status(validation.status || 400).json({ ok: false, error: validation.error });
+    }
+    const data = validation.data;
+    const referencia = createExternalReference('SOL');
+    const inserted = await client.query(
+      `INSERT INTO solicitudes_sedes (
+         fecha, hora, sede_id, sede_nombre, responsable_nombre, responsable_email,
+         observaciones, estado, referencia_externa, creado_por, created_at, updated_at
+       )
+       VALUES ($1::date, $2::time, $3, $4, $5, NULLIF($6, ''), $7, 'PENDIENTE', $8, $9, NOW(), NOW())
+       RETURNING id_solicitud`,
+      [data.fecha, data.hora, data.sede.id_sede, data.sede.nombre, data.responsable_nombre, data.responsable_email, data.observaciones, referencia, normalizeAuthUsername(auth.username) || auth.username]
+    );
+    solicitudId = Number(inserted.rows[0].id_solicitud);
+    for (const item of data.productos) {
+      await client.query(
+        `INSERT INTO solicitudes_sedes_detalle (
+           solicitud_id, producto_id, codigo_producto, producto, familia,
+           cantidad_solicitada, unidad_medida, created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+        [solicitudId, item.producto_id, item.codigo_producto, item.producto, item.familia, item.cantidad, item.unidad_medida]
+      );
+    }
+    const headerForSheets = {
+      referencia_externa: referencia,
+      fecha: data.fecha,
+      hora: data.hora,
+      sede_id: data.sede.id_sede,
+      sede_nombre: data.sede.nombre,
+      responsable_nombre: data.responsable_nombre,
+      responsable_email: data.responsable_email,
+      observaciones: data.observaciones,
+    };
+    const detailForSheets = data.productos.map((item) => ({
+      producto_id: item.producto_id,
+      codigo_producto: item.codigo_producto,
+      producto: item.producto,
+      familia: item.familia,
+      cantidad_solicitada: item.cantidad,
+      unidad_medida: item.unidad_medida,
+    }));
+    const sheetsPayload = buildSolicitudesSheetsPayload('solicitud', headerForSheets, detailForSheets);
+    sheetsEvent = await createSolicitudesSheetsOutboxEvent(client, 'solicitud', solicitudId, referencia, sheetsPayload);
+    await client.query('COMMIT');
+    createdSolicitud = await fetchSolicitudById(pool, solicitudId);
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
+  }
+  const sheets = sheetsEvent ? await syncSolicitudesSedesOutboxEvent(sheetsEvent) : { ok: false, queued: false, error: 'Outbox de Sheets no disponible' };
+  return res.status(201).json({ ok: true, solicitud: createdSolicitud, sheets });
+});
+
+app.patch('/api/solicitudes-sedes/:id/estado', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.solicitudStateUpdate);
+  if (!auth) return;
+  const idSolicitud = Number(req.params?.id || 0);
+  const estado = normalizeSolicitudesText(req.body?.estado || '', 20).toUpperCase();
+  if (!Number.isInteger(idSolicitud) || idSolicitud <= 0) return res.status(400).json({ ok: false, error: 'id de solicitud invalido.' });
+  if (!SOLICITUD_ESTADOS.has(estado)) return res.status(400).json({ ok: false, error: 'estado invalido.' });
+  try {
+    const result = await pool.query(
+      `UPDATE solicitudes_sedes SET estado = $2, updated_at = NOW() WHERE id_solicitud = $1 RETURNING id_solicitud`,
+      [idSolicitud, estado]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
+    const solicitud = await fetchSolicitudById(pool, idSolicitud);
+    return res.json({ ok: true, solicitud });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/entregas-sedes', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.entregaRead);
+  if (!auth) return;
+  const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
+  const page = Math.max(Number(req.query?.page || 1), 1);
+  const offset = (page - 1) * limit;
+  const params = [];
+  const whereParts = [];
+  const sedeId = Number(req.query?.sede_id || 0);
+  const productoId = Number(req.query?.producto_id || 0);
+  const fechaDesde = String(req.query?.fecha_desde || '').trim();
+  const fechaHasta = String(req.query?.fecha_hasta || '').trim();
+  if (Number.isInteger(sedeId) && sedeId > 0) {
+    params.push(sedeId);
+    whereParts.push(`e.sede_id = $${params.length}`);
+  }
+  if (isValidIsoDate(fechaDesde)) {
+    params.push(fechaDesde);
+    whereParts.push(`e.fecha >= $${params.length}::date`);
+  }
+  if (isValidIsoDate(fechaHasta)) {
+    params.push(fechaHasta);
+    whereParts.push(`e.fecha <= $${params.length}::date`);
+  }
+  if (Number.isInteger(productoId) && productoId > 0) {
+    params.push(productoId);
+    whereParts.push(`EXISTS (
+      SELECT 1 FROM entregas_sedes_detalle ed
+      WHERE ed.entrega_id = e.id_entrega AND ed.producto_id = $${params.length}
+    )`);
+  }
+  const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+  params.push(limit, offset);
+  try {
+    const result = await pool.query(
+      `SELECT
+         e.id_entrega,
+         e.solicitud_id,
+         e.referencia_externa,
+         TO_CHAR(e.fecha, 'YYYY-MM-DD') AS fecha,
+         TO_CHAR(e.hora, 'HH24:MI') AS hora,
+         e.sede_id,
+         e.sede_nombre,
+         e.responsable_nombre,
+         e.responsable_email,
+         e.observaciones,
+         e.creado_por,
+         TO_CHAR(e.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+         COUNT(*) OVER()::int AS total
+       FROM entregas_sedes e
+       ${whereSql}
+       ORDER BY e.fecha DESC, e.created_at DESC, e.id_entrega DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    const total = Number(result.rows?.[0]?.total || 0);
+    return res.json({ ok: true, rows: result.rows.map(mapEntregaRow), pagination: { page, limit, total } });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/entregas-sedes/:id', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.entregaRead);
+  if (!auth) return;
+  const idEntrega = Number(req.params?.id || 0);
+  if (!Number.isInteger(idEntrega) || idEntrega <= 0) return res.status(400).json({ ok: false, error: 'id de entrega invalido.' });
+  try {
+    const entrega = await fetchEntregaById(pool, idEntrega);
+    if (!entrega) return res.status(404).json({ ok: false, error: 'Entrega no encontrada.' });
+    return res.json({ ok: true, entrega });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/entregas-sedes', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.entregaCreate);
+  if (!auth) return;
+  const solicitudIdRaw = Number(req.body?.solicitud_id || 0);
+  const hasSolicitud = Number.isInteger(solicitudIdRaw) && solicitudIdRaw > 0;
+  const client = await pool.connect();
+  let entregaId = null;
+  let nuevoEstado = null;
+  let createdEntrega = null;
+  let sheetsEvent = null;
+  try {
+    await client.query('BEGIN');
+    const validation = await validateSolicitudesPayload(client, req.body, 'cantidad_entregada');
+    if (!validation.ok) {
+      await client.query('ROLLBACK');
+      return res.status(validation.status || 400).json({ ok: false, error: validation.error });
+    }
+    const data = validation.data;
+    if (hasSolicitud) {
+      const lockResult = await client.query(
+        `SELECT id_solicitud, estado, sede_id
+           FROM solicitudes_sedes
+          WHERE id_solicitud = $1
+          FOR UPDATE`,
+        [solicitudIdRaw]
+      );
+      if (!lockResult.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
+      }
+      const locked = lockResult.rows[0];
+      const estadoSolicitud = normalizeSolicitudesText(locked.estado || 'PENDIENTE', 30).toUpperCase();
+      if (estadoSolicitud === 'CANCELADA') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ ok: false, error: 'La solicitud esta cancelada y no acepta entregas.' });
+      }
+      if (estadoSolicitud === 'COMPLETADA') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ ok: false, error: 'La solicitud ya esta completada.' });
+      }
+      const solicitud = await fetchSolicitudById(client, solicitudIdRaw);
+      if (!solicitud) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
+      }
+      if (Number(solicitud.sede_id) !== Number(data.sede.id_sede)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ ok: false, error: 'La sede de la entrega no coincide con la solicitud.' });
+      }
+    }
+    const referencia = createExternalReference('ENT');
+    const inserted = await client.query(
+      `INSERT INTO entregas_sedes (
+         solicitud_id, fecha, hora, sede_id, sede_nombre, responsable_nombre, responsable_email,
+         observaciones, referencia_externa, creado_por, created_at
+       )
+       VALUES (NULLIF($1, 0), $2::date, $3::time, $4, $5, $6, NULLIF($7, ''), $8, $9, $10, NOW())
+       RETURNING id_entrega`,
+      [hasSolicitud ? solicitudIdRaw : 0, data.fecha, data.hora, data.sede.id_sede, data.sede.nombre, data.responsable_nombre, data.responsable_email, data.observaciones, referencia, normalizeAuthUsername(auth.username) || auth.username]
+    );
+    entregaId = Number(inserted.rows[0].id_entrega);
+    for (const item of data.productos) {
+      await client.query(
+        `INSERT INTO entregas_sedes_detalle (
+           entrega_id, producto_id, codigo_producto, producto, familia,
+           cantidad_entregada, unidad_medida, created_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+        [entregaId, item.producto_id, item.codigo_producto, item.producto, item.familia, item.cantidad, item.unidad_medida]
+      );
+    }
+    if (hasSolicitud) nuevoEstado = await recalculateSolicitudEstado(client, solicitudIdRaw);
+    const headerForSheets = {
+      referencia_externa: referencia,
+      fecha: data.fecha,
+      hora: data.hora,
+      sede_id: data.sede.id_sede,
+      sede_nombre: data.sede.nombre,
+      responsable_nombre: data.responsable_nombre,
+      responsable_email: data.responsable_email,
+      observaciones: data.observaciones,
+    };
+    const detailForSheets = data.productos.map((item) => ({
+      producto_id: item.producto_id,
+      codigo_producto: item.codigo_producto,
+      producto: item.producto,
+      familia: item.familia,
+      cantidad_entregada: item.cantidad,
+      unidad_medida: item.unidad_medida,
+    }));
+    const sheetsPayload = buildSolicitudesSheetsPayload('entrega', headerForSheets, detailForSheets);
+    sheetsEvent = await createSolicitudesSheetsOutboxEvent(client, 'entrega', entregaId, referencia, sheetsPayload);
+    await client.query('COMMIT');
+    createdEntrega = await fetchEntregaById(pool, entregaId);
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ ok: false, error: error.message });
+  } finally {
+    client.release();
+  }
+  const sheets = sheetsEvent ? await syncSolicitudesSedesOutboxEvent(sheetsEvent) : { ok: false, queued: false, error: 'Outbox de Sheets no disponible' };
+  return res.status(201).json({ ok: true, entrega: createdEntrega, solicitud_estado: nuevoEstado, sheets });
+});
+
+app.post('/api/solicitudes-sedes/sheets/retry', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.sheetsRetry);
+  if (!auth) return;
+  if (!SOLICITUDES_SHEETS_SYNC_ENABLED) {
+    return res.json({ ok: true, total: 0, sincronizados: 0, omitidos: 0, errores: 0, skipped: true, reason: 'disabled' });
+  }
+  const limit = Math.min(Math.max(Number(req.body?.limit || req.query?.limit || 10), 1), 50);
+  try {
+    const events = await claimSolicitudesSheetsOutboxEvents(limit);
+    const results = [];
+    for (const event of events) {
+      results.push(await syncSolicitudesSedesOutboxEvent(event));
+    }
+    return res.json({
+      ok: true,
+      total: events.length,
+      sincronizados: results.filter((item) => item.ok && !item.skipped).length,
+      omitidos: results.filter((item) => item.skipped).length,
+      errores: results.filter((item) => !item.ok).length,
+      results,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
   }
 });
 
@@ -9555,10 +10536,14 @@ async function startServer() {
   });
 }
 
-startServer().catch((error) => {
-  const step = error?.startupStep || 'desconocido';
-  const message = error?.message || String(error);
-  console.log(`[startup] Fallo en ${step}: ${message}`);
-  console.error('No se pudieron preparar las tablas base:', error);
-  process.exit(1);
-});
+if (!testRuntime?.skipStart) {
+  startServer().catch((error) => {
+    const step = error?.startupStep || 'desconocido';
+    const message = error?.message || String(error);
+    console.log(`[startup] Fallo en ${step}: ${message}`);
+    console.error('No se pudieron preparar las tablas base:', error);
+    process.exit(1);
+  });
+}
+
+export { app, pool, startServer };

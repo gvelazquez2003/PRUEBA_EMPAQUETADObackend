@@ -117,13 +117,13 @@ Notas:
 Para SPanel sin SSL, usa una URL sin `sslmode` y define `DB_SSL=false`:
 
 ```env
-DATABASE_URL=postgresql://admin01_pasante:CAMBIAR_CLAVE@174.136.57.19:5432/admin01_neondbfinal
+DATABASE_URL=postgresql://USUARIO:CLAVE@HOST:5432/NOMBRE_DB
 DB_SSL=false
 DB_CONNECT_TIMEOUT_MS=10000
 DB_POOL_MAX=5
 NODE_ENV=production
 ADMIN_KEY=CAMBIAR_CLAVE_ADMIN
-CORS_ORIGIN=https://prueba-empaquetad-ofrontend-theta.vercel.app
+CORS_ORIGIN=https://produccionpdt.com
 ROUTING_PROVIDER=openrouteservice
 OPENROUTESERVICE_API_KEY=CAMBIAR_API_KEY
 ROUTING_REFERENCE_LAT=10.492
@@ -140,3 +140,154 @@ GOOGLE_GEOCODING_MAX_VARIANTS=5
 
 El usuario PostgreSQL debe estar asignado a `admin01_neondbfinal` y SPanel debe permitir conexiones desde los rangos IP de salida del servicio Render.
 En Render no agregues `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` ni `DB_PORT`: el backend usa `DATABASE_URL`. Tampoco es necesario fijar `PORT`; Render lo proporciona al servicio.
+
+## 7) Solicitudes y Entregas a Sedes
+
+Modulo interno para registrar solicitudes de productos por sede, registrar entregas y sincronizar una copia operativa hacia Google Sheets desde el backend.
+
+### Variables de entorno
+
+```env
+SOLICITUDES_SHEETS_WEBHOOK_URL=
+SOLICITUDES_SHEETS_WEBHOOK_SECRET=
+SOLICITUDES_SHEETS_SYNC_ENABLED=false
+SOLICITUDES_ALLOWED_UNITS=UND,KG,PAQ,LT,CAJ,BLT,ENV,SAC,RLL,BOLSA,CESTA,BULTO
+```
+
+`SOLICITUDES_SHEETS_SYNC_ENABLED` queda en `false` por defecto. El registro en PostgreSQL no depende de Sheets.
+
+### Matriz de permisos
+
+- `administrador`: acceso completo, cambio manual de estado, reintentos de Sheets y actualizacion de unidad primaria.
+- `produccion`: crear y consultar solicitudes; consultar entregas.
+- `almacen`: consultar solicitudes; crear y consultar entregas; actualizar unidad primaria; reintentar Sheets.
+
+No se agregaron roles nuevos. Se reutilizan los roles existentes de `auth_users`.
+
+### Endpoints
+
+- `GET /api/solicitudes-sedes/catalogos/sedes`
+- `GET /api/solicitudes-sedes/catalogos/productos?limit=250&q=texto`
+- `PATCH /api/solicitudes-sedes/catalogos/productos/:id/unidad`
+- `GET /api/solicitudes-sedes`
+- `GET /api/solicitudes-sedes/:id`
+- `POST /api/solicitudes-sedes`
+- `PATCH /api/solicitudes-sedes/:id/estado`
+- `GET /api/entregas-sedes`
+- `GET /api/entregas-sedes/:id`
+- `POST /api/entregas-sedes`
+- `POST /api/solicitudes-sedes/sheets/retry`
+
+Todas las respuestas mantienen el formato general del backend:
+
+```json
+{ "ok": true }
+```
+
+o:
+
+```json
+{ "ok": false, "error": "mensaje" }
+```
+
+### Payload de solicitud
+
+```json
+{
+  "fecha": "2026-08-03",
+  "hora": "07:30",
+  "sede_id": 1,
+  "responsable_nombre": "Nombre Apellido",
+  "responsable_email": "correo@dominio.com",
+  "observaciones": "Opcional",
+  "productos": [
+    {
+      "producto_id": 51,
+      "cantidad_solicitada": 10,
+      "unidad_medida": "UND"
+    }
+  ]
+}
+```
+
+### Payload de entrega
+
+```json
+{
+  "solicitud_id": 10,
+  "fecha": "2026-08-03",
+  "hora": "09:00",
+  "sede_id": 1,
+  "responsable_nombre": "Nombre Apellido",
+  "productos": [
+    {
+      "producto_id": 51,
+      "cantidad_entregada": 6,
+      "unidad_medida": "UND"
+    }
+  ]
+}
+```
+
+`solicitud_id` puede ser `null` para entregas historicas sin relacion confiable.
+
+### Reglas principales
+
+- Las cantidades deben ser mayores que cero.
+- No se permite repetir productos dentro del mismo formulario.
+- `productos.unidad_primaria` puede ser `NULL`; en ese caso la interfaz exige seleccionar una unidad valida.
+- La unidad seleccionada se guarda como copia historica en el detalle.
+- `LTS` se normaliza como `LT`.
+- No se deduce fresco/empaquetado ni unidad por nombre o codigo del producto.
+- Las entregas relacionadas no se aceptan si la solicitud esta `CANCELADA` o `COMPLETADA`.
+- El estado queda `PENDIENTE`, `PARCIAL`, `COMPLETADA` o `CANCELADA`.
+- La cantidad pendiente visible nunca se muestra negativa aunque exista sobreentrega controlada.
+
+### Transacciones
+
+Solicitud:
+
+```text
+BEGIN -> cabecera -> detalles -> evento outbox -> COMMIT -> intento Sheets
+```
+
+Entrega:
+
+```text
+BEGIN -> SELECT solicitud FOR UPDATE -> cabecera -> detalles -> recalcular estado -> evento outbox -> COMMIT -> intento Sheets
+```
+
+El bloqueo `FOR UPDATE` evita carreras cuando dos usuarios registran entregas de la misma solicitud al mismo tiempo.
+
+### Outbox de Google Sheets
+
+El script `scripts/migration-solicitudes-sedes-outbox.sql` crea solo la tabla tecnica `solicitudes_sedes_sheets_outbox`. No modifica ni recrea las tablas de negocio.
+
+Flujo:
+
+```text
+guardar en PostgreSQL -> crear outbox en la misma transaccion -> intentar Sheets despues del COMMIT -> marcar sincronizado/error -> permitir reintento
+```
+
+Los reintentos usan `FOR UPDATE SKIP LOCKED` para evitar que dos procesos tomen el mismo evento.
+
+### Apps Script
+
+Usa `scripts/google_apps_script_solicitudes_sedes.gs` como plantilla. Propiedades recomendadas:
+
+- `SOLICITUDES_SHEETS_WEBHOOK_SECRET`
+- `SOLICITUDES_SPREADSHEET_ID` opcional si no se usa el spreadsheet activo.
+- `SOLICITUDES_SHEET_SOLICITUDES` opcional.
+- `SOLICITUDES_SHEET_ENTREGAS` opcional.
+
+El script usa `LockService`, valida secreto compartido y actualiza por `row_reference` para no duplicar filas.
+
+### SPanel futuro
+
+1. Subir cambios al repositorio.
+2. En SPanel, hacer `git pull` del backend y frontend.
+3. Instalar dependencias si cambiaron.
+4. Revisar `scripts/inspect-solicitudes-sedes.sql` en phpPgAdmin.
+5. Aplicar manualmente `scripts/migration-solicitudes-sedes-outbox.sql` si se activara Sheets.
+6. Configurar variables `.env` sin credenciales en Git.
+7. Reiniciar la app Node.js desde SPanel.
