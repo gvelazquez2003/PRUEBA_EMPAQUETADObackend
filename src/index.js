@@ -4973,12 +4973,15 @@ app.get('/api/solicitudes-sedes/catalogos/productos', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, SOLICITUDES_SEDES_PERMISSIONS.catalogRead);
   if (!auth) return;
   const q = normalizeSolicitudesText(req.query?.q || '', 80);
-  const limit = Math.min(Math.max(Number(req.query?.limit || 100), 1), 250);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 1000), 1), 5000);
   const params = [];
-  const whereParts = [`COALESCE(activo, TRUE) = TRUE`];
+  const whereParts = [
+    `COALESCE(activo, TRUE) = TRUE`,
+    `(UPPER(TRIM(codigo_producto)) LIKE 'PT%' OR UPPER(TRIM(codigo_producto)) LIKE 'ST%')`,
+  ];
   if (q) {
     params.push(`%${q}%`);
-    whereParts.push(`(codigo_producto ILIKE $${params.length} OR descripcion ILIKE $${params.length})`);
+    whereParts.push(`(UPPER(TRIM(codigo_producto)) ILIKE UPPER($${params.length}) OR descripcion ILIKE $${params.length})`);
   }
   params.push(limit);
   try {
@@ -4986,7 +4989,7 @@ app.get('/api/solicitudes-sedes/catalogos/productos', async (req, res) => {
       `SELECT id_producto, codigo_producto, descripcion, unidad_primaria, COALESCE(activo, TRUE) AS activo
          FROM productos
         WHERE ${whereParts.join(' AND ')}
-        ORDER BY codigo_producto ASC
+        ORDER BY UPPER(TRIM(codigo_producto)) ASC, descripcion ASC
         LIMIT $${params.length}`,
       params
     );

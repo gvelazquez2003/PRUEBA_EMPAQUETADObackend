@@ -51,8 +51,14 @@ class FakePgPool {
       ],
       productos: [
         { id_producto: 10, codigo_producto: 'PTEM0010', descripcion: 'Producto UND', unidad_primaria: 'UND', activo: true },
-        { id_producto: 20, codigo_producto: 'PTEM0020', descripcion: 'Producto KG', unidad_primaria: 'KG', activo: true },
-        { id_producto: 30, codigo_producto: 'PTEM0030', descripcion: 'Producto sin unidad', unidad_primaria: null, activo: true },
+        { id_producto: 20, codigo_producto: 'PTSU0020', descripcion: 'Producto KG', unidad_primaria: 'KG', activo: true },
+        { id_producto: 30, codigo_producto: 'PTEE0030', descripcion: 'Producto sin unidad', unidad_primaria: null, activo: true },
+        { id_producto: 31, codigo_producto: 'PTES0031', descripcion: 'Producto PTES', unidad_primaria: 'UND', activo: true },
+        { id_producto: 32, codigo_producto: 'ST0032', descripcion: 'Producto ST', unidad_primaria: 'UND', activo: true },
+        { id_producto: 50, codigo_producto: 'ACTV0050', descripcion: 'Articulo contable', unidad_primaria: 'UND', activo: true },
+        { id_producto: 51, codigo_producto: 'CSCV0051', descripcion: 'Articulo administrativo', unidad_primaria: 'UND', activo: true },
+        { id_producto: 52, codigo_producto: 'GEN0052', descripcion: 'Generico administrativo', unidad_primaria: 'UND', activo: true },
+        { id_producto: 53, codigo_producto: 'GSGE0053', descripcion: 'Gasto general', unidad_primaria: 'UND', activo: true },
         { id_producto: 40, codigo_producto: 'PTEM0040', descripcion: 'Producto inactivo', unidad_primaria: 'UND', activo: false },
       ],
       solicitudes: [],
@@ -119,7 +125,12 @@ class FakePgPool {
       const q = params.length > 1 ? String(params[0] || '').replace(/%/g, '').toLowerCase() : '';
       return result(state.productos
         .filter((product) => product.activo !== false)
+        .filter((product) => {
+          const code = String(product.codigo_producto || '').trim().toUpperCase();
+          return code.startsWith('PT') || code.startsWith('ST');
+        })
         .filter((product) => !q || product.codigo_producto.toLowerCase().includes(q) || product.descripcion.toLowerCase().includes(q))
+        .sort((a, b) => String(a.codigo_producto).localeCompare(String(b.codigo_producto)) || String(a.descripcion).localeCompare(String(b.descripcion)))
         .slice(0, limit));
     }
     if (text.startsWith('UPDATE productos SET unidad_primaria')) {
@@ -466,6 +477,15 @@ test('catalog endpoints list sedes/products and update product unit with validat
     assert.equal(sedes.payload.sedes.length, 2);
     const products = await ctx.request('GET', '/api/solicitudes-sedes/catalogos/productos?limit=10', null, 'prod-token');
     assert.equal(products.status, 200);
+    const codes = products.payload.productos.map((p) => p.codigo_producto);
+    assert.deepEqual(
+      ['PTEM0010', 'PTSU0020', 'PTEE0030', 'PTES0031', 'ST0032'].every((code) => codes.includes(code)),
+      true
+    );
+    assert.deepEqual(
+      ['ACTV0050', 'CSCV0051', 'GEN0052', 'GSGE0053'].some((code) => codes.includes(code)),
+      false
+    );
     assert.equal(products.payload.productos.some((p) => p.unidad_primaria === null), true);
     assert.equal(products.payload.productos.some((p) => p.id_producto === 40), false);
     assert.equal((await ctx.request('PATCH', '/api/solicitudes-sedes/catalogos/productos/30/unidad', { unidad: 'BAD' }, 'almacen-token')).status, 400);

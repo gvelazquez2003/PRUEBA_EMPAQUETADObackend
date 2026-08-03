@@ -167,7 +167,7 @@ No se agregaron roles nuevos. Se reutilizan los roles existentes de `auth_users`
 ### Endpoints
 
 - `GET /api/solicitudes-sedes/catalogos/sedes`
-- `GET /api/solicitudes-sedes/catalogos/productos?limit=250&q=texto`
+- `GET /api/solicitudes-sedes/catalogos/productos?limit=5000&q=texto`
 - `PATCH /api/solicitudes-sedes/catalogos/productos/:id/unidad`
 - `GET /api/solicitudes-sedes`
 - `GET /api/solicitudes-sedes/:id`
@@ -236,6 +236,7 @@ o:
 - Las cantidades deben ser mayores que cero.
 - No se permite repetir productos dentro del mismo formulario.
 - `productos.unidad_primaria` puede ser `NULL`; en ese caso la interfaz exige seleccionar una unidad valida.
+- El catalogo de productos del modulo solo lista codigos activos cuyo `codigo_producto` normalizado empieza por `PT` o `ST`.
 - La unidad seleccionada se guarda como copia historica en el detalle.
 - `LTS` se normaliza como `LT`.
 - No se deduce fresco/empaquetado ni unidad por nombre o codigo del producto.
