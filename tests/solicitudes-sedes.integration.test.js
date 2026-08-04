@@ -41,7 +41,9 @@ class FakePgPool {
     this.state = {
       sessions: new Map([
         ['admin-token', { id_user: 1, username: 'ADMIN', role: 'administrador', activo: true }],
-        ['prod-token', { id_user: 2, username: 'PROD', role: 'produccion', activo: true }],
+        ['prod-token', { id_user: 2, username: 'PROD', role: 'produccion', activo: true, sede_id: 1, nombre_sede: 'SL' }],
+        ['prod2-token', { id_user: 5, username: 'PROD2', role: 'produccion', activo: true, sede_id: 2, nombre_sede: 'LA GUAIRA' }],
+        ['prod-central-token', { id_user: 6, username: 'PRODCENTRAL', role: 'produccion', activo: true }],
         ['almacen-token', { id_user: 3, username: 'ALMACEN', role: 'almacen', activo: true }],
         ['ventas-token', { id_user: 4, username: 'VENTAS', role: 'ventas', activo: true }],
       ]),
@@ -67,6 +69,11 @@ class FakePgPool {
       entregas: [],
       entregasDetalle: [],
       outbox: [],
+      users: [
+        { id_user: 1, username: 'ADMIN', role: 'administrador', full_name: 'ADMIN', vehicle_plate: '', sede_id: null, activo: true },
+        { id_user: 2, username: 'PROD', role: 'produccion', full_name: 'PROD', vehicle_plate: '', sede_id: 1, activo: true },
+        { id_user: 3, username: 'ALMACEN', role: 'almacen', full_name: 'ALMACEN', vehicle_plate: '', sede_id: null, activo: true },
+      ],
     };
   }
 
@@ -106,9 +113,53 @@ class FakePgPool {
 
     if (text.includes('FROM auth_sessions s JOIN auth_users u')) {
       const session = state.sessions.get(params[0]);
-      return session ? result([{ token: params[0], ...session, full_name: session.username }]) : result();
+      return session ? result([{ token: params[0], ...session, full_name: session.username, vehicle_plate: '', nombre_sede: session.nombre_sede || '' }]) : result();
     }
     if (text.startsWith('UPDATE auth_sessions SET last_seen_at')) return result([{ ok: true }]);
+    if (text.startsWith('SELECT 1 FROM auth_users')) {
+      const username = params[0];
+      const excludeId = Number(params[1] || 0);
+      return result(state.users.filter((user) => user.username === username && (!excludeId || Number(user.id_user) !== excludeId)).slice(0, 1));
+    }
+    if (text.includes('FROM auth_users u LEFT JOIN sedes se') && text.includes('WHERE u.activo = TRUE')) {
+      return result(state.users
+        .filter((user) => user.activo !== false)
+        .map((user) => ({ ...user, nombre_sede: state.sedes.find((sede) => Number(sede.id_sede) === Number(user.sede_id))?.nombre || '' })));
+    }
+    if (text.startsWith('INSERT INTO auth_users') && text.includes('sede_id')) {
+      const user = {
+        id_user: state.users.length + 1,
+        username: params[0],
+        role: params[1],
+        password_hash: params[2],
+        password_visible: params[3],
+        full_name: params[4],
+        vehicle_plate: params[5],
+        sede_id: params[6] === null || params[6] === undefined ? null : Number(params[6]),
+        activo: true,
+        created_at: '2026-08-04T00:00:00.000Z',
+      };
+      state.users.push(user);
+      return result([user]);
+    }
+    if (text.startsWith('SELECT id_user, username, role FROM auth_users')) {
+      const user = state.users.find((item) => item.username === params[0] && item.activo !== false);
+      return user ? result([user]) : result();
+    }
+    if (text.startsWith('SELECT COUNT(*)::int AS total FROM auth_users')) {
+      return result([{ total: state.users.filter((user) => user.activo !== false && user.role === 'administrador').length }]);
+    }
+    if (text.startsWith('UPDATE auth_users SET') || text.startsWith('UPDATE auth_users SET'.replace(/\s+/g, ' '))) {
+      const id = Number(params[params.length - 1]);
+      const user = state.users.find((item) => Number(item.id_user) === id);
+      if (!user) return result();
+      user.username = params[0];
+      user.role = params[1];
+      user.full_name = params[2];
+      user.vehicle_plate = params[3];
+      user.sede_id = params[4] === null || params[4] === undefined ? null : Number(params[4]);
+      return result([user]);
+    }
 
     if (text.startsWith('SELECT id_sede, nombre FROM sedes WHERE id_sede')) {
       return result(state.sedes.filter((sede) => Number(sede.id_sede) === Number(params[0])));
@@ -191,10 +242,10 @@ class FakePgPool {
     }
 
     if (text.startsWith('SELECT ss.id_solicitud,') && !text.includes('WHERE ss.id_solicitud = $1 LIMIT 1')) {
-      return result(listSolicitudes(state, params));
+      return result(listSolicitudes(state, params, text));
     }
     if (text.startsWith('SELECT e.id_entrega,') && !text.includes('WHERE e.id_entrega = $1 LIMIT 1')) {
-      return result(listEntregas(state, params));
+      return result(listEntregas(state, params, text));
     }
 
     if (text.startsWith('SELECT ss.id_solicitud') && text.includes('WHERE ss.id_solicitud = $1 LIMIT 1')) {
@@ -371,6 +422,7 @@ function cloneState(state) {
     entregas: clone(state.entregas),
     entregasDetalle: clone(state.entregasDetalle),
     outbox: clone(state.outbox),
+    users: clone(state.users),
   };
 }
 
@@ -382,18 +434,26 @@ function sumDelivered(state, solicitudId, productId) {
     .reduce((sum, detail) => sum + Number(detail.cantidad_entregada || 0), 0);
 }
 
-function listSolicitudes(state, params) {
+function listSolicitudes(state, params, text = '') {
   const limit = Number(params[params.length - 2] || 50);
   const offset = Number(params[params.length - 1] || 0);
-  const rows = [...state.solicitudes].reverse().slice(offset, offset + limit);
-  return rows.map((row) => ({ ...row, total: state.solicitudes.length }));
+  let source = [...state.solicitudes];
+  if (String(text).includes('ss.sede_id = $1')) {
+    source = source.filter((row) => Number(row.sede_id) === Number(params[0]));
+  }
+  const rows = source.reverse().slice(offset, offset + limit);
+  return rows.map((row) => ({ ...row, total: source.length }));
 }
 
-function listEntregas(state, params) {
+function listEntregas(state, params, text = '') {
   const limit = Number(params[params.length - 2] || 50);
   const offset = Number(params[params.length - 1] || 0);
-  const rows = [...state.entregas].reverse().slice(offset, offset + limit);
-  return rows.map((row) => ({ ...row, total: state.entregas.length }));
+  let source = [...state.entregas];
+  if (String(text).includes('e.sede_id = $1')) {
+    source = source.filter((row) => Number(row.sede_id) === Number(params[0]));
+  }
+  const rows = source.reverse().slice(offset, offset + limit);
+  return rows.map((row) => ({ ...row, total: source.length }));
 }
 
 function filterGenericProducts(productos, query = '', prefixes = []) {
@@ -451,6 +511,7 @@ async function setup(options = {}) {
       return { status: response.status, payload };
     },
     close() {
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
       server.close();
       globalThis.fetch = originalFetch;
       delete globalThis.__PDT_TEST_RUNTIME;
@@ -544,6 +605,113 @@ test('productos endpoint can restrict control inventario catalog to PTEM and PTS
   }
 });
 
+test('auth users can be created and edited with sede assignment', async () => {
+  const ctx = await setup();
+  try {
+    const created = await ctx.request('POST', '/auth/register', {
+      username: 'SLSOL',
+      role: 'produccion',
+      password: '1234',
+      sede_id: 1,
+    }, 'admin-token');
+    assert.equal(created.status, 201);
+    assert.equal(created.payload.user.sede_id, 1);
+    assert.equal(created.payload.user.nombre_sede, 'SL');
+
+    const edited = await ctx.request('POST', '/auth/users/update', {
+      targetUsername: 'SLSOL',
+      username: 'SLSOL',
+      role: 'produccion',
+      sede_id: 2,
+    }, 'admin-token');
+    assert.equal(edited.status, 200);
+    assert.equal(edited.payload.user.sede_id, 2);
+    assert.equal(edited.payload.user.nombre_sede, 'LA GUAIRA');
+
+    const users = await ctx.request('GET', '/auth/users', null, 'admin-token');
+    const user = users.payload.users.find((item) => item.username === 'SLSOL');
+    assert.equal(user.sede_id, 2);
+    assert.equal(user.nombre_sede, 'LA GUAIRA');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('auth users reject nonexistent sede and allow null sede', async () => {
+  const ctx = await setup();
+  try {
+    const bad = await ctx.request('POST', '/auth/register', {
+      username: 'BADSEDE',
+      role: 'produccion',
+      password: '1234',
+      sede_id: 999,
+    }, 'admin-token');
+    assert.equal(bad.status, 400);
+
+    const general = await ctx.request('POST', '/auth/register', {
+      username: 'GENERAL',
+      role: 'administrador',
+      password: '1234',
+      sede_id: null,
+    }, 'admin-token');
+    assert.equal(general.status, 201);
+    assert.equal(general.payload.user.sede_id, null);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('solicitudes use authenticated sede and reject missing assigned sede', async () => {
+  const ctx = await setup();
+  try {
+    const forged = await ctx.request('POST', '/api/solicitudes-sedes', { ...validSolicitud(), sede_id: 2 }, 'prod-token');
+    assert.equal(forged.status, 201);
+    assert.equal(forged.payload.solicitud.sede_id, 1);
+    assert.equal(forged.payload.solicitud.sede_nombre, 'SL');
+
+    const missing = await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud(), 'prod-central-token');
+    assert.equal(missing.status, 400);
+    assert.equal(missing.payload.error, 'El usuario no tiene una sede asignada');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('sede users only read own records while central roles can read all', async () => {
+  const ctx = await setup();
+  try {
+    await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud(), 'prod-token');
+    await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud(), 'prod2-token');
+
+    const sedeOne = await ctx.request('GET', '/api/solicitudes-sedes', null, 'prod-token');
+    assert.equal(sedeOne.status, 200);
+    assert.deepEqual(sedeOne.payload.rows.map((row) => row.sede_id), [1]);
+
+    const admin = await ctx.request('GET', '/api/solicitudes-sedes', null, 'admin-token');
+    assert.equal(admin.status, 200);
+    assert.equal(admin.payload.rows.length, 2);
+
+    const almacen = await ctx.request('GET', '/api/solicitudes-sedes', null, 'almacen-token');
+    assert.equal(almacen.status, 200);
+    assert.equal(almacen.payload.rows.length, 2);
+  } finally {
+    ctx.close();
+  }
+});
+
+test('entregas inherit solicitud sede and ignore forged body sede', async () => {
+  const ctx = await setup();
+  try {
+    const created = await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud(), 'prod-token');
+    const entrega = await ctx.request('POST', '/api/entregas-sedes', { ...validEntrega(created.payload.solicitud.id_solicitud), sede_id: 2 }, 'almacen-token');
+    assert.equal(entrega.status, 201);
+    assert.equal(entrega.payload.entrega.sede_id, 1);
+    assert.equal(entrega.payload.entrega.sede_nombre, 'SL');
+  } finally {
+    ctx.close();
+  }
+});
+
 test('solicitudes create header, details and outbox in one transaction', async () => {
   const ctx = await setup();
   try {
@@ -576,7 +744,9 @@ test('solicitudes reject invalid payloads with controlled 400 responses', async 
     ]), 'prod-token')).status, 400);
     assert.equal((await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud([{ producto_id: 10, cantidad_solicitada: 0, unidad_medida: 'UND' }]), 'prod-token')).status, 400);
     assert.equal((await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud([{ producto_id: 10, cantidad_solicitada: -1, unidad_medida: 'UND' }]), 'prod-token')).status, 400);
-    assert.equal((await ctx.request('POST', '/api/solicitudes-sedes', { ...validSolicitud(), sede_id: 999 }, 'prod-token')).status, 400);
+    const forgedSede = await ctx.request('POST', '/api/solicitudes-sedes', { ...validSolicitud(), sede_id: 999 }, 'prod-token');
+    assert.equal(forgedSede.status, 201);
+    assert.equal(forgedSede.payload.solicitud.sede_id, 1);
     assert.equal((await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud([{ producto_id: 999, cantidad_solicitada: 1, unidad_medida: 'UND' }]), 'prod-token')).status, 400);
     assert.equal((await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud([{ producto_id: 30, cantidad_solicitada: 1 }]), 'prod-token')).status, 400);
     assert.equal((await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud([{ producto_id: 30, cantidad_solicitada: 1, unidad_medida: 'CAJ' }]), 'prod-token')).status, 201);
@@ -643,7 +813,9 @@ test('entregas reject missing/cancelled/completed/different-sede solicitudes and
     assert.equal((await ctx.request('POST', '/api/entregas-sedes', validEntrega(999), 'almacen-token')).status, 404);
     const created = await ctx.request('POST', '/api/solicitudes-sedes', validSolicitud([{ producto_id: 10, cantidad_solicitada: 2, unidad_medida: 'UND' }]), 'prod-token');
     const id = created.payload.solicitud.id_solicitud;
-    assert.equal((await ctx.request('POST', '/api/entregas-sedes', { ...validEntrega(id), sede_id: 2 }, 'almacen-token')).status, 409);
+    const forgedEntrega = await ctx.request('POST', '/api/entregas-sedes', { ...validEntrega(id), sede_id: 2 }, 'almacen-token');
+    assert.equal(forgedEntrega.status, 201);
+    assert.equal(forgedEntrega.payload.entrega.sede_id, 1);
     assert.equal((await ctx.request('PATCH', `/api/solicitudes-sedes/${id}/estado`, { estado: 'CANCELADA' }, 'admin-token')).status, 200);
     assert.equal((await ctx.request('POST', '/api/entregas-sedes', validEntrega(id), 'almacen-token')).status, 409);
   } finally {
