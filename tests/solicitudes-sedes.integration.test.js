@@ -54,6 +54,7 @@ class FakePgPool {
         { id_producto: 20, codigo_producto: 'PTSU0020', descripcion: 'Producto KG', unidad_primaria: 'KG', activo: true },
         { id_producto: 30, codigo_producto: 'PTEE0030', descripcion: 'Producto sin unidad', unidad_primaria: null, activo: true },
         { id_producto: 31, codigo_producto: 'PTES0031', descripcion: 'Producto PTES', unidad_primaria: 'UND', activo: true },
+        { id_producto: 33, codigo_producto: 'PTSE0033', descripcion: 'Producto PTSE sin unidad', unidad_primaria: null, activo: true },
         { id_producto: 32, codigo_producto: 'ST0032', descripcion: 'Producto ST', unidad_primaria: 'UND', activo: true },
         { id_producto: 50, codigo_producto: 'ACTV0050', descripcion: 'Articulo contable', unidad_primaria: 'UND', activo: true },
         { id_producto: 51, codigo_producto: 'CSCV0051', descripcion: 'Articulo administrativo', unidad_primaria: 'UND', activo: true },
@@ -119,6 +120,20 @@ class FakePgPool {
     if (text.includes('FROM productos') && text.includes('WHERE id_producto = ANY')) {
       const ids = new Set(params[0].map(Number));
       return result(state.productos.filter((product) => ids.has(Number(product.id_producto))));
+    }
+    if (text.startsWith('SELECT id_producto, codigo_producto, codigo_barras,')) {
+      const limit = Number(params[params.length - 2] || 50);
+      const offset = Number(params[params.length - 1] || 0);
+      const q = params.find((param) => typeof param === 'string' && param.includes('%'));
+      const query = q ? String(q || '').replace(/%/g, '').toLowerCase() : '';
+      const prefixes = params.find((param) => Array.isArray(param)) || [];
+      return result(filterGenericProducts(state.productos, query, prefixes).slice(offset, offset + limit));
+    }
+    if (text.startsWith('SELECT COUNT(*)::INT AS total') && text.includes('FROM productos')) {
+      const q = params.find((param) => typeof param === 'string' && param.includes('%'));
+      const query = q ? String(q || '').replace(/%/g, '').toLowerCase() : '';
+      const prefixes = params.find((param) => Array.isArray(param)) || [];
+      return result([{ total: filterGenericProducts(state.productos, query, prefixes).length }]);
     }
     if (text.startsWith('SELECT id_producto, codigo_producto, descripcion, unidad_primaria')) {
       const limit = Number(params[params.length - 1] || 250);
@@ -381,6 +396,21 @@ function listEntregas(state, params) {
   return rows.map((row) => ({ ...row, total: state.entregas.length }));
 }
 
+function filterGenericProducts(productos, query = '', prefixes = []) {
+  return productos
+    .filter((product) => product.activo !== false)
+    .filter((product) => {
+      const code = String(product.codigo_producto || '').trim().toUpperCase();
+      return !prefixes.length || prefixes.some((prefix) => code.startsWith(String(prefix || '').replace(/%/g, '').toUpperCase()));
+    })
+    .filter((product) => {
+      if (!query) return true;
+      return String(product.codigo_producto || '').toLowerCase().includes(query)
+        || String(product.descripcion || '').toLowerCase().includes(query);
+    })
+    .sort((a, b) => String(a.codigo_producto).localeCompare(String(b.codigo_producto)) || String(a.descripcion).localeCompare(String(b.descripcion)));
+}
+
 async function setup(options = {}) {
   const pool = new FakePgPool(options.poolOptions || {});
   const fetchCalls = [];
@@ -492,6 +522,23 @@ test('catalog endpoints list sedes/products and update product unit with validat
     const updated = await ctx.request('PATCH', '/api/solicitudes-sedes/catalogos/productos/30/unidad', { unidad: 'LTS' }, 'almacen-token');
     assert.equal(updated.status, 200);
     assert.equal(updated.payload.producto.unidad_primaria, 'LT');
+  } finally {
+    ctx.close();
+  }
+});
+
+test('productos endpoint can restrict control inventario catalog to PTEM and PTSE prefixes', async () => {
+  const ctx = await setup();
+  try {
+    const response = await ctx.request('GET', '/productos?limit=100&prefixes=PTEM,PTSE');
+    assert.equal(response.status, 200);
+    const codes = response.payload.map((product) => product.codigo_producto);
+    assert.deepEqual(codes.sort(), ['PTEM0010', 'PTSE0033']);
+    assert.equal(
+      ['ACTV0050', 'CSCV0051', 'GEN0052', 'GSGE0053', 'PTSU0020', 'PTEE0030', 'PTES0031', 'ST0032', 'PTEM0040'].some((code) => codes.includes(code)),
+      false
+    );
+    assert.equal(response.payload.some((product) => product.codigo_producto === 'PTSE0033' && product.unidad_primaria === null), true);
   } finally {
     ctx.close();
   }

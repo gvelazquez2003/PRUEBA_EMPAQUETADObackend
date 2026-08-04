@@ -5400,14 +5400,19 @@ app.post('/api/solicitudes-sedes/sheets/retry', async (req, res) => {
 app.get('/productos', async (req, res) => {
   try {
     const rawQuery = String(req.query?.q || '').trim();
+    const rawPrefixes = String(req.query?.prefixes || req.query?.prefijos || '').trim();
     const hasCustomLimit = req.query && req.query.limit !== undefined;
     const hasCustomOffset = req.query && req.query.offset !== undefined;
     const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
     const offset = Math.max(Number(req.query?.offset || 0), 0);
-    const isPagedRequest = hasCustomLimit || hasCustomOffset || rawQuery.length > 0;
+    const isPagedRequest = hasCustomLimit || hasCustomOffset || rawQuery.length > 0 || rawPrefixes.length > 0;
 
     const whereParts = ['COALESCE(activo, TRUE) = TRUE'];
     const params = [];
+    const prefixes = rawPrefixes
+      .split(',')
+      .map((prefix) => String(prefix || '').trim().toUpperCase())
+      .filter((prefix) => /^[A-Z0-9]{2,12}$/.test(prefix));
 
     if (rawQuery) {
       params.push(`%${rawQuery}%`);
@@ -5415,6 +5420,10 @@ app.get('/productos', async (req, res) => {
         codigo_producto ILIKE $${params.length}
         OR descripcion ILIKE $${params.length}
       )`);
+    }
+    if (prefixes.length) {
+      params.push(prefixes.map((prefix) => `${prefix}%`));
+      whereParts.push(`UPPER(TRIM(codigo_producto)) LIKE ANY($${params.length}::text[])`);
     }
 
     const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
@@ -5519,6 +5528,10 @@ app.get('/api/control-inventario/producto-barcode', async (req, res) => {
            ctid ASC
        ) productos_unicos
        WHERE COALESCE(activo, TRUE) = TRUE
+         AND (
+           UPPER(TRIM(COALESCE(codigo_producto, ''))) LIKE 'PTEM%'
+           OR UPPER(TRIM(COALESCE(codigo_producto, ''))) LIKE 'PTSE%'
+         )
          AND (
            UPPER(TRIM(COALESCE(codigo_barras, ''))) = UPPER(TRIM($1))
            OR UPPER(TRIM(COALESCE(codigo_producto, ''))) = UPPER(TRIM($1))
