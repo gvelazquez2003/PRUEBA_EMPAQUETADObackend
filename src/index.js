@@ -446,6 +446,8 @@ function buildAuthSessionResponse(row) {
     role: normalizeAuthRole(row.role),
     fullName: String(row.fullName || row.full_name || '').trim(),
     vehiclePlate: normalizeVehiclePlate(row.vehiclePlate || row.vehicle_plate || ''),
+    sede_id: row.sede_id === null || row.sede_id === undefined ? null : Number(row.sede_id),
+    nombre_sede: String(row.nombre_sede || row.sede_nombre || '').trim(),
     loggedAt: row.loggedAt || row.logged_at || row.created_at || new Date().toISOString(),
     expiresAt: row.expiresAt || row.expires_at || null,
   };
@@ -481,9 +483,12 @@ async function getSessionContext(token, touch) {
        u.username,
        u.role,
        COALESCE(u.full_name, '') AS full_name,
-       COALESCE(u.vehicle_plate, '') AS vehicle_plate
+       COALESCE(u.vehicle_plate, '') AS vehicle_plate,
+       u.sede_id,
+       COALESCE(se.nombre, '') AS nombre_sede
      FROM auth_sessions s
      JOIN auth_users u ON u.id_user = s.id_user
+     LEFT JOIN sedes se ON se.id_sede = u.sede_id
      WHERE s.token = $1
        AND s.revoked_at IS NULL
        AND (s.expires_at IS NULL OR s.expires_at > NOW())
@@ -505,6 +510,8 @@ async function getSessionContext(token, touch) {
     role: normalizeAuthRole(row.role),
     fullName: String(row.full_name || '').trim(),
     vehiclePlate: normalizeVehiclePlate(row.vehicle_plate || ''),
+    sede_id: row.sede_id === null || row.sede_id === undefined ? null : Number(row.sede_id),
+    nombre_sede: String(row.nombre_sede || '').trim(),
     loggedAt: row.logged_at,
     expiresAt: row.expires_at || null,
   };
@@ -537,6 +544,24 @@ const SOLICITUDES_SEDES_PERMISSIONS = Object.freeze({
   productUnitUpdate: [APP_ROLES.ADMIN, APP_ROLES.ALMACEN],
   sheetsRetry: [APP_ROLES.ADMIN, APP_ROLES.ALMACEN],
 });
+
+function getAuthSedeId(auth) {
+  const sedeId = Number(auth?.sede_id ?? auth?.sedeId ?? 0);
+  return Number.isInteger(sedeId) && sedeId > 0 ? sedeId : null;
+}
+
+function canReadAllSolicitudesSedes(auth) {
+  const role = normalizeAuthRole(auth?.role);
+  if (role === APP_ROLES.ADMIN || role === APP_ROLES.ALMACEN) return true;
+  if (role === APP_ROLES.PRODUCCION && !getAuthSedeId(auth)) return true;
+  return false;
+}
+
+function normalizeOptionalSedeId(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const sedeId = Number(value);
+  return Number.isInteger(sedeId) && sedeId > 0 ? sedeId : NaN;
+}
 const SOLICITUD_ESTADOS = new Set(['PENDIENTE', 'PARCIAL', 'COMPLETADA', 'CANCELADA']);
 
 function normalizeSolicitudesText(value, maxLength = 255) {
@@ -652,10 +677,13 @@ function validateSolicitudesProductos(rawProductos, quantityField) {
   return { ok: true, productos: normalized };
 }
 
-async function validateSolicitudesPayload(db, body, quantityField) {
+async function validateSolicitudesPayload(db, body, quantityField, options = {}) {
   const fecha = String(body?.fecha || '').trim();
   const hora = String(body?.hora || '').trim();
-  const sedeId = Number(body?.sede_id || body?.id_sede || 0);
+  const forcedSedeId = Number(options?.sede_id || options?.sedeId || 0);
+  const sedeId = Number.isInteger(forcedSedeId) && forcedSedeId > 0
+    ? forcedSedeId
+    : Number(body?.sede_id || body?.id_sede || 0);
   const responsableNombre = normalizeSolicitudesText(body?.responsable_nombre || body?.responsable || '', 120);
   const responsableEmail = normalizeSolicitudesEmail(body?.responsable_email || body?.correo || '');
   const observaciones = normalizeSolicitudesText(body?.observaciones || '', 1000);
@@ -921,6 +949,7 @@ function buildSolicitudesSheetsPayload(kind, header, detalles) {
 async function createSolicitudesSheetsOutboxEvent(db, kind, entityId, reference, payload) {
   const eventType = `sync_${kind}_sheets`;
   const entityType = kind === 'entrega' ? 'entrega_sede' : 'solicitud_sede';
+
   try {
     const result = await db.query(
       `INSERT INTO solicitudes_sedes_sheets_outbox (
@@ -1313,7 +1342,11 @@ app.post('/auth/register', async (req, res) => {
   const password = String(req.body?.password || '');
   const fullName = normalizeCatalogText(req.body?.full_name || req.body?.fullName || '', 120);
   const vehiclePlate = normalizeVehiclePlate(req.body?.vehicle_plate || req.body?.vehiclePlate || '');
+  const sedeId = normalizeOptionalSedeId(req.body?.sede_id ?? req.body?.sedeId);
 
+  if (Number.isNaN(sedeId)) {
+    return res.status(400).json({ ok: false, error: 'sede_id invalido' });
+  }
   if (!isValidAuthUsername(username)) {
     return res.status(400).json({ ok: false, error: 'username inválido' });
   }
@@ -1328,13 +1361,17 @@ app.post('/auth/register', async (req, res) => {
     if (await authUsernameExists(pool, username)) {
       return res.status(409).json({ ok: false, error: 'Ese usuario ya existe' });
     }
+    const sede = sedeId ? await getSedeById(pool, sedeId) : null;
+    if (sedeId && !sede) {
+      return res.status(400).json({ ok: false, error: 'La sede indicada no existe.' });
+    }
 
     const passwordHash = hashPassword(password);
     const inserted = await pool.query(
-      `INSERT INTO auth_users (username, role, password_hash, password_visible, full_name, vehicle_plate, activo)
-       VALUES ($1, $2, $3, $4, $5, $6, TRUE)
-       RETURNING id_user, username, role, full_name, vehicle_plate, created_at`,
-      [username, role, passwordHash, password, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : '']
+      `INSERT INTO auth_users (username, role, password_hash, password_visible, full_name, vehicle_plate, sede_id, activo)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+       RETURNING id_user, username, role, full_name, vehicle_plate, sede_id, created_at`,
+      [username, role, passwordHash, password, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : '', sedeId]
     );
 
     const user = inserted.rows[0];
@@ -1345,6 +1382,8 @@ app.post('/auth/register', async (req, res) => {
         role: normalizeAuthRole(user.role),
         full_name: String(user.full_name || '').trim(),
         vehicle_plate: normalizeVehiclePlate(user.vehicle_plate || ''),
+        sede_id: user.sede_id === null || user.sede_id === undefined ? null : Number(user.sede_id),
+        nombre_sede: sede ? sede.nombre : '',
         createdAt: user.created_at,
       },
     });
@@ -1366,10 +1405,20 @@ app.post('/auth/login', async (req, res) => {
 
   try {
     const userResult = await pool.query(
-      `SELECT id_user, username, role, password_hash, full_name, vehicle_plate, created_at
-       FROM auth_users
-       WHERE username = $1
-         AND activo = TRUE
+      `SELECT
+         u.id_user,
+         u.username,
+         u.role,
+         u.password_hash,
+         u.full_name,
+         u.vehicle_plate,
+         u.sede_id,
+         COALESCE(se.nombre, '') AS nombre_sede,
+         u.created_at
+       FROM auth_users u
+       LEFT JOIN sedes se ON se.id_sede = u.sede_id
+       WHERE u.username = $1
+         AND u.activo = TRUE
        LIMIT 1`,
       [username]
     );
@@ -1391,6 +1440,8 @@ app.post('/auth/login', async (req, res) => {
       role: normalizeAuthRole(user.role),
       fullName: String(user.full_name || '').trim(),
       vehiclePlate: normalizeVehiclePlate(user.vehicle_plate || ''),
+      sede_id: user.sede_id === null || user.sede_id === undefined ? null : Number(user.sede_id),
+      nombre_sede: String(user.nombre_sede || '').trim(),
       loggedAt: new Date().toISOString(),
       expiresAt: sessionData.expiresAt,
     };
@@ -1440,11 +1491,19 @@ app.post('/auth/logout', async (req, res) => {
 async function listRegisteredUsers(_auth, res) {
   try {
     const result = await pool.query(
-      `SELECT username, role, COALESCE(full_name, '') AS full_name, COALESCE(vehicle_plate, '') AS vehicle_plate, created_at
-       FROM auth_users
-       WHERE activo = TRUE
+      `SELECT
+         u.username,
+         u.role,
+         COALESCE(u.full_name, '') AS full_name,
+         COALESCE(u.vehicle_plate, '') AS vehicle_plate,
+         u.sede_id,
+         COALESCE(se.nombre, '') AS nombre_sede,
+         u.created_at
+       FROM auth_users u
+       LEFT JOIN sedes se ON se.id_sede = u.sede_id
+       WHERE u.activo = TRUE
        ORDER BY
-         CASE role
+         CASE u.role
            WHEN 'administrador' THEN 0
            WHEN 'almacen' THEN 1
            WHEN 'facturacion' THEN 2
@@ -1454,7 +1513,7 @@ async function listRegisteredUsers(_auth, res) {
            WHEN 'produccion' THEN 6
            ELSE 9
          END,
-         username ASC`
+         u.username ASC`
     );
     return res.json({ ok: true, users: result.rows });
   } catch (error) {
@@ -1562,6 +1621,7 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
   const password = String(payload?.password || '');
   const fullName = normalizeCatalogText(payload?.full_name || payload?.fullName || '', 120);
   const vehiclePlate = normalizeVehiclePlate(payload?.vehicle_plate || payload?.vehiclePlate || '');
+  const sedeId = normalizeOptionalSedeId(payload?.sede_id ?? payload?.sedeId);
 
   if (!username || username.length < 2) {
     return { ok: false, status: 400, error: 'username invÃ¡lido' };
@@ -1575,10 +1635,19 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
   if (password && !canManageVisiblePasswords(auth)) {
     return { ok: false, status: 403, error: 'Solo PRUEBAS puede modificar contrasenas de usuarios' };
   }
+  if (Number.isNaN(sedeId)) {
+    return { ok: false, status: 400, error: 'sede_id invalido' };
+  }
 
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
+    const sede = sedeId ? await getSedeById(client, sedeId) : null;
+    if (sedeId && !sede) {
+      await client.query('ROLLBACK');
+      return { ok: false, status: 400, error: 'La sede indicada no existe.' };
+    }
 
     const targetResult = await client.query(
       `SELECT id_user, username, role
@@ -1615,8 +1684,8 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
       }
     }
 
-    const fields = ['username = $1', 'role = $2', 'full_name = $3', 'vehicle_plate = $4', 'updated_at = NOW()'];
-    const params = [username, role, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : ''];
+    const fields = ['username = $1', 'role = $2', 'full_name = $3', 'vehicle_plate = $4', 'sede_id = $5', 'updated_at = NOW()'];
+    const params = [username, role, fullName || username, role === APP_ROLES.CONDUCTOR ? vehiclePlate : '', sedeId];
     if (password) {
       params.push(hashPassword(password));
       fields.push(`password_hash = $${params.length}`);
@@ -1629,7 +1698,7 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
       `UPDATE auth_users
           SET ${fields.join(', ')}
         WHERE id_user = $${params.length}
-        RETURNING id_user, username, role, full_name, vehicle_plate`,
+        RETURNING id_user, username, role, full_name, vehicle_plate, sede_id`,
       params
     );
 
@@ -1644,6 +1713,8 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
           role: normalizeAuthRole(user.role),
           full_name: String(user.full_name || '').trim(),
           vehicle_plate: normalizeVehiclePlate(user.vehicle_plate || ''),
+          sede_id: user.sede_id === null || user.sede_id === undefined ? null : Number(user.sede_id),
+          nombre_sede: sede ? sede.nombre : '',
         },
         currentUserUpdated: Number(auth.userId) === Number(user.id_user),
       },
@@ -5034,7 +5105,11 @@ app.get('/api/solicitudes-sedes', async (req, res) => {
   const estado = normalizeSolicitudesText(req.query?.estado || '', 20).toUpperCase();
   const fechaDesde = String(req.query?.fecha_desde || '').trim();
   const fechaHasta = String(req.query?.fecha_hasta || '').trim();
-  if (Number.isInteger(sedeId) && sedeId > 0) {
+  const authSedeId = getAuthSedeId(auth);
+  if (!canReadAllSolicitudesSedes(auth) && authSedeId) {
+    params.push(authSedeId);
+    whereParts.push(`ss.sede_id = $${params.length}`);
+  } else if (Number.isInteger(sedeId) && sedeId > 0) {
     params.push(sedeId);
     whereParts.push(`ss.sede_id = $${params.length}`);
   }
@@ -5097,6 +5172,10 @@ app.get('/api/solicitudes-sedes/:id', async (req, res) => {
   try {
     const solicitud = await fetchSolicitudById(pool, idSolicitud);
     if (!solicitud) return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
+    const authSedeId = getAuthSedeId(auth);
+    if (!canReadAllSolicitudesSedes(auth) && authSedeId && Number(solicitud.sede_id) !== authSedeId) {
+      return res.status(403).json({ ok: false, error: 'No autorizado para consultar esta sede.' });
+    }
     return res.json({ ok: true, solicitud });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
@@ -5112,7 +5191,12 @@ app.post('/api/solicitudes-sedes', async (req, res) => {
   let sheetsEvent = null;
   try {
     await client.query('BEGIN');
-    const validation = await validateSolicitudesPayload(client, req.body, 'cantidad_solicitada');
+    const authSedeId = getAuthSedeId(auth);
+    if (!authSedeId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'El usuario no tiene una sede asignada' });
+    }
+    const validation = await validateSolicitudesPayload(client, req.body, 'cantidad_solicitada', { sede_id: authSedeId });
     if (!validation.ok) {
       await client.query('ROLLBACK');
       return res.status(validation.status || 400).json({ ok: false, error: validation.error });
@@ -5203,7 +5287,11 @@ app.get('/api/entregas-sedes', async (req, res) => {
   const productoId = Number(req.query?.producto_id || 0);
   const fechaDesde = String(req.query?.fecha_desde || '').trim();
   const fechaHasta = String(req.query?.fecha_hasta || '').trim();
-  if (Number.isInteger(sedeId) && sedeId > 0) {
+  const authSedeId = getAuthSedeId(auth);
+  if (!canReadAllSolicitudesSedes(auth) && authSedeId) {
+    params.push(authSedeId);
+    whereParts.push(`e.sede_id = $${params.length}`);
+  } else if (Number.isInteger(sedeId) && sedeId > 0) {
     params.push(sedeId);
     whereParts.push(`e.sede_id = $${params.length}`);
   }
@@ -5261,6 +5349,10 @@ app.get('/api/entregas-sedes/:id', async (req, res) => {
   try {
     const entrega = await fetchEntregaById(pool, idEntrega);
     if (!entrega) return res.status(404).json({ ok: false, error: 'Entrega no encontrada.' });
+    const authSedeId = getAuthSedeId(auth);
+    if (!canReadAllSolicitudesSedes(auth) && authSedeId && Number(entrega.sede_id) !== authSedeId) {
+      return res.status(403).json({ ok: false, error: 'No autorizado para consultar esta sede.' });
+    }
     return res.json({ ok: true, entrega });
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message });
@@ -5279,12 +5371,7 @@ app.post('/api/entregas-sedes', async (req, res) => {
   let sheetsEvent = null;
   try {
     await client.query('BEGIN');
-    const validation = await validateSolicitudesPayload(client, req.body, 'cantidad_entregada');
-    if (!validation.ok) {
-      await client.query('ROLLBACK');
-      return res.status(validation.status || 400).json({ ok: false, error: validation.error });
-    }
-    const data = validation.data;
+    let forcedSedeId = getAuthSedeId(auth);
     if (hasSolicitud) {
       const lockResult = await client.query(
         `SELECT id_solicitud, estado, sede_id
@@ -5309,14 +5396,21 @@ app.post('/api/entregas-sedes', async (req, res) => {
       }
       const solicitud = await fetchSolicitudById(client, solicitudIdRaw);
       if (!solicitud) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
-      }
-      if (Number(solicitud.sede_id) !== Number(data.sede.id_sede)) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ ok: false, error: 'La sede de la entrega no coincide con la solicitud.' });
-      }
+          await client.query('ROLLBACK');
+          return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
+        }
+      forcedSedeId = Number(solicitud.sede_id);
     }
+    if (!forcedSedeId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'El usuario no tiene una sede asignada' });
+    }
+    const validation = await validateSolicitudesPayload(client, req.body, 'cantidad_entregada', { sede_id: forcedSedeId });
+    if (!validation.ok) {
+      await client.query('ROLLBACK');
+      return res.status(validation.status || 400).json({ ok: false, error: validation.error });
+    }
+    const data = validation.data;
     const referencia = createExternalReference('ENT');
     const inserted = await client.query(
       `INSERT INTO entregas_sedes (
