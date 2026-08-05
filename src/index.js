@@ -9661,6 +9661,7 @@ function flattenRouteResultClients(sheet) {
       controlNumber: normalizeRouteResultText(invoice?.numero_control),
       name,
       nombre_o_razon_social: name,
+      seller: normalizeRouteResultText(invoice?.vendedor_nombre),
       address,
       originalAddress,
       route: routeKey,
