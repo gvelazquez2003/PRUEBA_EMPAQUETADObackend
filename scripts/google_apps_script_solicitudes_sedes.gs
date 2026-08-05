@@ -29,6 +29,11 @@ function doPost(e) {
 
     const spreadsheetId = PropertiesService.getScriptProperties().getProperty('SOLICITUDES_SPREADSHEET_ID') || '';
     const ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
+
+    if (payload.tipo === 'prediccion') {
+      return writePrediccionesDemanda_(ss, payload);
+    }
+
     const sheetName = payload.tipo === 'entrega'
       ? (PropertiesService.getScriptProperties().getProperty('SOLICITUDES_SHEET_ENTREGAS') || 'Entregas Sedes')
       : (PropertiesService.getScriptProperties().getProperty('SOLICITUDES_SHEET_SOLICITUDES') || 'Solicitudes Sedes');
@@ -129,6 +134,66 @@ function buildExistingReferences_(sheet, col) {
     if (key) map[key] = index + 2;
   });
   return map;
+}
+
+/**
+ * Escribe las predicciones de demanda en el sheet asignado.
+ *
+ * Columnas en orden: Fecha, Codigo, Producto, Cantidad Proyectada, Sede.
+ * Antes de escribir borra las filas de las mismas semanas (para no duplicar).
+ *
+ * Configura en Script properties:
+ *   PREDICCIONES_SHEET_PREDICCIONES  (nombre de la hoja, default 'Predicciones Demanda')
+ */
+function writePrediccionesDemanda_(ss, payload) {
+  const sheetName = PropertiesService.getScriptProperties().getProperty('PREDICCIONES_SHEET_PREDICCIONES') || 'Predicciones Demanda';
+  const sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  const headers = ['Fecha', 'Codigo', 'Producto', 'Cantidad Proyectada', 'Sede'];
+  ensureHeaders_(sheet, headers);
+
+  const rows = (Array.isArray(payload.rows) ? payload.rows : []).map((item) => [
+    item.fecha || '',
+    item.codigo || '',
+    item.producto || '',
+    item.cantidad_proyectada === null || item.cantidad_proyectada === undefined ? '' : item.cantidad_proyectada,
+    item.sede || '',
+  ]);
+
+  if (!rows.length) {
+    return jsonResponse_(200, { ok: true, sheet: sheetName, inserted: 0, updated: 0, message: 'Sin filas para escribir' });
+  }
+
+  const targetWeeks = new Set(rows.map((row) => weekKey_(row[0])));
+  const lastRow = sheet.getLastRow();
+  const keep = [];
+  if (lastRow > 1) {
+    const values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+    values.forEach((row) => {
+      if (row[0] && targetWeeks.has(weekKey_(row[0]))) return;
+      keep.push(row);
+    });
+  }
+  if (lastRow > 1) {
+    sheet.deleteRows(2, lastRow - 1);
+  }
+  keep.forEach((row) => sheet.appendRow(row));
+  rows.forEach((row) => sheet.appendRow(row));
+
+  return jsonResponse_(200, { ok: true, sheet: sheetName, inserted: rows.length, updated: 0, message: 'Predicciones escritas correctamente' });
+}
+
+function weekKey_(dateValue) {
+  if (!dateValue) return '';
+  let d;
+  if (dateValue instanceof Date) {
+    d = dateValue;
+  } else {
+    d = new Date(String(dateValue).slice(0, 10) + 'T00:00:00Z');
+  }
+  if (isNaN(d.getTime())) return '';
+  const dow = (d.getUTCDay() + 6) % 7;
+  const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - dow));
+  return monday.toISOString().slice(0, 10);
 }
 
 function jsonResponse_(status, obj) {
