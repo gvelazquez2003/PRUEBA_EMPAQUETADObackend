@@ -10922,6 +10922,9 @@ app.get('/api/ventas/export', async (req, res) => {
         ORDER BY v.fecha ASC, s.nombre ASC, p.codigo_producto ASC`,
       [desde, hasta]
     );
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, error: 'No hay ventas registradas en el rango seleccionado.' });
+    }
     const exportRows = result.rows.map((fila) => {
       const fechaIso = formatDateIso(fila.fecha);
       const precioUnitario = Number(fila.precio_unitario) || 0;

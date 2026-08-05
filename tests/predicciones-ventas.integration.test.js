@@ -399,6 +399,9 @@ test('ventas export returns an xlsx download with week and totals', async () => 
     assert.ok(rows.every((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.Fecha)));
     assert.ok(rows.every((r) => Number.isInteger(r.Semana)));
     assert.ok(rows.every((r) => Number.isFinite(r['Venta neta']) && Number.isFinite(r['Venta total'])));
+    const empty = await ctx.request('GET', '/api/ventas/export?desde=2025-01-01&hasta=2025-01-31', null, 'admin-token');
+    assert.equal(empty.status, 404);
+    assert.match(empty.payload.error, /no hay ventas/i);
     assert.equal((await ctx.request('GET', '/api/ventas/export?desde=bad&hasta=2026-08-31', null, 'admin-token')).status, 400);
   } finally {
     ctx.close();
