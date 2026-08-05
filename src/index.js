@@ -9711,7 +9711,8 @@ function applyRouteDeliveryStatus(client, status) {
     deliveredBaskets: status ? Number(status.delivered_baskets || 0) : null,
     suppliedBaskets: status ? Number(status.supplied_baskets || 0) : null,
     recoveredBaskets: status ? Number(status.recovered_baskets || 0) : null,
-    deliveredAt: status?.delivered_at || null,
+    // Registros historicos de entregas incompletas no siempre tienen delivered_at.
+    deliveredAt: status?.delivered_at || status?.updated_at || null,
     partialDetail,
   };
 }
