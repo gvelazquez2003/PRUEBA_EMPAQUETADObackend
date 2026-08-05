@@ -21,6 +21,7 @@ const ALMACEN09_ENTRADAS_START_DATE = String(process.env.ALMACEN09_ENTRADAS_STAR
 const ALMACEN09_ENTRADAS_VISIBLE_DAYS = Math.max(0, Number(process.env.ALMACEN09_ENTRADAS_VISIBLE_DAYS || 2) || 2);
 const FACTURAS_BOT_UPLOAD_DIR = path.resolve(process.env.FACTURAS_BOT_UPLOAD_DIR || path.join(process.cwd(), 'data', 'facturas-bot', 'pendientes'));
 const FACTURAS_BOT_MAX_UPLOAD_MB = Math.max(1, Number(process.env.FACTURAS_BOT_MAX_UPLOAD_MB || 15) || 15);
+const VENTAS_MAX_UPLOAD_MB = Math.max(1, Number(process.env.VENTAS_MAX_UPLOAD_MB || 50) || 50);
 const SOLICITUDES_SHEETS_WEBHOOK_URL = String(process.env.SOLICITUDES_SHEETS_WEBHOOK_URL || '').trim();
 const SOLICITUDES_SHEETS_WEBHOOK_SECRET = String(process.env.SOLICITUDES_SHEETS_WEBHOOK_SECRET || '').trim();
 const SOLICITUDES_SHEETS_SYNC_ENABLED = ['true', '1', 'yes', 'si', 'sí'].includes(String(process.env.SOLICITUDES_SHEETS_SYNC_ENABLED || 'false').trim().toLowerCase());
@@ -10618,7 +10619,7 @@ const multer = require('multer');
 const PREDICCIONES_VERSION_MODELO = 'v1.0';
 const PREDICCION_DIA_LABELS = ['Dom', 'Lun', 'Mar', 'Mie', 'Jue', 'Vie', 'Sab'];
 const PREDICCION_MESES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
-const ventasUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+const ventasUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: VENTAS_MAX_UPLOAD_MB * 1024 * 1024 } });
 
 function normalizeLookupKey(value) {
   return stripDiacritics(String(value || '')).trim().toUpperCase().replace(/\s+/g, '');
