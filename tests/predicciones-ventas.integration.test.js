@@ -283,6 +283,8 @@ async function setup(options = {}) {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   return {
     pool,
+    baseUrl,
+    clientFetch,
     fetchCalls,
     async request(method, route, body, token) {
       const response = await clientFetch(`${baseUrl}${route}`, {
@@ -379,16 +381,24 @@ test('ventas import parses Excel, upserts and reports omitted rows (admin only)'
   }
 });
 
-test('ventas export filters by date range and joins catalog data', async () => {
+test('ventas export returns an xlsx download with week and totals', async () => {
   const ctx = await setup();
   try {
     seedVentas(ctx.pool.state);
     assert.equal((await ctx.request('GET', '/api/ventas/export?desde=2026-08-01&hasta=2026-08-31', null, 'ventas-token')).status, 403);
-    const response = await ctx.request('GET', '/api/ventas/export?desde=2026-08-01&hasta=2026-08-31', null, 'admin-token');
+    const response = await ctx.clientFetch(`${ctx.baseUrl}/api/ventas/export?desde=2026-08-01&hasta=2026-08-31`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer admin-token' },
+    });
     assert.equal(response.status, 200);
-    assert.equal(response.payload.total, 4);
-    assert.ok(response.payload.filas.every((fila) => /^\d{4}-\d{2}-\d{2}$/.test(fila.fecha)));
-    assert.deepEqual(response.payload.filas.map((f) => f.codigo_producto).sort(), ['PTEM0010', 'PTEM0010', 'PTEM0010', 'PTSU0020']);
+    assert.match(response.headers.get('content-type') || '', /spreadsheetml/);
+    const workbook = XLSX.read(Buffer.from(await response.arrayBuffer()), { type: 'buffer' });
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
+    assert.equal(rows.length, 4);
+    assert.deepEqual(rows.map((r) => r['Codigo de barra']).sort(), ['PTEM0010', 'PTEM0010', 'PTEM0010', 'PTSU0020']);
+    assert.ok(rows.every((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.Fecha)));
+    assert.ok(rows.every((r) => Number.isInteger(r.Semana)));
+    assert.ok(rows.every((r) => Number.isFinite(r['Venta neta']) && Number.isFinite(r['Venta total'])));
     assert.equal((await ctx.request('GET', '/api/ventas/export?desde=bad&hasta=2026-08-31', null, 'admin-token')).status, 400);
   } finally {
     ctx.close();

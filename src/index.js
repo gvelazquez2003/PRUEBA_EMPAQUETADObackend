@@ -10655,6 +10655,15 @@ function excelDateToIso(value) {
     : '';
 }
 
+function isoWeek(dateIso) {
+  const d = new Date(`${dateIso}T00:00:00Z`);
+  if (!Number.isFinite(d.getTime())) return '';
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+}
+
 function formatDateIso(value) {
   if (value instanceof Date && Number.isFinite(value.getTime())) {
     return `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, '0')}-${String(value.getUTCDate()).padStart(2, '0')}`;
@@ -10913,11 +10922,27 @@ app.get('/api/ventas/export', async (req, res) => {
         ORDER BY v.fecha ASC, s.nombre ASC, p.codigo_producto ASC`,
       [desde, hasta]
     );
-    return res.json({
-      ok: true,
-      filas: result.rows.map((fila) => ({ ...fila, fecha: formatDateIso(fila.fecha) })),
-      total: result.rows.length,
+    const exportRows = result.rows.map((fila) => {
+      const fechaIso = formatDateIso(fila.fecha);
+      const precioUnitario = Number(fila.precio_unitario) || 0;
+      const cantidad = Number(fila.cantidad) || 0;
+      return {
+        Sede: fila.sede_nombre,
+        Fecha: fechaIso,
+        Semana: isoWeek(fechaIso),
+        'Codigo de barra': fila.codigo_producto,
+        Producto: fila.producto || fila.codigo_producto,
+        Cantidad: cantidad,
+        'Venta neta': Math.round(precioUnitario * 100) / 100,
+        'Venta total': Math.round(precioUnitario * cantidad * 100) / 100,
+      };
     });
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportRows), 'Ventas');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="ventas_${desde}_${hasta}.xlsx"`);
+    return res.send(buffer);
   } catch (error) {
     return res.status(500).json({ ok: false, error: error.message || 'No se pudo exportar las ventas.' });
   }
