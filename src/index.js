@@ -10871,11 +10871,14 @@ app.post('/api/ventas/import', ventasUpload.single('archivo'), async (req, res) 
            VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
            ON CONFLICT (fecha, sede_id, producto_id)
            DO UPDATE SET cantidad = EXCLUDED.cantidad, precio_unitario = EXCLUDED.precio_unitario, updated_at = NOW()
+           WHERE ventas_diarias.cantidad IS DISTINCT FROM EXCLUDED.cantidad
+              OR ventas_diarias.precio_unitario IS DISTINCT FROM EXCLUDED.precio_unitario
            RETURNING (xmax = 0) AS creado`,
           [fechaIso, sedeId, productoId, cantidad, precio]
         );
-        if (upsert.rows[0]?.creado) registrados += 1;
-        else actualizados += 1;
+        const fila = upsert.rows[0];
+        if (fila?.creado) registrados += 1;
+        else if (fila) actualizados += 1;
       }
       await client.query('COMMIT');
     } catch (error) {

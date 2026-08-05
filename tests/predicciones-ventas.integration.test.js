@@ -141,6 +141,7 @@ class FakePgPool {
       const [fecha, sedeId, productoId, cantidad, precio] = params;
       const existing = state.ventas.find((v) => v.fecha === fecha && Number(v.sede_id) === Number(sedeId) && Number(v.producto_id) === Number(productoId));
       if (existing) {
+        if (existing.cantidad === cantidad && existing.precio_unitario === precio) return result([]);
         existing.cantidad = cantidad;
         existing.precio_unitario = precio;
         return result([{ creado: false }]);
@@ -374,8 +375,21 @@ test('ventas import parses Excel, upserts and reports omitted rows (admin only)'
     const reimport = await ctx.requestMultipart('/api/ventas/import', workbook, 'ventas.xlsx', 'admin-token');
     assert.equal(reimport.status, 200);
     assert.equal(reimport.payload.registrados, 0);
-    assert.equal(reimport.payload.actualizados, 2);
+    assert.equal(reimport.payload.actualizados, 0);
     assert.equal(ctx.pool.state.ventas.length, 2);
+
+    const wbChanged = XLSX.utils.book_new();
+    const wsChanged = XLSX.utils.json_to_sheet([
+      { sede: 'SL', fecha: '2026-07-20', 'codigo de barra': 'PTEM0010', cantidad: 3, 'venta neta': 15 },
+      { sede: 'LA GUAIRA', fecha: '2026-07-20', 'codigo de barra': 'PTSU0020', cantidad: 5, 'venta neta': 25 },
+    ]);
+    XLSX.utils.book_append_sheet(wbChanged, wsChanged, 'VENTAS');
+    const changed = await ctx.requestMultipart('/api/ventas/import', XLSX.write(wbChanged, { type: 'buffer', bookType: 'xlsx' }), 'ventas-cambio.xlsx', 'admin-token');
+    assert.equal(changed.status, 200);
+    assert.equal(changed.payload.registrados, 0);
+    assert.equal(changed.payload.actualizados, 1);
+    assert.equal(ctx.pool.state.ventas.length, 2);
+    assert.equal(ctx.pool.state.ventas.find((v) => Number(v.producto_id) === 20).cantidad, 5);
   } finally {
     ctx.close();
   }
