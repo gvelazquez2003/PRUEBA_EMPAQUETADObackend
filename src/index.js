@@ -21,6 +21,7 @@ const ALMACEN09_ENTRADAS_START_DATE = String(process.env.ALMACEN09_ENTRADAS_STAR
 const ALMACEN09_ENTRADAS_VISIBLE_DAYS = Math.max(0, Number(process.env.ALMACEN09_ENTRADAS_VISIBLE_DAYS || 2) || 2);
 const FACTURAS_BOT_UPLOAD_DIR = path.resolve(process.env.FACTURAS_BOT_UPLOAD_DIR || path.join(process.cwd(), 'data', 'facturas-bot', 'pendientes'));
 const FACTURAS_BOT_MAX_UPLOAD_MB = Math.max(1, Number(process.env.FACTURAS_BOT_MAX_UPLOAD_MB || 15) || 15);
+const VENTAS_MAX_UPLOAD_MB = Math.max(1, Number(process.env.VENTAS_MAX_UPLOAD_MB || 50) || 50);
 const SOLICITUDES_SHEETS_WEBHOOK_URL = String(process.env.SOLICITUDES_SHEETS_WEBHOOK_URL || '').trim();
 const SOLICITUDES_SHEETS_WEBHOOK_SECRET = String(process.env.SOLICITUDES_SHEETS_WEBHOOK_SECRET || '').trim();
 const SOLICITUDES_SHEETS_SYNC_ENABLED = ['true', '1', 'yes', 'si', 'sí'].includes(String(process.env.SOLICITUDES_SHEETS_SYNC_ENABLED || 'false').trim().toLowerCase());
@@ -9669,6 +9670,7 @@ function flattenRouteResultClients(sheet) {
       controlNumber: normalizeRouteResultText(invoice?.numero_control),
       name,
       nombre_o_razon_social: name,
+      seller: normalizeRouteResultText(invoice?.vendedor_nombre),
       address,
       originalAddress,
       route: routeKey,
@@ -9717,7 +9719,8 @@ function applyRouteDeliveryStatus(client, status) {
     deliveredBaskets: status ? Number(status.delivered_baskets || 0) : null,
     suppliedBaskets: status ? Number(status.supplied_baskets || 0) : null,
     recoveredBaskets: status ? Number(status.recovered_baskets || 0) : null,
-    deliveredAt: status?.delivered_at || null,
+    // Registros historicos de entregas incompletas no siempre tienen delivered_at.
+    deliveredAt: status?.delivered_at || status?.updated_at || null,
     partialDetail,
   };
 }
@@ -10614,6 +10617,496 @@ app.get('/api/stock/actual', async (req, res) => {
   const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
   if (!auth) return;
   return sendAlmacen09StockActualResponse(req, res);
+});
+
+// ---------------------------------------------------------------------------
+// Ventas Diarias y Prediccion de Demanda
+// ---------------------------------------------------------------------------
+
+const XLSX = require('xlsx');
+const multer = require('multer');
+const PREDICCIONES_VERSION_MODELO = 'v1.0';
+const PREDICCION_DIA_LABELS = ['Dom', 'Lun', 'Mar', 'Mie', 'Jue', 'Vie', 'Sab'];
+const PREDICCION_MESES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+const ventasUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: VENTAS_MAX_UPLOAD_MB * 1024 * 1024 } });
+
+function normalizeLookupKey(value) {
+  return stripDiacritics(String(value || '')).trim().toUpperCase().replace(/\s+/g, '');
+}
+
+function normalizeExcelHeader(value) {
+  return stripDiacritics(String(value || '')).trim().toLowerCase().replace(/[^a-z0-9]/g, '_');
+}
+
+function parseNumValue(value, fallback = 0) {
+  if (value === null || value === undefined || String(value).trim() === '') return fallback;
+  const n = Number(String(value).trim().replace(',', '.'));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function excelDateToIso(value) {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, '0')}-${String(value.getUTCDate()).padStart(2, '0')}`;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const d = new Date((value - 25569) * 86400 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const slash = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  if (slash) return `${slash[3]}-${String(Number(slash[2])).padStart(2, '0')}-${String(Number(slash[1])).padStart(2, '0')}`;
+  const d = new Date(raw);
+  return Number.isFinite(d.getTime()) && !Number.isNaN(d.getTime())
+    ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+    : '';
+}
+
+function isoWeek(dateIso) {
+  const d = new Date(`${dateIso}T00:00:00Z`);
+  if (!Number.isFinite(d.getTime())) return '';
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+}
+
+function formatDateIso(value) {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return `${value.getUTCFullYear()}-${String(value.getUTCMonth() + 1).padStart(2, '0')}-${String(value.getUTCDate()).padStart(2, '0')}`;
+  }
+  const raw = String(value || '').trim().slice(0, 10);
+  return isValidIsoDate(raw) ? raw : '';
+}
+
+function parseSemanaInicio(value) {
+  const raw = String(value || '').trim();
+  if (!isValidIsoDate(raw)) return null;
+  const date = new Date(`${raw}T00:00:00Z`);
+  if (date.getUTCDay() !== 1) return null;
+  return raw;
+}
+
+function buildTargetWeek(semanaInicio) {
+  const start = new Date(`${semanaInicio}T00:00:00Z`);
+  const dias = [];
+  for (let i = 0; i < 7; i += 1) {
+    const d = new Date(start.getTime() + i * 86400000);
+    dias.push({ iso: d.toISOString().slice(0, 10), dow: d.getUTCDay(), label: PREDICCION_DIA_LABELS[d.getUTCDay()] });
+  }
+  return dias;
+}
+
+function buildSemanaLabel(semanaInicio) {
+  const dias = buildTargetWeek(semanaInicio);
+  const fmt = (dia) => `${dia.label} ${Number(dia.iso.slice(8, 10))} ${PREDICCION_MESES[Number(dia.iso.slice(5, 7)) - 1]}`;
+  return `${fmt(dias[0])} - ${fmt(dias[6])} ${dias[6].iso.slice(0, 4)}`;
+}
+
+function meanValue(values) {
+  if (!Array.isArray(values) || !values.length) return 0;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+async function generarPredicciones(db, semanaInicio) {
+  const diasSemana = buildTargetWeek(semanaInicio);
+  const labels = diasSemana.map((dia) => dia.label);
+  const sedesRes = await db.query('SELECT id_sede, nombre FROM sedes ORDER BY nombre ASC');
+  const sedes = sedesRes.rows;
+  const productosRes = await db.query('SELECT id_producto, descripcion, unidad_primaria, codigo_producto FROM productos');
+  const productosById = new Map(productosRes.rows.map((p) => [p.id_producto, p]));
+  const sedeNombre = new Map(sedes.map((s) => [s.id_sede, s.nombre]));
+
+  const ventasRes = await db.query(
+    `SELECT v.sede_id, v.producto_id, v.fecha, v.cantidad
+       FROM ventas_diarias v
+      WHERE v.fecha < $1
+      ORDER BY v.sede_id ASC, v.producto_id ASC, v.fecha ASC`,
+    [semanaInicio]
+  );
+
+  const historial = new Map();
+  for (const v of ventasRes.rows) {
+    const key = `${v.sede_id}:${v.producto_id}`;
+    const fecha = v.fecha instanceof Date ? v.fecha : new Date(`${String(v.fecha).slice(0, 10)}T00:00:00Z`);
+    if (!historial.has(key)) historial.set(key, []);
+    historial.get(key).push({ fecha, dow: fecha.getUTCDay(), cantidad: Number(v.cantidad) });
+  }
+
+  const filas = [];
+  const sedesProcesadas = new Set();
+  const productosProcesados = new Set();
+  for (const [key, fechas] of historial) {
+    const [sedeId, productoId] = key.split(':').map(Number);
+    if (!sedeNombre.has(sedeId)) continue;
+    const producto = productosById.get(productoId);
+    if (!producto) continue;
+    sedesProcesadas.add(sedeId);
+    productosProcesados.add(productoId);
+    const dias = {};
+    let total = 0;
+    for (const dia of diasSemana) {
+      const fechasDia = fechas.filter((f) => f.dow === dia.dow).slice(-6);
+      if (!fechasDia.length) {
+        dias[dia.label] = null;
+        continue;
+      }
+      let valor;
+      if (fechasDia.length <= 5) {
+        valor = meanValue(fechasDia.map((f) => f.cantidad));
+      } else {
+        const cantidades = fechasDia.map((f) => f.cantidad).sort((a, b) => a - b);
+        valor = meanValue(cantidades.slice(1, cantidades.length - 1));
+      }
+      valor = Math.round(valor * 100) / 100;
+      dias[dia.label] = valor;
+      total += valor;
+    }
+    filas.push({
+      sede_id: sedeId,
+      sede_nombre: sedeNombre.get(sedeId),
+      producto_id: productoId,
+      producto: producto.descripcion,
+      codigo: producto.codigo_producto,
+      familia: '',
+      unidad: producto.unidad_primaria || '',
+      dias,
+      total: Math.round(total * 100) / 100,
+    });
+  }
+
+  filas.sort((a, b) => a.sede_nombre.localeCompare(b.sede_nombre) || a.producto.localeCompare(b.producto));
+  return {
+    filas,
+    dias: labels,
+    semanaLabel: buildSemanaLabel(semanaInicio),
+    sedes: sedesProcesadas.size,
+    productos: productosProcesados.size,
+  };
+}
+
+function buildPrediccionSheetsPayload(semanaInicio, rows) {
+  return {
+    tipo: 'prediccion',
+    referencia_externa: `prediccion:${semanaInicio}`,
+    secret: SOLICITUDES_SHEETS_WEBHOOK_SECRET || undefined,
+    rows,
+  };
+}
+
+async function enqueuePrediccionSheetsOutbox(semanaInicio, rows) {
+  const referencia = `prediccion:${semanaInicio}`;
+  const payload = buildPrediccionSheetsPayload(semanaInicio, rows);
+  try {
+    await pool.query(
+      `INSERT INTO solicitudes_sedes_sheets_outbox (
+         event_type, entity_type, entity_id, tipo, referencia_externa, payload, estado, intentos, ultimo_error, created_at, updated_at
+       )
+       VALUES ($1, $2, NULL, $3, $4, $5::jsonb, 'pendiente', 0, NULL, NOW(), NOW())
+       ON CONFLICT (event_type, referencia_externa)
+       DO UPDATE SET payload = EXCLUDED.payload, estado = 'pendiente', ultimo_error = NULL, updated_at = NOW()`,
+      ['sync_prediccion_sheets', 'prediccion_demanda', 'prediccion', referencia, JSON.stringify(payload)]
+    );
+  } catch (error) {
+    if (error?.code !== '42P01' && error?.code !== '42703') {
+      console.warn('[predicciones-sheets] outbox no disponible:', error.message || error);
+    }
+  }
+}
+
+async function getPrediccionOutboxEvent(semanaInicio) {
+  try {
+    const result = await pool.query(
+      `SELECT id_sync, event_type, entity_type, entity_id, tipo, referencia_externa, payload, estado, intentos
+         FROM solicitudes_sedes_sheets_outbox
+        WHERE event_type = $1 AND referencia_externa = $2`,
+      ['sync_prediccion_sheets', `prediccion:${semanaInicio}`]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    if (error?.code !== '42P01' && error?.code !== '42703') {
+      console.warn('[predicciones-sheets] no se pudo leer el outbox:', error.message || error);
+    }
+    return null;
+  }
+}
+
+app.post('/api/ventas/import', ventasUpload.single('archivo'), async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Sube un archivo Excel (.xlsx/.xls).' });
+    const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const sheetName = workbook.SheetNames[0];
+    if (!sheetName) return res.status(400).json({ ok: false, error: 'El archivo no contiene hojas.' });
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: null });
+    if (!rows.length) return res.status(400).json({ ok: false, error: 'El archivo no contiene filas de datos.' });
+
+    const sedesRes = await pool.query('SELECT id_sede, nombre FROM sedes');
+    const productosRes = await pool.query('SELECT id_producto, codigo_producto FROM productos');
+    const sedesByNombre = new Map(sedesRes.rows.map((s) => [normalizeLookupKey(s.nombre), s.id_sede]));
+    const productosByCodigo = new Map(productosRes.rows.map((p) => [normalizeLookupKey(p.codigo_producto), p.id_producto]));
+
+    let registrados = 0;
+    let actualizados = 0;
+    const omitidos = [];
+    const familias = new Set();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const row of rows) {
+        const cols = {};
+        for (const [k, v] of Object.entries(row)) cols[normalizeExcelHeader(k)] = v;
+        const sedeNombre = String(cols['sede'] ?? '').trim();
+        const codigo = String(cols['codigo_de_barra'] ?? cols['codigo'] ?? '').trim();
+        const fechaIso = excelDateToIso(cols['fecha']);
+        const cantidad = Math.trunc(parseNumValue(cols['cantidad']));
+        const ventaNeta = parseNumValue(cols['venta_neta']);
+        const familia = String(cols['familia'] ?? '').trim();
+        if (familia) familias.add(familia);
+
+        const linea = { sede: sedeNombre, codigo, fecha: fechaIso || String(cols['fecha'] || '') };
+        const sedeId = sedesByNombre.get(normalizeLookupKey(sedeNombre));
+        const productoId = productosByCodigo.get(normalizeLookupKey(codigo));
+        if (!sedeId) { omitidos.push({ ...linea, motivo: 'Sede no encontrada' }); continue; }
+        if (!productoId) { omitidos.push({ ...linea, motivo: 'Producto no encontrado' }); continue; }
+        if (!isValidIsoDate(fechaIso)) { omitidos.push({ ...linea, motivo: 'Fecha invalida' }); continue; }
+        if (!Number.isInteger(cantidad) || cantidad <= 0) { omitidos.push({ ...linea, motivo: 'Cantidad invalida' }); continue; }
+        const precio = Number.isFinite(ventaNeta) ? Math.round((ventaNeta / cantidad) * 100) / 100 : 0;
+        const upsert = await client.query(
+          `INSERT INTO ventas_diarias (fecha, sede_id, producto_id, cantidad, precio_unitario, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+           ON CONFLICT (fecha, sede_id, producto_id)
+           DO UPDATE SET cantidad = EXCLUDED.cantidad, precio_unitario = EXCLUDED.precio_unitario, updated_at = NOW()
+           WHERE ventas_diarias.cantidad IS DISTINCT FROM EXCLUDED.cantidad
+              OR ventas_diarias.precio_unitario IS DISTINCT FROM EXCLUDED.precio_unitario
+           RETURNING (xmax = 0) AS creado`,
+          [fechaIso, sedeId, productoId, cantidad, precio]
+        );
+        const fila = upsert.rows[0];
+        if (fila?.creado) registrados += 1;
+        else if (fila) actualizados += 1;
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return res.json({
+      ok: true,
+      registrados,
+      actualizados,
+      omitidos_count: omitidos.length,
+      omitidos,
+      familias_detectadas: [...familias].slice(0, 200),
+      message: `Ventas importadas: ${registrados} nuevos, ${actualizados} actualizados, ${omitidos.length} omitidos.`,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || 'No se pudo importar las ventas.' });
+  }
+});
+
+app.get('/api/ventas/export', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  try {
+    const desde = String(req.query.desde || '').trim();
+    const hasta = String(req.query.hasta || '').trim();
+    if (!isValidIsoDate(desde) || !isValidIsoDate(hasta)) {
+      return res.status(400).json({ ok: false, error: 'Parámetros desde y hasta inválidos (YYYY-MM-DD).' });
+    }
+    if (desde > hasta) {
+      return res.status(400).json({ ok: false, error: 'La fecha desde no puede ser mayor que hasta.' });
+    }
+    const result = await pool.query(
+      `SELECT v.fecha, v.cantidad, v.precio_unitario,
+              s.id_sede, s.nombre AS sede_nombre,
+              p.codigo_producto, p.descripcion AS producto
+         FROM ventas_diarias v
+         JOIN sedes s ON s.id_sede = v.sede_id
+         JOIN productos p ON p.id_producto = v.producto_id
+        WHERE v.fecha BETWEEN $1 AND $2
+        ORDER BY v.fecha ASC, s.nombre ASC, p.codigo_producto ASC`,
+      [desde, hasta]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, error: 'No hay ventas registradas en el rango seleccionado.' });
+    }
+    const exportRows = result.rows.map((fila) => {
+      const fechaIso = formatDateIso(fila.fecha);
+      const precioUnitario = Number(fila.precio_unitario) || 0;
+      const cantidad = Number(fila.cantidad) || 0;
+      return {
+        Sede: fila.sede_nombre,
+        Fecha: fechaIso,
+        Semana: isoWeek(fechaIso),
+        'Codigo de barra': fila.codigo_producto,
+        Producto: fila.producto || fila.codigo_producto,
+        Cantidad: cantidad,
+        'Venta neta': Math.round(precioUnitario * 100) / 100,
+        'Venta total': Math.round(precioUnitario * cantidad * 100) / 100,
+      };
+    });
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportRows), 'Ventas');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="ventas_${desde}_${hasta}.xlsx"`);
+    return res.send(buffer);
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || 'No se pudo exportar las ventas.' });
+  }
+});
+
+app.get('/api/predicciones/validar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  try {
+    const semanaInicio = parseSemanaInicio(req.query.semana_inicio);
+    if (!semanaInicio) {
+      return res.status(400).json({ ok: false, error: 'semana_inicio inválido (debe ser un lunes YYYY-MM-DD).' });
+    }
+    const sedesRes = await pool.query('SELECT id_sede, nombre FROM sedes ORDER BY nombre ASC');
+    const sedes = sedesRes.rows;
+    if (!sedes.length) return res.json({ ok: true, cobertura: [], message: 'No hay sedes registradas.' });
+
+    const histRes = await pool.query(
+      `SELECT DISTINCT v.sede_id, EXTRACT(DOW FROM v.fecha)::int AS dow, v.fecha
+         FROM ventas_diarias v
+        WHERE v.fecha < $1
+        ORDER BY v.sede_id ASC, dow ASC, v.fecha DESC`,
+      [semanaInicio]
+    );
+
+    const bySedeDow = new Map();
+    for (const h of histRes.rows) {
+      const key = `${h.sede_id}:${h.dow}`;
+      if (!bySedeDow.has(key)) bySedeDow.set(key, []);
+      if (bySedeDow.get(key).length < 6) bySedeDow.get(key).push(formatDateIso(h.fecha));
+    }
+
+    const cobertura = [];
+    for (const sede of sedes) {
+      for (let dow = 0; dow < 7; dow += 1) {
+        const fechas = bySedeDow.get(`${sede.id_sede}:${dow}`) || [];
+        const estado = fechas.length >= 6 ? 'listo' : fechas.length >= 1 ? 'baja_confianza' : 'sin_datos';
+        cobertura.push({ sede_id: sede.id_sede, sede_nombre: sede.nombre, dia_semana: PREDICCION_DIA_LABELS[dow], fechas, estado });
+      }
+    }
+
+    return res.json({ ok: true, cobertura, message: 'Validación completada.' });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || 'No se pudo validar los datos.' });
+  }
+});
+
+app.post('/api/predicciones/generar', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  try {
+    const semanaInicio = parseSemanaInicio(req.body?.semana_inicio);
+    if (!semanaInicio) {
+      return res.status(400).json({ ok: false, error: 'semana_inicio inválido (debe ser un lunes YYYY-MM-DD).' });
+    }
+    const resultado = await generarPredicciones(pool, semanaInicio);
+    return res.json({
+      ok: true,
+      filas: resultado.filas,
+      dias: resultado.dias,
+      semana_label: resultado.semanaLabel,
+      message: `Predicción generada para ${resultado.sedes} sedes y ${resultado.productos} productos.`,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || 'No se pudo generar la predicción.' });
+  }
+});
+
+app.post('/api/predicciones/subir', async (req, res) => {
+  const auth = await requireRolesForRequest(req, res, [APP_ROLES.ADMIN]);
+  if (!auth) return;
+  try {
+    const semanaInicio = parseSemanaInicio(req.body?.semana_inicio);
+    if (!semanaInicio) {
+      return res.status(400).json({ ok: false, error: 'semana_inicio inválido (debe ser un lunes YYYY-MM-DD).' });
+    }
+    const forzar = req.body?.forzar === true;
+    const diasSemana = buildTargetWeek(semanaInicio);
+    const inicio = diasSemana[0].iso;
+    const fin = diasSemana[6].iso;
+
+    const existente = await pool.query(
+      'SELECT COUNT(*)::int AS total FROM predicciones_demanda WHERE fecha_objetivo BETWEEN $1 AND $2',
+      [inicio, fin]
+    );
+    if (!forzar && existente.rows[0]?.total > 0) {
+      return res.status(409).json({ ok: false, collision: true, error: 'La semana ya tiene predicciones registradas.' });
+    }
+
+    const resultado = await generarPredicciones(pool, semanaInicio);
+    const registros = [];
+    const rowsSheet = [];
+    for (const fila of resultado.filas) {
+      for (const dia of diasSemana) {
+        const valor = fila.dias[dia.label];
+        if (valor === null || valor === undefined || Number.isNaN(Number(valor))) continue;
+        registros.push({ fecha: dia.iso, sede_id: fila.sede_id, producto_id: fila.producto_id, cantidad: Number(valor) });
+        rowsSheet.push({
+          fecha: dia.iso,
+          codigo: fila.codigo,
+          producto: fila.producto,
+          cantidad_proyectada: Number(valor),
+          sede: fila.sede_nombre,
+        });
+      }
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (forzar) {
+        await client.query('DELETE FROM predicciones_demanda WHERE fecha_objetivo BETWEEN $1 AND $2', [inicio, fin]);
+      }
+      for (const registro of registros) {
+        await client.query(
+          `INSERT INTO predicciones_demanda (fecha_objetivo, sede_id, producto_id, cantidad_proyectada, fecha_calculo, version_modelo)
+           VALUES ($1, $2, $3, $4, NOW(), $5)
+           ON CONFLICT (fecha_objetivo, sede_id, producto_id)
+           DO UPDATE SET cantidad_proyectada = EXCLUDED.cantidad_proyectada, fecha_calculo = NOW(), version_modelo = EXCLUDED.version_modelo`,
+          [registro.fecha, registro.sede_id, registro.producto_id, registro.cantidad, PREDICCIONES_VERSION_MODELO]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    let sheets = { ok: false, queued: false, error: 'Outbox de Sheets no disponible' };
+    try {
+      await enqueuePrediccionSheetsOutbox(semanaInicio, rowsSheet);
+      const outboxEvent = await getPrediccionOutboxEvent(semanaInicio);
+      if (outboxEvent) sheets = await syncSolicitudesSedesOutboxEvent(outboxEvent);
+    } catch (error) {
+      sheets = { ok: false, queued: true, error: error.message || String(error) };
+    }
+
+    return res.json({
+      ok: true,
+      message: `Predicción subida: ${registros.length} registros para ${resultado.sedes} sedes.`,
+      registros: registros.length,
+      sedes: resultado.sedes,
+      sheets,
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message || 'No se pudo subir la predicción.' });
+  }
 });
 
 async function startServer() {
