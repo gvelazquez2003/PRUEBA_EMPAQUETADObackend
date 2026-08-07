@@ -8,6 +8,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { PDFParse } from 'pdf-parse';
 
+// env
 dotenv.config();
 
 const app = express();
@@ -95,7 +96,7 @@ function normalizeOrigin(value) {
   }
 }
 
-function stripDiacritics(text){
+function stripDiacritics(text) {
   try {
     return String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   } catch (_) {
@@ -106,9 +107,9 @@ function stripDiacritics(text){
 const rawCorsOrigin = String(process.env.CORS_ORIGIN || '').trim();
 const corsOrigins = rawCorsOrigin
   ? rawCorsOrigin
-      .split(',')
-      .map((item) => normalizeOrigin(item))
-      .filter(Boolean)
+    .split(',')
+    .map((item) => normalizeOrigin(item))
+    .filter(Boolean)
   : ['*'];
 const allowAnyOrigin = corsOrigins.includes('*') || corsOrigins.includes('https://*') || corsOrigins.includes('http://*');
 
@@ -139,7 +140,7 @@ function isAllowedOrigin(origin) {
     const host = String(parsed.hostname || '').toLowerCase();
     if (host === 'localhost' || host === '127.0.0.1') return true;
     if (host.endsWith('.vercel.app')) return true;
-  } catch (_) {}
+  } catch (_) { }
 
   return false;
 }
@@ -253,15 +254,15 @@ app.use(async (req, res, next) => {
       const status = Number(res.statusCode) || 200;
       const finalize = status >= 200 && status < 300
         ? pool.query(
-            `UPDATE idempotency_requests
+          `UPDATE idempotency_requests
              SET response_status = $1, response_body = $2::jsonb, completed_at = NOW()
              WHERE scope = $3 AND request_key = $4`,
-            [status, JSON.stringify(body || {}), scope, requestKey]
-          )
+          [status, JSON.stringify(body || {}), scope, requestKey]
+        )
         : pool.query(
-            'DELETE FROM idempotency_requests WHERE scope = $1 AND request_key = $2',
-            [scope, requestKey]
-          );
+          'DELETE FROM idempotency_requests WHERE scope = $1 AND request_key = $2',
+          [scope, requestKey]
+        );
       finalize
         .catch((error) => console.error('Error guardando idempotencia:', error.message || error))
         .finally(() => sender(body));
@@ -1017,7 +1018,7 @@ async function claimSolicitudesSheetsOutboxEvents(limit = 10) {
     await client.query('COMMIT');
     return result.rows;
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     throw error;
   } finally {
     client.release();
@@ -1041,7 +1042,7 @@ async function syncSolicitudesSedesOutboxEvent(event) {
       body: JSON.stringify(event.payload),
     });
     let data = null;
-    try { data = await response.json(); } catch (_) {}
+    try { data = await response.json(); } catch (_) { }
     if (!response.ok || data?.ok === false) {
       const message = data?.error || `Sheets HTTP ${response.status}`;
       await markSolicitudesSheetsOutbox(pool, event.id_sync, 'error', message);
@@ -1173,7 +1174,7 @@ async function ensureAuthTables() {
   await pool.query(`
     ALTER TABLE auth_users
     ALTER COLUMN username TYPE VARCHAR(20)
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query('ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS full_name VARCHAR(120)');
   await pool.query('ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS vehicle_plate VARCHAR(20)');
@@ -1202,50 +1203,50 @@ async function ensureAuthTables() {
     UPDATE auth_users
        SET role = 'produccion'
      WHERE lower(trim(role)) IN ('empaquetado', 'produccion', 'producción', 'producción')
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     UPDATE auth_users
        SET role = 'almacen'
      WHERE lower(trim(role)) IN ('almacen', 'almacén')
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     UPDATE auth_users
        SET role = 'administrador'
      WHERE lower(trim(role)) IN ('administrador', 'admin')
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     UPDATE auth_users
        SET role = 'facturacion'
      WHERE lower(trim(role)) IN ('facturacion', 'facturaciÃ³n')
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     UPDATE auth_users
        SET role = 'ventas'
      WHERE lower(trim(role)) IN ('ventas', 'venta')
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     UPDATE auth_users
        SET role = 'vendedor'
      WHERE lower(trim(role)) IN ('vendedor', 'seller')
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     UPDATE auth_users
        SET role = 'conductor'
      WHERE lower(trim(role)) IN ('conductor', 'chofer', 'driver')
-  `).catch(() => {});
+  `).catch(() => { });
 
   // Set any remaining unknown/empty roles to 'almacen' as a safe default
   await pool.query(`
     UPDATE auth_users
        SET role = 'almacen'
      WHERE role IS NULL OR trim(role) = '' OR lower(trim(role)) NOT IN ('administrador','produccion','controlp_carga','controlp_editor','almacen','facturacion','ventas','vendedor','conductor')
-  `).catch(() => {});
+  `).catch(() => { });
 
   // Now validate the constraint (should succeed after normalization)
   await pool.query(`
@@ -1609,7 +1610,7 @@ async function deleteAuthUserWithAdmin(auth, targetUser) {
       },
     };
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return { ok: false, status: 500, error: error.message };
   } finally {
     client.release();
@@ -1721,7 +1722,7 @@ async function updateAuthUserWithAdmin(auth, targetUser, payload) {
       },
     };
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     if (error && error.code === '23505') {
       return { ok: false, status: 409, error: 'Ese usuario ya existe' };
     }
@@ -2040,10 +2041,10 @@ async function ensureCambiosProductosTables() {
   `);
   await pool.query(`ALTER TABLE cambios_razones ADD COLUMN IF NOT EXISTS id_razon BIGSERIAL`);
   await pool.query(`ALTER TABLE cambios_razones ADD COLUMN IF NOT EXISTS razon_texto VARCHAR(180)`);
-  await pool.query(`UPDATE cambios_razones SET razon_texto = COALESCE(razon_texto, nombre) WHERE razon_texto IS NULL`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS nombre`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS activo`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS created_at`).catch(() => {});
+  await pool.query(`UPDATE cambios_razones SET razon_texto = COALESCE(razon_texto, nombre) WHERE razon_texto IS NULL`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS nombre`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS activo`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_razones DROP COLUMN IF EXISTS created_at`).catch(() => { });
 
   await pool.query(`
     DELETE FROM cambios_razones duplicated
@@ -2051,10 +2052,10 @@ async function ensureCambiosProductosTables() {
     WHERE duplicated.ctid > retained.ctid
       AND duplicated.razon_texto = retained.razon_texto
   `);
-  await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN id_razon SET NOT NULL`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN razon_texto SET NOT NULL`).catch(() => {});
-  await pool.query('ALTER TABLE cambios_razones DROP CONSTRAINT IF EXISTS cambios_razones_pkey').catch(() => {});
-  await pool.query('ALTER TABLE cambios_razones ADD CONSTRAINT cambios_razones_pkey PRIMARY KEY (id_razon)').catch(() => {});
+  await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN id_razon SET NOT NULL`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_razones ALTER COLUMN razon_texto SET NOT NULL`).catch(() => { });
+  await pool.query('ALTER TABLE cambios_razones DROP CONSTRAINT IF EXISTS cambios_razones_pkey').catch(() => { });
+  await pool.query('ALTER TABLE cambios_razones ADD CONSTRAINT cambios_razones_pkey PRIMARY KEY (id_razon)').catch(() => { });
 
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS id_cliente BIGINT REFERENCES almacen09_clientes(id_cliente) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS codigo_cambio VARCHAR(20)`);
@@ -2068,20 +2069,20 @@ async function ensureCambiosProductosTables() {
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS contacto VARCHAR(180)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS telefono VARCHAR(20)`);
   await pool.query(`ALTER TABLE cambios_registros ADD COLUMN IF NOT EXISTS producto JSONB`);
-  await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => {});
-  await pool.query(`UPDATE cambios_registros SET nombre_cliente = COALESCE(nombre_cliente, cliente_nombre) WHERE nombre_cliente IS NULL`).catch(() => {});
-  await pool.query(`UPDATE cambios_registros SET producto = COALESCE(producto, detalle_productos) WHERE producto IS NULL`).catch(() => {});
+  await pool.query(`UPDATE cambios_registros SET id_cliente = COALESCE(id_cliente, cliente_id) WHERE id_cliente IS NULL`).catch(() => { });
+  await pool.query(`UPDATE cambios_registros SET nombre_cliente = COALESCE(nombre_cliente, cliente_nombre) WHERE nombre_cliente IS NULL`).catch(() => { });
+  await pool.query(`UPDATE cambios_registros SET producto = COALESCE(producto, detalle_productos) WHERE producto IS NULL`).catch(() => { });
   await pool.query(`
     UPDATE cambios_registros
        SET codigo_cambio = 'CAM' || LPAD(id_cambio::text, 4, '0')
      WHERE codigo_cambio IS NULL OR TRIM(codigo_cambio) = ''
-  `).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_id`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_nombre`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS razon_id`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS razon_texto`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS detalle_productos`).catch(() => {});
-  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS usuario`).catch(() => {});
+  `).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_id`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS cliente_nombre`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS razon_id`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS razon_texto`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS detalle_productos`).catch(() => { });
+  await pool.query(`ALTER TABLE cambios_registros DROP COLUMN IF EXISTS usuario`).catch(() => { });
 
   // Use a new name: a restored database may already have a non-unique legacy index with the old name.
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_cambios_razones_texto_unique ON cambios_razones(razon_texto)');
@@ -2122,7 +2123,7 @@ async function ensureProductosSoftDelete() {
        SET codigo_barras = UPPER(TRIM(codigo_producto))
      WHERE UPPER(TRIM(COALESCE(codigo_barras, ''))) <> UPPER(TRIM(COALESCE(codigo_producto, '')))
        AND TRIM(COALESCE(codigo_producto, '')) <> ''
-  `).catch(() => {});
+  `).catch(() => { });
 }
 
 async function ensureProductosAuditTable() {
@@ -2206,11 +2207,11 @@ async function ensureEmpaquetadosDetalleSnapshotColumns() {
          TRIM(COALESCE(ed.codigo_producto, '')) = ''
          OR TRIM(COALESCE(ed.producto, '')) = ''
        )
-  `).catch(() => {});
+  `).catch(() => { });
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_codigo_producto
     ON empaquetados_detalle (codigo_producto)
-  `).catch(() => {});
+  `).catch(() => { });
 }
 
 async function ensureHistoricoResultadosTable() {
@@ -2288,7 +2289,7 @@ async function ensureControlInventarioTable() {
     UPDATE control_inventario_guardia
        SET fecha_conteo = COALESCE(fecha_conteo, fecha_elaboracion)
      WHERE fecha_conteo IS NULL
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_created_at
@@ -2333,10 +2334,10 @@ async function ensureSalidas09Tables() {
   await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS estado BOOLEAN`);
   await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS codigo_zona VARCHAR(20)`);
   await pool.query(`ALTER TABLE almacen09_vendedores ADD COLUMN IF NOT EXISTS nombre VARCHAR(200)`);
-  await pool.query(`ALTER TABLE almacen09_vendedores DROP CONSTRAINT IF EXISTS almacen09_vendedores_nombre_key`).catch(() => {});
-  await pool.query(`UPDATE almacen09_vendedores SET descripcion = COALESCE(NULLIF(TRIM(descripcion), ''), NULLIF(TRIM(nombre), '')) WHERE COALESCE(TRIM(descripcion), '') = ''`).catch(() => {});
-  await pool.query(`UPDATE almacen09_vendedores SET nombre = COALESCE(NULLIF(TRIM(nombre), ''), NULLIF(TRIM(descripcion), '')) WHERE COALESCE(TRIM(nombre), '') = ''`).catch(() => {});
-  await pool.query(`ALTER TABLE almacen09_vendedores ALTER COLUMN descripcion SET NOT NULL`).catch(() => {});
+  await pool.query(`ALTER TABLE almacen09_vendedores DROP CONSTRAINT IF EXISTS almacen09_vendedores_nombre_key`).catch(() => { });
+  await pool.query(`UPDATE almacen09_vendedores SET descripcion = COALESCE(NULLIF(TRIM(descripcion), ''), NULLIF(TRIM(nombre), '')) WHERE COALESCE(TRIM(descripcion), '') = ''`).catch(() => { });
+  await pool.query(`UPDATE almacen09_vendedores SET nombre = COALESCE(NULLIF(TRIM(nombre), ''), NULLIF(TRIM(descripcion), '')) WHERE COALESCE(TRIM(nombre), '') = ''`).catch(() => { });
+  await pool.query(`ALTER TABLE almacen09_vendedores ALTER COLUMN descripcion SET NOT NULL`).catch(() => { });
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_almacen09_vendedores_codigo ON almacen09_vendedores(codigo_ven)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_almacen09_vendedores_descripcion ON almacen09_vendedores(LOWER(TRIM(descripcion)))`);
 
@@ -2436,12 +2437,12 @@ async function ensureSalidas09Tables() {
     UPDATE salidas_cliente_sucursales
        SET cliente_key = LOWER(TRIM(COALESCE(cliente_nombre, '')))
      WHERE TRIM(COALESCE(cliente_key, '')) = ''
-  `).catch(() => {});
+  `).catch(() => { });
   await pool.query(`
     UPDATE salidas_cliente_sucursales
        SET sucursal_key = LOWER(TRIM(COALESCE(sucursal_nombre, '')))
      WHERE TRIM(COALESCE(sucursal_key, '')) = ''
-  `).catch(() => {});
+  `).catch(() => { });
 
   await pool.query(`
     UPDATE salidas_facturas
@@ -2452,8 +2453,8 @@ async function ensureSalidas09Tables() {
   await pool.query(`UPDATE salidas_facturas SET documento = 'factura' WHERE TRIM(COALESCE(documento, '')) = ''`);
   await pool.query(`ALTER TABLE salidas_facturas ALTER COLUMN documento SET DEFAULT 'factura'`);
   await pool.query('ALTER TABLE salidas_facturas ALTER COLUMN documento SET NOT NULL');
-  await pool.query('ALTER TABLE salidas_facturas ALTER COLUMN numero_control DROP NOT NULL').catch(() => {});
-  await pool.query('ALTER TABLE salidas_facturas DROP CONSTRAINT IF EXISTS salidas_facturas_numero_factura_key').catch(() => {});
+  await pool.query('ALTER TABLE salidas_facturas ALTER COLUMN numero_control DROP NOT NULL').catch(() => { });
+  await pool.query('ALTER TABLE salidas_facturas DROP CONSTRAINT IF EXISTS salidas_facturas_numero_factura_key').catch(() => { });
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS almacen09_salidas_detalle (
@@ -2770,7 +2771,7 @@ async function ensureFacturasBotTables() {
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_facturas_bot_uploads_sha256
     ON facturas_bot_uploads (sha256)
-  `).catch(() => {});
+  `).catch(() => { });
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_facturas_bot_uploads_created_at
     ON facturas_bot_uploads (created_at DESC)
@@ -3593,18 +3594,18 @@ async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_productos_codigo_upper ON productos(UPPER(TRIM(codigo_producto)))');
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_producto_unique
     ON productos (codigo_producto)`).catch((error) => {
-      console.warn('[startup] No se pudo crear indice unico de productos.codigo_producto:', error.message);
-    });
+    console.warn('[startup] No se pudo crear indice unico de productos.codigo_producto:', error.message);
+  });
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_upper_unique
     ON productos (UPPER(TRIM(codigo_producto)))`).catch((error) => {
-      console.warn('[startup] No se pudo crear indice unico normalizado de productos.codigo_producto:', error.message);
-    });
+    console.warn('[startup] No se pudo crear indice unico normalizado de productos.codigo_producto:', error.message);
+  });
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_productos_codigo_barras_unique
     ON productos (UPPER(TRIM(codigo_barras)))
-    WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => {});
+    WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => { });
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_productos_codigo_barras_lookup
     ON productos (codigo_barras)
-    WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => {});
+    WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) <> ''`).catch(() => { });
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_cabecera_fecha_hora ON empaquetados_cabecera(fecha_hora DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_cabecera_numero_registro ON empaquetados_cabecera(numero_registro)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_cabecera ON empaquetados_detalle(id_cabecera)');
@@ -3612,15 +3613,15 @@ async function ensurePerformanceIndexes() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_empaquetados_detalle_lote_upper ON empaquetados_detalle(UPPER(TRIM(numero_lote)))');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_control_inventario_guardia_producto_fecha ON control_inventario_guardia(id_producto, fecha_elaboracion DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_salidas09_detalle_factura ON almacen09_salidas_detalle(id_factura)');
-  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS descripcion TEXT').catch(() => {});
-  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS tipo_cliente TEXT').catch(() => {});
-  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS direccion TEXT').catch(() => {});
-  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS ruta TEXT').catch(() => {});
-  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS transporte TEXT').catch(() => {});
-  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS zona TEXT').catch(() => {});
-  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS vendedor TEXT').catch(() => {});
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_zona ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(zona)))').catch(() => {});
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_direccion ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(direccion)))').catch(() => {});
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS descripcion TEXT').catch(() => { });
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS tipo_cliente TEXT').catch(() => { });
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS direccion TEXT').catch(() => { });
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS ruta TEXT').catch(() => { });
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS transporte TEXT').catch(() => { });
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS zona TEXT').catch(() => { });
+  await pool.query('ALTER TABLE public.clientes ADD COLUMN IF NOT EXISTS vendedor TEXT').catch(() => { });
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_zona ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(zona)))').catch(() => { });
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_public_clientes_descripcion_direccion ON public.clientes (LOWER(TRIM(descripcion)), LOWER(TRIM(direccion)))').catch(() => { });
 }
 
 async function dropLegacyUnusedTables() {
@@ -4757,7 +4758,7 @@ app.post('/api/almacen09/cambios', async (req, res) => {
       cambio: cambiosInsertados[0] || null,
     });
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -5019,7 +5020,7 @@ app.post('/api/mermas', async (req, res) => {
     await client.query('COMMIT');
     return res.status(201).json({ ok: true, id_merma: idMerma, total: insertedRows.length, rows: insertedRows });
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -5247,7 +5248,7 @@ app.post('/api/solicitudes-sedes', async (req, res) => {
     await client.query('COMMIT');
     createdSolicitud = await fetchSolicitudById(pool, solicitudId);
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -5397,9 +5398,9 @@ app.post('/api/entregas-sedes', async (req, res) => {
       }
       const solicitud = await fetchSolicitudById(client, solicitudIdRaw);
       if (!solicitud) {
-          await client.query('ROLLBACK');
-          return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
-        }
+        await client.query('ROLLBACK');
+        return res.status(404).json({ ok: false, error: 'Solicitud no encontrada.' });
+      }
       forcedSedeId = Number(solicitud.sede_id);
     }
     if (!forcedSedeId) {
@@ -5457,7 +5458,7 @@ app.post('/api/entregas-sedes', async (req, res) => {
     await client.query('COMMIT');
     createdEntrega = await fetchEntregaById(pool, entregaId);
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -5750,7 +5751,7 @@ app.delete('/productos/:codigo', async (req, res) => {
       },
     });
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -5820,7 +5821,7 @@ app.post('/productos/purge-catalog', async (req, res) => {
       })),
     });
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -5988,14 +5989,14 @@ app.post('/api/control-inventario', async (req, res) => {
   const detalle = hasDetalle
     ? body.detalle
     : [
-        {
-          id_producto: body.id_producto,
-          cantidad_fisica_contada: body.cantidad_fisica_contada,
-          numero_lote: body.numero_lote,
-          fecha_conteo: body.fecha_conteo,
-          fecha_elaboracion: body.fecha_elaboracion,
-        },
-      ];
+      {
+        id_producto: body.id_producto,
+        cantidad_fisica_contada: body.cantidad_fisica_contada,
+        numero_lote: body.numero_lote,
+        fecha_conteo: body.fecha_conteo,
+        fecha_elaboracion: body.fecha_elaboracion,
+      },
+    ];
 
   const detalleNormalizado = (detalle || []).map((item) => ({
     id_producto: Number(item?.id_producto),
@@ -6083,7 +6084,7 @@ app.post('/api/control-inventario', async (req, res) => {
     await client.query('COMMIT');
     return res.status(201).json({ ok: true, total: insertedRows.length, rows: insertedRows });
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -7081,8 +7082,8 @@ app.post('/api/registros/delete', async (req, res) => {
   const legacyIdsRaw = Array.isArray(req.body?.ids) ? req.body.ids : [];
   const legacyIds = normalizeAuthRole(auth.role) === APP_ROLES.ADMIN
     ? legacyIdsRaw
-        .map((id) => Number(id))
-        .filter((id) => Number.isInteger(id) && id > 0)
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0)
     : [];
 
   const detalleIdsSet = new Set(legacyIds);
@@ -7731,8 +7732,8 @@ function parseFacturaBotPdfText(text) {
   const numeroFactura = isNotaEntrega
     ? numeroNota
     : extractBotPdfTextValue(rawText, /N[°ºO.]?\s*(?:DE\s*)?FACTURA[:\s#-]+(\d{4,8})/mi)
-      || extractBotPdfTextValue(rawText, /\bFACTURA\b[\s\S]{0,90}?\b(?:NRO|NO|NUM(?:ERO)?|N[°º])\b\s*[:#-]?\s*(\d{4,8})/mi)
-      || extractBotPdfTextValue(rawText, /\b(?:NRO|NO|NUM(?:ERO)?|N[°º])\b\s*(?:DE\s*)?FACTURA\s*[:#-]?\s*(\d{4,8})/mi);
+    || extractBotPdfTextValue(rawText, /\bFACTURA\b[\s\S]{0,90}?\b(?:NRO|NO|NUM(?:ERO)?|N[°º])\b\s*[:#-]?\s*(\d{4,8})/mi)
+    || extractBotPdfTextValue(rawText, /\b(?:NRO|NO|NUM(?:ERO)?|N[°º])\b\s*(?:DE\s*)?FACTURA\s*[:#-]?\s*(\d{4,8})/mi);
   const fechaRaw = extractBotPdfTextValue(rawText, /FEC(?:HA)?\.?\s*(?:DE\s*)?EMISI[OÓ]N[:\s]+(\d{2}\/\d{2}\/\d{4})/mi)
     || (isNotaEntrega ? extractNextDateAfter(/^FEC\.?\s*(?:DE\s*)?EMISI[OÓ]N\b/i) : '');
   const fechaVencRaw = extractBotPdfTextValue(rawText, /FEC(?:HA)?\.?\s*(?:DE\s*)?VENC[:\s]+(\d{2}\/\d{2}\/\d{4})/mi)
@@ -7901,7 +7902,7 @@ async function buildFacturaBotSalidasPayload(upload, auth) {
   try {
     parsedPdf = await parser.getText();
   } finally {
-    await parser.destroy().catch(() => {});
+    await parser.destroy().catch(() => { });
   }
   const datos = parseFacturaBotPdfText(parsedPdf?.text || '');
   if (!datos.numero_factura) {
@@ -8001,7 +8002,7 @@ async function extractFacturaBotPreview(upload) {
   try {
     parsedPdf = await parser.getText();
   } finally {
-    await parser.destroy().catch(() => {});
+    await parser.destroy().catch(() => { });
   }
   const datos = parseFacturaBotPdfText(parsedPdf?.text || '');
   if (!datos.numero_factura) {
@@ -8216,7 +8217,7 @@ app.post('/api/facturas-bot/uploads/delete', async (req, res) => {
       message: `Se borraron ${rows.length} registro(s) de la cola del bot.`,
     });
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
+    await client.query('ROLLBACK').catch(() => { });
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -8814,7 +8815,7 @@ app.post('/api/almacen09/salidas-facturas', async (req, res) => {
       },
     });
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -10490,7 +10491,7 @@ app.post('/api/almacen09/salidas-facturas/delete', async (req, res) => {
       deleted_facturas: deletedFacturasCount,
     });
   } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.query('ROLLBACK'); } catch (_) { }
     return res.status(500).json({ ok: false, error: error.message });
   } finally {
     client.release();
@@ -10891,7 +10892,7 @@ app.post('/api/ventas/import', ventasUpload.single('archivo'), async (req, res) 
       }
       await client.query('COMMIT');
     } catch (error) {
-      try { await client.query('ROLLBACK'); } catch (_) {}
+      try { await client.query('ROLLBACK'); } catch (_) { }
       throw error;
     } finally {
       client.release();
@@ -11082,7 +11083,7 @@ app.post('/api/predicciones/subir', async (req, res) => {
       }
       await client.query('COMMIT');
     } catch (error) {
-      try { await client.query('ROLLBACK'); } catch (_) {}
+      try { await client.query('ROLLBACK'); } catch (_) { }
       throw error;
     } finally {
       client.release();
