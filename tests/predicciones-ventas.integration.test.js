@@ -444,7 +444,7 @@ test('predicciones validar builds per-sede weekday coverage states', async () =>
   }
 });
 
-test('predicciones generar uses trimmed mean per sede per product', async () => {
+test('predicciones generar usa formula de Excel (ultimas 6 semanas, media recortada, factor de frecuencia)', async () => {
   const ctx = await setup();
   try {
     seedVentas(ctx.pool.state);
@@ -454,17 +454,17 @@ test('predicciones generar uses trimmed mean per sede per product', async () => 
     assert.equal(response.payload.filas.length, 3);
 
     const undSL = response.payload.filas.find((f) => f.sede_nombre === 'SL' && f.codigo === 'PTEM0010');
-    assert.equal(undSL.dias.Lun, 3.5);
-    assert.equal(undSL.dias.Dom, 8);
+    assert.equal(undSL.dias.Lun, 4);
+    assert.equal(undSL.dias.Dom, 1);
     assert.equal(undSL.dias.Mar, null);
-    assert.equal(undSL.total, 11.5);
+    assert.equal(undSL.total, 5);
 
     const kgSL = response.payload.filas.find((f) => f.sede_nombre === 'SL' && f.codigo === 'PTSU0020');
-    assert.equal(kgSL.dias.Lun, 9);
+    assert.equal(kgSL.dias.Lun, 5);
     assert.equal(kgSL.dias.Mar, null);
 
     const undGuaira = response.payload.filas.find((f) => f.sede_nombre === 'LA GUAIRA' && f.codigo === 'PTEM0010');
-    assert.equal(undGuaira.dias.Lun, 50);
+    assert.equal(undGuaira.dias.Lun, 8);
     assert.equal(undGuaira.dias.Dom, null);
   } finally {
     ctx.close();

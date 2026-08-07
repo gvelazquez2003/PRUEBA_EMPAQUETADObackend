@@ -10625,7 +10625,9 @@ app.get('/api/stock/actual', async (req, res) => {
 
 const XLSX = require('xlsx');
 const multer = require('multer');
-const PREDICCIONES_VERSION_MODELO = 'v1.0';
+const PREDICCIONES_VERSION_MODELO = 'v2.0';
+const PREDICCION_SEMANAS_EVAL = 6;
+const PREDICCION_ESTAC = 1;
 const PREDICCION_DIA_LABELS = ['Dom', 'Lun', 'Mar', 'Mie', 'Jue', 'Vie', 'Sab'];
 const PREDICCION_MESES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
 const ventasUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: VENTAS_MAX_UPLOAD_MB * 1024 * 1024 } });
@@ -10748,19 +10750,24 @@ async function generarPredicciones(db, semanaInicio) {
     const dias = {};
     let total = 0;
     for (const dia of diasSemana) {
-      const fechasDia = fechas.filter((f) => f.dow === dia.dow).slice(-6);
+      const fechasDia = fechas.filter((f) => f.dow === dia.dow).slice(-PREDICCION_SEMANAS_EVAL);
       if (!fechasDia.length) {
         dias[dia.label] = null;
         continue;
       }
-      let valor;
-      if (fechasDia.length <= 5) {
-        valor = meanValue(fechasDia.map((f) => f.cantidad));
+      const n = fechasDia.length;
+      const suma = fechasDia.reduce((acc, f) => acc + f.cantidad, 0);
+      let promedioBase;
+      if (n > 2) {
+        const cantidades = fechasDia.map((f) => f.cantidad);
+        const maxV = Math.max(...cantidades);
+        const minV = Math.min(...cantidades);
+        promedioBase = (suma - maxV - minV) / (n - 2);
       } else {
-        const cantidades = fechasDia.map((f) => f.cantidad).sort((a, b) => a - b);
-        valor = meanValue(cantidades.slice(1, cantidades.length - 1));
+        promedioBase = suma / n;
       }
-      valor = Math.round(valor * 100) / 100;
+      const factorFrecuencia = n / PREDICCION_SEMANAS_EVAL;
+      const valor = Math.round(promedioBase * factorFrecuencia * PREDICCION_ESTAC);
       dias[dia.label] = valor;
       total += valor;
     }
