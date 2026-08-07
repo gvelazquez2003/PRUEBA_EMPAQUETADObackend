@@ -7688,10 +7688,18 @@ function parseBotPdfDate(value) {
 }
 
 function extractFacturaBotNumberFromFilename(value) {
-  const raw = String(value || '').replace(/\.pdf$/i, '');
-  const matches = raw.match(/\b\d{4,8}\b/g) || [];
+  const raw = path.basename(String(value || '')).replace(/\.pdf$/i, '');
+  const normalizeNumber = (candidate) => {
+    const digits = String(candidate || '').replace(/\D+/g, '');
+    if (digits.length < 4 || digits.length > 8) return '';
+    return digits.padStart(8, '0').slice(0, 8);
+  };
+  const labeledMatch = raw.match(/(?:^|[^A-Za-z0-9])fact(?:ura)?[^0-9]{0,20}(\d{4,8})(?:[^0-9]|$)/i);
+  const labeledNumber = normalizeNumber(labeledMatch?.[1]);
+  if (labeledNumber) return labeledNumber;
+  const matches = [...raw.matchAll(/(?:^|[^A-Za-z0-9])(\d{4,8})(?=[^A-Za-z0-9]|$)/g)].map((match) => match[1]);
   if (!matches.length) return '';
-  return matches[matches.length - 1].slice(0, 8);
+  return normalizeNumber(matches[matches.length - 1]);
 }
 
 function extractBotPdfTextValue(src, pattern) {
