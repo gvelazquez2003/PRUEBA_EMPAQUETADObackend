@@ -14,7 +14,7 @@
 function doPost(e) {
   const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(30000);
+    lock.waitLock(60000);
     const payload = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     const expectedSecret = PropertiesService.getScriptProperties().getProperty('SOLICITUDES_SHEETS_WEBHOOK_SECRET') || '';
 
@@ -149,7 +149,6 @@ function writePrediccionesDemanda_(ss, payload) {
   const sheetName = PropertiesService.getScriptProperties().getProperty('PREDICCIONES_SHEET_PREDICCIONES') || 'Predicciones Demanda';
   const sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
   const headers = ['Fecha', 'Codigo', 'Producto', 'Cantidad Proyectada', 'Sede'];
-  ensureHeaders_(sheet, headers);
 
   const rows = (Array.isArray(payload.rows) ? payload.rows : []).map((item) => [
     item.fecha || '',
@@ -173,13 +172,21 @@ function writePrediccionesDemanda_(ss, payload) {
       keep.push(row);
     });
   }
-  if (lastRow > 1) {
-    sheet.deleteRows(2, lastRow - 1);
+
+  const output = [headers].concat(keep, rows);
+  sheet.clearContents();
+  if (output.length) {
+    writeRangeInChunks_(sheet, 1, output, headers.length, 5000);
   }
-  keep.forEach((row) => sheet.appendRow(row));
-  rows.forEach((row) => sheet.appendRow(row));
 
   return jsonResponse_(200, { ok: true, sheet: sheetName, inserted: rows.length, updated: 0, message: 'Predicciones escritas correctamente' });
+}
+
+function writeRangeInChunks_(sheet, startRow, rows, numCols, chunkSize) {
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    sheet.getRange(startRow + i, 1, chunk.length, numCols).setValues(chunk);
+  }
 }
 
 function weekKey_(dateValue) {
