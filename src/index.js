@@ -8,7 +8,6 @@ import fs from 'fs/promises';
 import path from 'path';
 import { PDFParse } from 'pdf-parse';
 
-// env
 dotenv.config();
 
 const app = express();
