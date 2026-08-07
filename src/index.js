@@ -982,12 +982,12 @@ async function markSolicitudesSheetsOutbox(db, eventId, status, errorMessage = '
   const estado = status === 'sincronizado' ? 'sincronizado' : 'error';
   await db.query(
     `UPDATE solicitudes_sedes_sheets_outbox
-        SET estado = $2,
+        SET estado = $2::varchar,
             intentos = intentos + 1,
-            ultimo_error = NULLIF($3, ''),
-            synced_at = CASE WHEN $2 = 'sincronizado' THEN NOW() ELSE synced_at END,
+            ultimo_error = NULLIF($3::text, ''),
+            synced_at = CASE WHEN $2::varchar = 'sincronizado' THEN NOW() ELSE synced_at END,
             updated_at = NOW()
-      WHERE id_sync = $1`,
+      WHERE id_sync = $1::bigint`,
     [eventId, estado, normalizeSolicitudesText(errorMessage, 1000)]
   );
 }
@@ -10796,7 +10796,7 @@ async function enqueuePrediccionSheetsOutbox(semanaInicio, rows) {
       `INSERT INTO solicitudes_sedes_sheets_outbox (
          event_type, entity_type, entity_id, tipo, referencia_externa, payload, estado, intentos, ultimo_error, created_at, updated_at
        )
-       VALUES ($1, $2, NULL, $3, $4, $5::jsonb, 'pendiente', 0, NULL, NOW(), NOW())
+       VALUES ($1::varchar, $2::varchar, NULL, $3::varchar, $4::varchar, $5::jsonb, 'pendiente', 0, NULL, NOW(), NOW())
        ON CONFLICT (event_type, referencia_externa)
        DO UPDATE SET payload = EXCLUDED.payload, estado = 'pendiente', ultimo_error = NULL, updated_at = NOW()`,
       ['sync_prediccion_sheets', 'prediccion_demanda', 'prediccion', referencia, JSON.stringify(payload)]
